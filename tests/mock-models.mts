@@ -54,6 +54,14 @@ export function toolCallResponse(toolName: string, input: string): LanguageModel
   );
 }
 
+// Multiple tool calls in one response → the AI SDK executes them in parallel (Promise.all).
+export function toolCallsResponse(calls: { toolName: string; input: string }[]): LanguageModelV4GenerateResult {
+  return contentResponse(
+    calls.map((c, i) => ({ type: 'tool-call', toolCallId: `call-${i}`, toolName: c.toolName, input: c.input })),
+    finishReason('tool-calls'),
+  );
+}
+
 export function textStreamParts(deltas: string[]): LanguageModelV4StreamPart[] {
   return [
     { type: 'stream-start', warnings: [] },
@@ -142,24 +150,31 @@ export class MockImageModel implements ImageModelV4 {
   readonly specificationVersion = 'v4';
   readonly provider = 'mock';
   readonly modelId = 'mock-image';
-  readonly maxImagesPerCall = 1;
+  readonly maxImagesPerCall = 1; // forces generateImage to split n>1 into parallel batches
 
   generateCalls = 0;
 
-  async doGenerate(_options: ImageModelV4CallOptions): Promise<ImageModelV4Result> {
+  async doGenerate(options: ImageModelV4CallOptions): Promise<ImageModelV4Result> {
     this.generateCalls++;
+    // Tag each generated image with this call's ordinal so a reordering on replay is detectable.
+    const images = Array.from({ length: options.n }, () => new Uint8Array([...IMAGE_BYTES, this.generateCalls]));
     return {
-      images: [new Uint8Array(IMAGE_BYTES)], // binary bytes → middleware should base64-encode for the checkpoint
+      images,
       warnings: [],
       response: { timestamp: new Date('2026-07-02T12:00:00Z'), modelId: 'mock-image', headers: {} },
     };
   }
 }
 
-// Mimics an @ai-sdk/mcp client: tools() lists a tool over the "wire"; execute runs the tool.
+// Mimics an @ai-sdk/mcp client: tools() lists tools over the "wire"; execute runs a tool.
 export class MockMCPClient {
   listCalls = 0;
-  executeCalls = 0;
+  weatherCalls = 0;
+  timeCalls = 0;
+
+  get executeCalls(): number {
+    return this.weatherCalls + this.timeCalls;
+  }
 
   async tools(): Promise<ToolSet> {
     this.listCalls++;
@@ -168,8 +183,16 @@ export class MockMCPClient {
         description: 'Get the weather for a city',
         inputSchema: z.object({ city: z.string() }),
         execute: async ({ city }: { city: string }) => {
-          this.executeCalls++;
+          this.weatherCalls++;
           return `sunny in ${city}`;
+        },
+      }),
+      getTime: tool({
+        description: 'Get the current time in a city',
+        inputSchema: z.object({ city: z.string() }),
+        execute: async ({ city }: { city: string }) => {
+          this.timeCalls++;
+          return `noon in ${city}`;
         },
       }),
     };

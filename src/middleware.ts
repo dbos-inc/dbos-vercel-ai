@@ -23,7 +23,7 @@ import { assertNotInTransaction, isInWorkflowFunction, withErrorClassification }
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
 
-function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed' | 'image'): string {
+function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed'): string {
   const workflowID = DBOS.workflowID!;
   const inflight = inflightModelCalls.get(workflowID) ?? 0;
   if (inflight > 0) {
@@ -164,7 +164,11 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelV
   };
 }
 
-/** AI SDK image-model middleware that runs each image generation as a durable DBOS step, like {@link durableCalls}. */
+/**
+ * AI SDK image-model middleware that runs each image generation as a durable DBOS step, like {@link durableCalls}.
+ * No concurrency guard: generateImage splits `n > maxImagesPerCall` into batches it dispatches synchronously (no
+ * await before doGenerate), so their step order is deterministic on replay — unlike embedMany's parallel batches.
+ */
 export function durableImageCalls(options: StepConfig = {}): ImageModelV4Middleware {
   const stepConfig = withErrorClassification(options);
   return {
@@ -174,15 +178,10 @@ export function durableImageCalls(options: StepConfig = {}): ImageModelV4Middlew
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
-      const workflowID = enterDurableModelCall('image');
-      try {
-        return await DBOS.runStep(async () => encodeImageResult(await doGenerate()), {
-          ...stepConfig,
-          name: stepConfig.name ?? stepName(model, 'image'),
-        });
-      } finally {
-        exitDurableModelCall(workflowID);
-      }
+      return await DBOS.runStep(async () => encodeImageResult(await doGenerate()), {
+        ...stepConfig,
+        name: stepConfig.name ?? stepName(model, 'image'),
+      });
     },
   };
 }

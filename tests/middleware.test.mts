@@ -26,6 +26,7 @@ import {
   textResponse,
   textStreamParts,
   toolCallResponse,
+  toolCallsResponse,
   usage,
 } from './mock-models.mjs';
 
@@ -306,6 +307,19 @@ const imageWorkflow = DBOS.registerWorkflow(
   { name: 'imageWorkflow' },
 );
 
+// n > maxImagesPerCall (1) makes generateImage dispatch parallel batches; the last byte of each image is its call ordinal.
+const multiImageMock = new MockImageModel();
+const multiImageModel = wrapImageModel({ model: multiImageMock, middleware: durableImageCalls() });
+
+const multiImageWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const { images } = await generateImage({ model: multiImageModel, prompt, n: 3 });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return images.map((img) => img.uint8Array.at(-1)!);
+  },
+  { name: 'multiImageWorkflow' },
+);
+
 const nonRetryMock = new MockLanguageModel();
 const nonRetryModel = wrapLanguageModel({
   model: nonRetryMock,
@@ -329,6 +343,20 @@ const mcpWorkflow = DBOS.registerWorkflow(
     return result.text;
   },
   { name: 'mcpWorkflow' },
+);
+
+const parallelMcpMock = new MockLanguageModel();
+const parallelMcpModel = wrapLanguageModel({ model: parallelMcpMock, middleware: durableCalls() });
+const parallelMcpClient = new MockMCPClient();
+
+const parallelMcpWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const tools = await durableMCPTools(parallelMcpClient);
+    const result = await generateText({ model: parallelMcpModel, prompt, tools, stopWhen: stepCountIs(5), maxRetries: 0 });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return result.text;
+  },
+  { name: 'parallelMcpWorkflow' },
 );
 
 before(async () => {
@@ -632,13 +660,29 @@ test('generateImage runs as a durable step, bytes survive, and replay does not r
   const handle = await DBOS.startWorkflow(imageWorkflow, { workflowID })('a durable cat');
   const result = await handle.getResult();
   assert.equal(result.count, 1);
-  assert.deepEqual(result.bytes, IMAGE_BYTES);
+  assert.deepEqual(result.bytes, [...IMAGE_BYTES, 1]); // image tagged with call ordinal 1
   assert.equal(imageMock.generateCalls, 1);
 
   const forked = await DBOS.forkWorkflow<ReturnType<typeof imageWorkflow>>(workflowID, 1);
   const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof imageWorkflow>>;
-  assert.deepEqual(replayed.bytes, IMAGE_BYTES);
+  assert.deepEqual(replayed.bytes, [...IMAGE_BYTES, 1]);
   assert.equal(imageMock.generateCalls, 1);
+});
+
+test('multi-image generateImage: parallel batches are durable and replay in the same order (no guard needed)', async () => {
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(multiImageWorkflow, { workflowID })('three durable cats');
+  const original = await handle.getResult();
+  assert.equal(original.length, 3);
+  assert.equal(multiImageMock.generateCalls, 3); // n=3 with maxImagesPerCall=1 → 3 parallel batches, no guard throw
+
+  // Fork past all image steps: each replays from its checkpoint, so the image order is byte-identical and nothing is re-called.
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof multiImageWorkflow>>(workflowID, noopStep.functionID);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof multiImageWorkflow>>;
+  assert.deepEqual(replayed, original); // deterministic: same batch → same funcID → same checkpoint → same order
+  assert.equal(multiImageMock.generateCalls, 3);
 });
 
 test('a provider non-retryable error is not retried even with retriesAllowed', async () => {
@@ -670,6 +714,33 @@ test('MCP tools list and execute as durable steps; replay does not re-execute th
   assert.equal(await forked.getResult(), 'It is sunny in Paris.');
   assert.equal(mcpClient.executeCalls, 1); // tool not re-invoked on replay
   assert.equal(mcpToolMock.generateCalls, generateCallsBefore); // model not re-called on replay
+});
+
+test('parallel MCP tool calls each execute durably and replay without re-executing', async () => {
+  // One model turn returns two tool calls; the AI SDK runs them in parallel (Promise.all).
+  parallelMcpMock.generateResults.push(
+    toolCallsResponse([
+      { toolName: 'getWeather', input: '{"city":"Paris"}' },
+      { toolName: 'getTime', input: '{"city":"Paris"}' },
+    ]),
+    textResponse('Fetched weather and time for Paris.'),
+  );
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(parallelMcpWorkflow, { workflowID })('weather and time in Paris?');
+  assert.equal(await handle.getResult(), 'Fetched weather and time for Paris.');
+  assert.equal(parallelMcpClient.weatherCalls, 1);
+  assert.equal(parallelMcpClient.timeCalls, 1);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather'), 'first parallel tool recorded as a step');
+  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getTime'), 'second parallel tool recorded as a step');
+
+  // Fork past both parallel tool steps: they replay from checkpoints (would throw DBOSUnexpectedStepError if reordered).
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof parallelMcpWorkflow>>(workflowID, noopStep.functionID);
+  assert.equal(await forked.getResult(), 'Fetched weather and time for Paris.');
+  assert.equal(parallelMcpClient.weatherCalls, 1); // not re-executed on replay
+  assert.equal(parallelMcpClient.timeCalls, 1);
 });
 
 // Keep this test last: it shuts down and relaunches DBOS mid-suite.
