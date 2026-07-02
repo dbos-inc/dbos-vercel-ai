@@ -2,6 +2,9 @@ import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type {
   EmbeddingModelV4,
   EmbeddingModelV4Middleware,
+  ImageModelV4,
+  ImageModelV4Middleware,
+  ImageModelV4Result,
   LanguageModelV4,
   LanguageModelV4Content,
   LanguageModelV4FinishReason,
@@ -15,22 +18,12 @@ import type {
   SharedV4ProviderMetadata,
   SharedV4Warning,
 } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
-
-function isInWorkflowFunction(): boolean {
-  // True only in workflow code proper: not in a step, transaction, or outside DBOS.
-  return DBOS.isInWorkflow();
-}
-
-function assertNotInTransaction(operation: string) {
-  if (DBOS.isInTransaction()) {
-    throw new Error(`Cannot call ${operation} inside a DBOS transaction; run it in workflow or step code.`);
-  }
-}
+import { assertNotInTransaction, isInWorkflowFunction, withErrorClassification } from './internal';
 
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
 
-function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed'): string {
+function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed' | 'image'): string {
   const workflowID = DBOS.workflowID!;
   const inflight = inflightModelCalls.get(workflowID) ?? 0;
   if (inflight > 0) {
@@ -58,7 +51,7 @@ function exitDurableModelCall(workflowID: string): void {
 
 /** AI SDK language-model middleware that runs each model call as a durable, checkpointed DBOS step (replayed on recovery); outside a workflow it calls the model directly. */
 export function durableCalls(options: StepConfig = {}): LanguageModelV4Middleware {
-  const stepConfig = options;
+  const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
 
@@ -150,6 +143,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
 
 /** AI SDK embedding-model middleware that runs each embedding call as a durable DBOS step, like {@link durableCalls}. */
 export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelV4Middleware {
+  const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
     wrapEmbed: async ({ doEmbed, model }) => {
@@ -160,8 +154,8 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelV
       const workflowID = enterDurableModelCall('embed');
       try {
         return await DBOS.runStep(async () => doEmbed(), {
-          ...options,
-          name: options.name ?? stepName(model, 'embed'),
+          ...stepConfig,
+          name: stepConfig.name ?? stepName(model, 'embed'),
         });
       } finally {
         exitDurableModelCall(workflowID);
@@ -170,7 +164,38 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelV
   };
 }
 
-function stepName(model: LanguageModelV4 | EmbeddingModelV4, operation: string): string {
+/** AI SDK image-model middleware that runs each image generation as a durable DBOS step, like {@link durableCalls}. */
+export function durableImageCalls(options: StepConfig = {}): ImageModelV4Middleware {
+  const stepConfig = withErrorClassification(options);
+  return {
+    specificationVersion: 'v4',
+    wrapGenerate: async ({ doGenerate, model }) => {
+      assertNotInTransaction('generateImage');
+      if (!isInWorkflowFunction()) {
+        return await doGenerate();
+      }
+      const workflowID = enterDurableModelCall('image');
+      try {
+        return await DBOS.runStep(async () => encodeImageResult(await doGenerate()), {
+          ...stepConfig,
+          name: stepConfig.name ?? stepName(model, 'image'),
+        });
+      } finally {
+        exitDurableModelCall(workflowID);
+      }
+    },
+  };
+}
+
+/** Convert generated image bytes (Uint8Array) to base64 (spec-allowed) to keep checkpoints compact. */
+function encodeImageResult(result: ImageModelV4Result): ImageModelV4Result {
+  if (result.images.length === 0 || typeof result.images[0] === 'string') {
+    return result;
+  }
+  return { ...result, images: (result.images as Uint8Array[]).map((image) => Buffer.from(image).toString('base64')) };
+}
+
+function stepName(model: LanguageModelV4 | EmbeddingModelV4 | ImageModelV4, operation: string): string {
   return `${model.provider}.${model.modelId}.${operation}`;
 }
 

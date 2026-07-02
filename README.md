@@ -64,6 +64,8 @@ durableCalls({
 });
 ```
 
+When `retriesAllowed` is set, a default `shouldRetry` skips errors the provider marks non-retryable (an AI SDK `APICallError`/`GatewayError` with `isRetryable === false`, e.g. a 401 or an invalid-request 400), so permanent failures fail fast instead of retrying `maxAttempts` times. Pass your own `shouldRetry` to override it.
+
 Note that the AI SDK has its own retry layer (`maxRetries` on `generateText` et al., default 2), which composes multiplicatively with DBOS step retries — each AI SDK retry is a fresh step. If you enable DBOS retries, consider passing `maxRetries: 0` to the AI SDK call so retry behavior is governed in one place.
 
 ## Streaming
@@ -109,6 +111,22 @@ const agent = DBOS.registerWorkflow(async (question: string) => {
 }, { name: 'weatherAgent' });
 ```
 
+### MCP tools
+
+`durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (from `@ai-sdk/mcp` or `ai`'s `experimental_createMCPClient`) so both the tool listing and every tool call run as durable steps. The tool list is checkpointed as JSON schemas, so a recovered workflow reconstructs the tools without the live connection, and each tool call is checkpointed so recovery replays results instead of re-invoking the tool:
+
+```ts
+import { experimental_createMCPClient } from 'ai';
+import { durableMCPTools } from '@dbos-inc/vercel-ai';
+
+const agent = DBOS.registerWorkflow(async (question: string) => {
+  const mcpClient = await experimental_createMCPClient({ transport: { type: 'http', url: MCP_URL } });
+  const tools = await durableMCPTools(mcpClient);
+  const result = await generateText({ model, prompt: question, tools, stopWhen: stepCountIs(10) });
+  return result.text;
+}, { name: 'mcpAgent' });
+```
+
 ## Concurrency
 
 Run **one durable model call at a time within a single workflow**. DBOS derives each step's replay identity from the order steps are reached, but the AI SDK issues concurrent model calls in a nondeterministic order — so on recovery a checkpoint could be bound to the wrong call, silently returning one call's result for another. To prevent this, the middleware throws if it detects a second durable model call starting while one is already in flight in the same workflow. This covers `Promise.all` over `generateText`/`streamText`, `embedMany` on inputs larger than the model's per-call limit (which the SDK batches in parallel — see [Embeddings](#embeddings) for the `maxParallelCalls: 1` remedy), and parallel tool calls that themselves invoke models.
@@ -148,6 +166,19 @@ const { embeddings } = await embedMany({ model: embeddingModel, values: chunks, 
 ```
 
 Pass `maxParallelCalls: 1` when embedding more values than the model's per-call limit. `embedMany` otherwise splits the input into batches and runs them concurrently, which the concurrency guard rejects (their step order would be nondeterministic on replay); `maxParallelCalls: 1` runs the batches sequentially, keeping them durable and replay-safe.
+
+## Images
+
+`durableImageCalls` makes image generation durable. Generated image bytes are base64-encoded before checkpointing (the `.uint8Array`/`.base64` accessors on the result work either way):
+
+```ts
+import { generateImage, wrapImageModel } from 'ai';
+import { durableImageCalls } from '@dbos-inc/vercel-ai';
+
+const imageModel = wrapImageModel({ model: openai.imageModel('gpt-image-1'), middleware: durableImageCalls() });
+
+const { images } = await generateImage({ model: imageModel, prompt: 'a durable cat' });
+```
 
 ## Serialization
 

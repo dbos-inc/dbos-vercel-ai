@@ -2,6 +2,9 @@ import type {
   EmbeddingModelV4,
   EmbeddingModelV4CallOptions,
   EmbeddingModelV4Result,
+  ImageModelV4,
+  ImageModelV4CallOptions,
+  ImageModelV4Result,
   LanguageModelV4,
   LanguageModelV4CallOptions,
   LanguageModelV4Content,
@@ -11,6 +14,8 @@ import type {
   LanguageModelV4StreamResult,
   LanguageModelV4Usage,
 } from '@ai-sdk/provider';
+import { tool, type ToolSet } from 'ai';
+import { z } from 'zod';
 
 export function usage(inputTokens = 10, outputTokens = 20): LanguageModelV4Usage {
   return {
@@ -129,4 +134,46 @@ export class MockEmbeddingModel implements EmbeddingModelV4 {
       warnings: [],
     };
   }
+}
+
+export const IMAGE_BYTES = [137, 80, 78, 71, 13, 10, 26, 10];
+
+export class MockImageModel implements ImageModelV4 {
+  readonly specificationVersion = 'v4';
+  readonly provider = 'mock';
+  readonly modelId = 'mock-image';
+  readonly maxImagesPerCall = 1;
+
+  generateCalls = 0;
+
+  async doGenerate(_options: ImageModelV4CallOptions): Promise<ImageModelV4Result> {
+    this.generateCalls++;
+    return {
+      images: [new Uint8Array(IMAGE_BYTES)], // binary bytes → middleware should base64-encode for the checkpoint
+      warnings: [],
+      response: { timestamp: new Date('2026-07-02T12:00:00Z'), modelId: 'mock-image', headers: {} },
+    };
+  }
+}
+
+// Mimics an @ai-sdk/mcp client: tools() lists a tool over the "wire"; execute runs the tool.
+export class MockMCPClient {
+  listCalls = 0;
+  executeCalls = 0;
+
+  async tools(): Promise<ToolSet> {
+    this.listCalls++;
+    return {
+      getWeather: tool({
+        description: 'Get the weather for a city',
+        inputSchema: z.object({ city: z.string() }),
+        execute: async ({ city }: { city: string }) => {
+          this.executeCalls++;
+          return `sunny in ${city}`;
+        },
+      }),
+    };
+  }
+
+  async close(): Promise<void> {}
 }

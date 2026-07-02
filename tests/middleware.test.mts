@@ -3,13 +3,26 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client as PgClient } from 'pg';
-import { embedMany, generateText, stepCountIs, streamText, tool, wrapEmbeddingModel, wrapLanguageModel } from 'ai';
+import {
+  embedMany,
+  generateImage,
+  generateText,
+  stepCountIs,
+  streamText,
+  tool,
+  wrapEmbeddingModel,
+  wrapImageModel,
+  wrapLanguageModel,
+} from 'ai';
 import { z } from 'zod';
-import { durableCalls, durableEmbeddingCalls } from '../src/index.js';
+import { durableCalls, durableEmbeddingCalls, durableImageCalls, durableMCPTools } from '../src/index.js';
 import {
   contentResponse,
+  IMAGE_BYTES,
   MockEmbeddingModel,
+  MockImageModel,
   MockLanguageModel,
+  MockMCPClient,
   textResponse,
   textStreamParts,
   toolCallResponse,
@@ -279,6 +292,43 @@ const orderingWorkflow = DBOS.registerWorkflow(
     return { types, text: await result.text };
   },
   { name: 'orderingWorkflow' },
+);
+
+const imageMock = new MockImageModel();
+const imageModel = wrapImageModel({ model: imageMock, middleware: durableImageCalls() });
+
+const imageWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const { images } = await generateImage({ model: imageModel, prompt });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { count: images.length, bytes: Array.from(images[0]!.uint8Array) };
+  },
+  { name: 'imageWorkflow' },
+);
+
+const nonRetryMock = new MockLanguageModel();
+const nonRetryModel = wrapLanguageModel({
+  model: nonRetryMock,
+  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 5, intervalSeconds: 0 }),
+});
+
+const nonRetryWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: nonRetryModel, prompt: 'hi', maxRetries: 0 })).text,
+  { name: 'nonRetryWorkflow' },
+);
+
+const mcpToolMock = new MockLanguageModel();
+const mcpToolModel = wrapLanguageModel({ model: mcpToolMock, middleware: durableCalls() });
+const mcpClient = new MockMCPClient();
+
+const mcpWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const tools = await durableMCPTools(mcpClient);
+    const result = await generateText({ model: mcpToolModel, prompt, tools, stopWhen: stepCountIs(5), maxRetries: 0 });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' }); // trailing step to fork past (replays all model/tool steps)
+    return result.text;
+  },
+  { name: 'mcpWorkflow' },
 );
 
 before(async () => {
@@ -575,6 +625,51 @@ test('accumulator preserves arrival order when a part interleaves an open text b
   // The source arrived while the text block was open; content must stay in arrival order (text then source), not [source, text].
   assert.deepEqual(result.types, ['text', 'source']);
   assert.equal(result.text, 'According to the docs');
+});
+
+test('generateImage runs as a durable step, bytes survive, and replay does not re-call the model', async () => {
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(imageWorkflow, { workflowID })('a durable cat');
+  const result = await handle.getResult();
+  assert.equal(result.count, 1);
+  assert.deepEqual(result.bytes, IMAGE_BYTES);
+  assert.equal(imageMock.generateCalls, 1);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof imageWorkflow>>(workflowID, 1);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof imageWorkflow>>;
+  assert.deepEqual(replayed.bytes, IMAGE_BYTES);
+  assert.equal(imageMock.generateCalls, 1);
+});
+
+test('a provider non-retryable error is not retried even with retriesAllowed', async () => {
+  nonRetryMock.generateResults.push(Object.assign(new Error('invalid request'), { isRetryable: false }));
+  const handle = await DBOS.startWorkflow(nonRetryWorkflow, { workflowID: randomUUID() })();
+  await assert.rejects(handle.getResult(), /invalid request/);
+  // Without error classification this would be called maxAttempts (5) times.
+  assert.equal(nonRetryMock.generateCalls, 1);
+});
+
+test('MCP tools list and execute as durable steps; replay does not re-execute the tool', async () => {
+  mcpToolMock.generateResults.push(
+    toolCallResponse('getWeather', '{"city":"Paris"}'),
+    textResponse('It is sunny in Paris.'),
+  );
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(mcpWorkflow, { workflowID })('weather in Paris?');
+  assert.equal(await handle.getResult(), 'It is sunny in Paris.');
+  assert.equal(mcpClient.executeCalls, 1);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.ok(steps?.some((s) => s.name === 'mcp.listTools'), 'tool listing recorded as a durable step');
+  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather'), 'tool call recorded as a durable step');
+  const generateCallsBefore = mcpToolMock.generateCalls;
+
+  // Fork past every model/tool step: they all replay from checkpoints, so nothing is re-invoked.
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof mcpWorkflow>>(workflowID, noopStep.functionID);
+  assert.equal(await forked.getResult(), 'It is sunny in Paris.');
+  assert.equal(mcpClient.executeCalls, 1); // tool not re-invoked on replay
+  assert.equal(mcpToolMock.generateCalls, generateCallsBefore); // model not re-called on replay
 });
 
 // Keep this test last: it shuts down and relaunches DBOS mid-suite.
