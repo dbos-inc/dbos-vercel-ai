@@ -1,0 +1,67 @@
+name: Publish to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Pack and validate without publishing to npm'
+        type: boolean
+        default: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history required for Nerdbank.GitVersioning
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+
+      - run: npm ci
+
+      - name: Validate package (build, lint, publint, attw)
+        run: npm run check:package
+
+      - name: Compute version with Nerdbank.GitVersioning
+        id: nbgv
+        uses: dotnet/nbgv@v0.4.2
+        with:
+          stamp: package.json
+
+      - name: Show computed version
+        run: echo "Version ${{ steps.nbgv.outputs.NpmPackageVersion }} (public=${{ steps.nbgv.outputs.PublicRelease }}, prerelease='${{ steps.nbgv.outputs.PrereleaseVersion }}')"
+
+      # Public releases come from main or release/v* branches. A stable version
+      # (no prerelease suffix) is tagged `latest`; a `-preview` version is tagged
+      # `preview` so it does not become the default `npm install` target.
+      - name: Publish release to npm
+        if: ${{ steps.nbgv.outputs.PublicRelease == 'True' && !inputs.dry-run }}
+        uses: JS-DevTools/npm-publish@v4
+        with:
+          token: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          registry: https://registry.npmjs.org/
+          access: public
+          tag: ${{ steps.nbgv.outputs.PrereleaseVersion == '' && 'latest' || 'preview' }}
+
+      # Builds from any other branch publish under a `test` dist-tag so they can
+      # be installed explicitly but never affect `latest`/`preview`.
+      - name: Publish test build to npm
+        if: ${{ steps.nbgv.outputs.PublicRelease == 'False' && !inputs.dry-run }}
+        uses: JS-DevTools/npm-publish@v4
+        with:
+          token: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          registry: https://registry.npmjs.org/
+          access: public
+          tag: test
+
+      - name: Dry run — pack only
+        if: ${{ inputs.dry-run }}
+        run: npm pack --dry-run

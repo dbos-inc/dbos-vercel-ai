@@ -145,9 +145,4 @@ DBOS checkpoints step results with a superjson-based serializer, so `Date`, `URL
 
 ## Development
 
-Tests require a local Postgres database (set `DBOS_TEST_DB_URL` to override the default `postgresql://postgres@localhost:5432/dbos_vercel_ai_test_dbos_sys`):
-
-```sh
-npm install
-npm test
-```
+See [DEVELOPING.md](./DEVELOPING.md) for building, testing (requires a local Postgres database), and the release process.
