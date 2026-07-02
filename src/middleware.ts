@@ -17,29 +17,17 @@ import type {
 } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
 
 function isInWorkflowFunction(): boolean {
-  // True only in workflow code proper: not in a step (the enclosing step provides
-  // durability), not in a transaction, and not outside DBOS entirely.
+  // True only in workflow code proper: not in a step, transaction, or outside DBOS.
   return DBOS.isInWorkflow();
 }
 
 function assertNotInTransaction(operation: string) {
   if (DBOS.isInTransaction()) {
-    throw new Error(
-      `Cannot call ${operation} inside a DBOS transaction. AI model calls perform network I/O; move this call to workflow or step code.`,
-    );
+    throw new Error(`Cannot call ${operation} inside a DBOS transaction; run it in workflow or step code.`);
   }
 }
 
-// Count of durable model-call steps currently executing within each workflow,
-// keyed by workflow ID. DBOS derives a step's replay identity from a synchronous
-// per-workflow counter captured in the order steps are reached — but the AI SDK
-// can issue model calls concurrently (parallel generateText/streamText, embedMany
-// over more values than the model's per-call limit, or parallel tool sub-agents),
-// and it reaches them in a nondeterministic order. On recovery that order can
-// differ, binding a checkpoint to the wrong call: silently for same-model calls
-// (identical step names), or as a replay crash for different ones. The middleware
-// cannot make the AI SDK deterministic, so it refuses to start a second concurrent
-// durable call rather than risk corruption; run each in its own child workflow.
+// In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
 
 function enterDurableModelCall(): string {
@@ -47,12 +35,7 @@ function enterDurableModelCall(): string {
   const inflight = inflightModelCalls.get(workflowID) ?? 0;
   if (inflight > 0) {
     throw new Error(
-      `Concurrent durable model calls detected in workflow "${workflowID}". The Vercel AI SDK ` +
-        `issues concurrent calls (e.g. Promise.all over generateText/streamText, embedMany over ` +
-        `inputs larger than the model's per-call limit, or parallel tool sub-agents) in a ` +
-        `nondeterministic order, which is unsafe for DBOS replay and can silently bind a checkpoint ` +
-        `to the wrong call on recovery. Run each concurrent model call in its own child workflow with ` +
-        `DBOS.startWorkflow instead. See the "Concurrency" section of the README.`,
+      `Concurrent durable model calls in workflow "${workflowID}" are not supported because their step order is nondeterministic on replay; run each in its own child workflow with DBOS.startWorkflow.`,
     );
   }
   inflightModelCalls.set(workflowID, inflight + 1);
@@ -68,23 +51,7 @@ function exitDurableModelCall(workflowID: string): void {
   }
 }
 
-/**
- * Returns AI SDK language-model middleware that makes model calls durable by
- * running them as DBOS steps. Once a call succeeds, its result is checkpointed
- * in the DBOS system database; if the workflow is interrupted and recovers, the
- * checkpointed result is used instead of calling the model again.
- *
- * Usage:
- * ```ts
- * const model = wrapLanguageModel({
- *   model: openai('gpt-5'),
- *   middleware: durableCalls({ retriesAllowed: true, maxAttempts: 5 }),
- * });
- * ```
- *
- * Used outside a DBOS workflow (or inside another step), the middleware calls
- * the model directly without checkpointing, so the same wrapped model works anywhere.
- */
+/** AI SDK language-model middleware that runs each model call as a durable, checkpointed DBOS step (replayed on recovery); outside a workflow it calls the model directly. */
 export function durableCalls(options: StepConfig = {}): LanguageModelV4Middleware {
   const stepConfig = options;
   return {
@@ -113,9 +80,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
       }
       const workflowID = enterDurableModelCall();
 
-      // With retries enabled, a failed attempt may have already produced parts, so
-      // live pass-through would deliver output from multiple attempts. Instead,
-      // buffer and emit the (synthesized) parts only after the step succeeds.
+      // With retries, buffer and emit only after success so parts from a failed attempt aren't delivered live.
       const buffered = stepConfig.retriesAllowed === true;
 
       let executed = false;
@@ -126,9 +91,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
         start(c) {
           controller = c;
         },
-        // On cancellation the step keeps draining the model to a checkpoint. Await
-        // it so a workflow that cancels early still blocks until the result is
-        // durable, instead of racing the checkpoint against workflow completion.
+        // Await the step so an early cancel still blocks until the model result is checkpointed.
         async cancel() {
           cancelled = true;
           await step.catch(() => {});
@@ -158,11 +121,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
         { ...stepConfig, name: stepConfig.name ?? stepName(model, 'stream') },
       );
 
-      // Don't await the step before returning: parts must flow to the consumer
-      // while the model call runs. The stream closes only after the step is
-      // checkpointed, so consumers finish strictly after the result is durable.
-      // If the step was replayed from a checkpoint (or ran buffered), the closure
-      // above never emitted, so synthesize the parts from the recorded result.
+      // Return the stream now and drive it from the settled step: replay/buffered runs emit synthesized parts, then close so consumers finish only after the result is durable.
       void step
         .then(
           (recorded) => {
@@ -182,10 +141,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
   };
 }
 
-/**
- * Returns AI SDK embedding-model middleware that makes embedding calls durable
- * by running them as DBOS steps, analogous to {@link durableCalls}.
- */
+/** AI SDK embedding-model middleware that runs each embedding call as a durable DBOS step, like {@link durableCalls}. */
 export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelV4Middleware {
   return {
     specificationVersion: 'v4',
@@ -211,11 +167,7 @@ function stepName(model: LanguageModelV4 | EmbeddingModelV4, operation: string):
   return `${model.provider}.${model.modelId}.${operation}`;
 }
 
-/**
- * DBOS serializes step results with superjson, which round-trips Date, URL, Map,
- * Set, and Buffer — but not raw Uint8Array. Generated files may carry raw bytes,
- * so convert them to base64 strings, which the provider spec explicitly allows.
- */
+/** Convert generated-file bytes (Uint8Array) to base64 (spec-allowed) to keep checkpoints compact. */
 function encodeBinaryContent(result: LanguageModelV4GenerateResult): LanguageModelV4GenerateResult {
   const content = result.content.map(encodeBinaryPart);
   return content.some((part, i) => part !== result.content[i]) ? { ...result, content } : result;
@@ -232,10 +184,7 @@ function encodeBinaryPart(part: LanguageModelV4Content): LanguageModelV4Content 
   return part;
 }
 
-/**
- * Assembles the parts of a model stream into a `LanguageModelV4GenerateResult`
- * so the completed stream can be checkpointed as a single step result.
- */
+/** Assembles stream parts into a LanguageModelV4GenerateResult so a stream can be checkpointed as one step result. */
 class StreamAccumulator {
   private readonly content: LanguageModelV4Content[] = [];
   private finishReason: LanguageModelV4FinishReason = { unified: 'other', raw: undefined };
@@ -246,11 +195,7 @@ class StreamAccumulator {
   private readonly warnings: SharedV4Warning[] = [];
   private providerMetadata?: SharedV4ProviderMetadata;
   private responseMetadata?: LanguageModelV4ResponseMetadata;
-  // These map a block id to the text/reasoning content object that is ALSO already
-  // in `content`. Blocks are appended to `content` at their `-start` and mutated in
-  // place, so `content` preserves arrival order — matching the AI SDK's own stream
-  // recorder. (Deferring the push to `-end` would place any part that arrives while
-  // a block is open ahead of that block, and would drop a block that never closes.)
+  // Text/reasoning content objects (also in content), appended at -start and mutated in place so content keeps arrival order.
   private readonly textBlocks = new Map<string, LanguageModelV4Text>();
   private readonly reasoningBlocks = new Map<string, LanguageModelV4Reasoning>();
 
@@ -315,15 +260,13 @@ class StreamAccumulator {
         // Transient parts; the tool-call part carries the complete input.
         break;
       default:
-        // Complete content parts: tool-call, tool-result, tool-approval-request,
-        // file, reasoning-file, source, custom.
+        // Complete content parts: tool-call, tool-result, tool-approval-request, file, reasoning-file, source, custom.
         this.content.push(part);
         break;
     }
   }
 
-  // Fallbacks for a malformed stream that emits a delta without a preceding start:
-  // create the block in arrival position rather than dropping the text.
+  // If a delta arrives with no preceding start, create the block in arrival position rather than dropping the text.
   private getOrCreateText(id: string): LanguageModelV4Text {
     let block = this.textBlocks.get(id);
     if (!block) {
@@ -360,12 +303,7 @@ class StreamAccumulator {
   }
 }
 
-/**
- * Synthesizes a stream of parts from a checkpointed generate result, for replaying
- * a recorded model stream during workflow recovery. Text and reasoning come back
- * as a single delta per block; the real-time token stream already happened during
- * the original execution.
- */
+/** Synthesizes a stream from a checkpointed result on recovery; text/reasoning come back as one delta per block. */
 function* replayParts(result: LanguageModelV4GenerateResult): Generator<LanguageModelV4StreamPart> {
   yield { type: 'stream-start', warnings: result.warnings ?? [] };
   if (result.response?.id !== undefined || result.response?.timestamp !== undefined || result.response?.modelId !== undefined) {

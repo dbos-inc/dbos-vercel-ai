@@ -103,8 +103,7 @@ const retryModel = wrapLanguageModel({
 
 const retryWorkflow = DBOS.registerWorkflow(
   async (prompt: string) => {
-    // maxRetries: 0 disables the AI SDK's own retry layer so the test observes
-    // DBOS step retries in isolation.
+    // maxRetries: 0 disables the AI SDK's own retry layer so the test observes DBOS step retries in isolation.
     const result = await generateText({ model: retryModel, prompt, maxRetries: 0 });
     return result.text;
   },
@@ -194,8 +193,7 @@ const cancelWorkflow = DBOS.registerWorkflow(
     const reader = streamResult.stream.getReader();
     await reader.read();
     await reader.read();
-    // cancel() awaits the in-flight step, so the model call is durably checkpointed
-    // before the workflow proceeds — no sleep needed to avoid racing the checkpoint.
+    // cancel() awaits the in-flight step, so the model call is checkpointed before the workflow proceeds (no sleep needed).
     await reader.cancel();
     return 'cancelled early';
   },
@@ -228,14 +226,11 @@ const concurrentWorkflow = DBOS.registerWorkflow(
   { name: 'concurrentWorkflow' },
 );
 
-// Streams a `source` part while a text block is still open, to check the
-// accumulator keeps arrival order ([text, source]) rather than pushing the
-// complete part ahead of the not-yet-closed text.
+// Streams a source part while a text block is still open, to check the accumulator keeps arrival order ([text, source]).
 const orderingMock = new MockLanguageModel();
 const orderingModel = wrapLanguageModel({
   model: orderingMock,
-  // Buffered (retries) mode so the consumer sees the parts synthesized from the
-  // accumulated/checkpointed content — i.e. this asserts the accumulator's order.
+  // Buffered (retries) mode so the consumer sees parts synthesized from the checkpointed content — asserts the accumulator's order.
   middleware: durableCalls({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 }),
 });
 
@@ -286,9 +281,7 @@ test('replayed workflows use the checkpointed model result instead of calling th
   const original = await handle.getResult();
   assert.equal(generateMock.generateCalls, 2);
 
-  // Fork after the model-call step: the workflow function re-executes, but the
-  // model call is replayed from its checkpoint. No mock responses are queued, so
-  // any real model call would throw.
+  // Fork after the model-call step: the workflow re-executes but the model call replays from its checkpoint (no responses queued, so a real call would throw).
   const forked = await DBOS.forkWorkflow<ReturnType<typeof generateWorkflow>>(workflowID, 1);
   const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof generateWorkflow>>;
 
@@ -388,8 +381,7 @@ test('recovery resumes mid-tool-loop without repeating completed work', async ()
   const callsBefore = toolMock.generateCalls;
   const toolExecutionsBefore = toolExecutions;
 
-  // Fork after step 0 (first model call) and step 1 (tool step), i.e. mid-loop:
-  // both replay from checkpoints and only the second model call re-executes.
+  // Fork after step 0 (first model call) and step 1 (tool step), mid-loop: both replay and only the second model call re-executes.
   toolMock.generateResults.push(textResponse('Recovered: rainy in Oslo.'));
   const forked = await DBOS.forkWorkflow<ReturnType<typeof toolWorkflow>>(workflowID, 2);
   assert.equal(await forked.getResult(), 'Recovered: rainy in Oslo.');
@@ -454,8 +446,7 @@ test('streaming with retries buffers output until an attempt succeeds', async ()
   );
   const handle = await DBOS.startWorkflow(bufferedStreamWorkflow, { workflowID: randomUUID() })('hi');
   const result = await handle.getResult();
-  // Nothing from the failed attempt leaks to the consumer; the successful
-  // attempt is flushed after completion as one delta per text block.
+  // Nothing from the failed attempt leaks to the consumer; the successful attempt is flushed after completion as one delta per block.
   assert.deepEqual(result.deltas, ['Good answer']);
   assert.equal(result.text, 'Good answer');
   assert.equal(bufferedMock.streamCalls, 2);
@@ -514,8 +505,7 @@ test('accumulator preserves arrival order when a part interleaves an open text b
   ]);
   const handle = await DBOS.startWorkflow(orderingWorkflow, { workflowID: randomUUID() })();
   const result = await handle.getResult();
-  // The source arrived while the text block was open; content must stay in arrival
-  // order (text then source), not [source, text].
+  // The source arrived while the text block was open; content must stay in arrival order (text then source), not [source, text].
   assert.deepEqual(result.types, ['text', 'source']);
   assert.equal(result.text, 'According to the docs');
 });
@@ -531,11 +521,7 @@ test('recovered workflows replay model calls and messages from checkpoints', asy
   assert.equal(original.go, 'proceed');
   assert.equal(recoveryMock.generateCalls, 1);
 
-  // Simulate a crash that lost the completion: flip the workflow back to
-  // PENDING (the same technique the DBOS SDK's own recovery tests use), then
-  // relaunch. Launch-time recovery re-executes the workflow function; the model
-  // call and the recv must both replay from checkpoints (no mock responses are
-  // queued and no message is re-sent, so real re-execution would fail).
+  // Simulate a lost completion: flip the workflow back to PENDING, then relaunch so recovery re-executes it and the model call and recv both replay from checkpoints.
   const client = new PgClient({ connectionString: systemDatabaseUrl });
   await client.connect();
   try {
