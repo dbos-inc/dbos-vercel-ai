@@ -95,6 +95,23 @@ const embedWorkflow = DBOS.registerWorkflow(
   { name: 'embedWorkflow' },
 );
 
+// Finite per-call limit makes embedMany split inputs into batches (parallel by default).
+const batchEmbedMock = new MockEmbeddingModel(2);
+const batchEmbedModel = wrapEmbeddingModel({ model: batchEmbedMock, middleware: durableEmbeddingCalls() });
+
+const parallelEmbedWorkflow = DBOS.registerWorkflow(
+  async (values: string[]) => (await embedMany({ model: batchEmbedModel, values })).embeddings.length,
+  { name: 'parallelEmbedWorkflow' },
+);
+
+const serialEmbedWorkflow = DBOS.registerWorkflow(
+  async (values: string[]) => {
+    const result = await embedMany({ model: batchEmbedModel, values, maxParallelCalls: 1 });
+    return { count: result.embeddings.length, first: result.embeddings[0] };
+  },
+  { name: 'serialEmbedWorkflow' },
+);
+
 const retryMock = new MockLanguageModel();
 const retryModel = wrapLanguageModel({
   model: retryMock,
@@ -337,6 +354,18 @@ test('embedMany runs as a durable step inside a workflow', async () => {
   assert.equal(result.count, 2);
   assert.deepEqual(result.first, [0, 0.5, 0.25]);
   assert.equal(embedMock.embedCalls, 1);
+});
+
+test('multi-batch embedMany (parallel batches) trips the guard with a remedy in the message', async () => {
+  const handle = await DBOS.startWorkflow(parallelEmbedWorkflow, { workflowID: randomUUID() })(['a', 'b', 'c', 'd']);
+  await assert.rejects(handle.getResult(), /Concurrent durable model calls.*maxParallelCalls: 1/s);
+});
+
+test('multi-batch embedMany with maxParallelCalls: 1 is durable and correct', async () => {
+  const handle = await DBOS.startWorkflow(serialEmbedWorkflow, { workflowID: randomUUID() })(['a', 'b', 'c', 'd']);
+  const result = await handle.getResult();
+  assert.equal(result.count, 4);
+  assert.deepEqual(result.first, [0, 0.5, 0.25]);
 });
 
 test('wrapped models work outside DBOS workflows without checkpointing', async () => {

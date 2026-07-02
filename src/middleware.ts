@@ -30,12 +30,17 @@ function assertNotInTransaction(operation: string) {
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
 
-function enterDurableModelCall(): string {
+function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed'): string {
   const workflowID = DBOS.workflowID!;
   const inflight = inflightModelCalls.get(workflowID) ?? 0;
   if (inflight > 0) {
+    // embedMany parallelizes its batches; maxParallelCalls: 1 serializes them deterministically. Other callers use child workflows.
+    const remedy =
+      operation === 'embed'
+        ? 'pass maxParallelCalls: 1 to embedMany, or run each call in its own child workflow with DBOS.startWorkflow'
+        : 'run each call in its own child workflow with DBOS.startWorkflow';
     throw new Error(
-      `Concurrent durable model calls in workflow "${workflowID}" are not supported because their step order is nondeterministic on replay; run each in its own child workflow with DBOS.startWorkflow.`,
+      `Concurrent durable model calls in workflow "${workflowID}" are not supported because their step order is nondeterministic on replay; ${remedy}.`,
     );
   }
   inflightModelCalls.set(workflowID, inflight + 1);
@@ -62,7 +67,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
-      const workflowID = enterDurableModelCall();
+      const workflowID = enterDurableModelCall('generate');
       try {
         return await DBOS.runStep(async () => encodeBinaryContent(await doGenerate()), {
           ...stepConfig,
@@ -78,7 +83,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
       if (!isInWorkflowFunction()) {
         return await doStream();
       }
-      const workflowID = enterDurableModelCall();
+      const workflowID = enterDurableModelCall('stream');
 
       // With retries, buffer and emit only after success so parts from a failed attempt aren't delivered live.
       const buffered = stepConfig.retriesAllowed === true;
@@ -150,7 +155,7 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelV
       if (!isInWorkflowFunction()) {
         return await doEmbed();
       }
-      const workflowID = enterDurableModelCall();
+      const workflowID = enterDurableModelCall('embed');
       try {
         return await DBOS.runStep(async () => doEmbed(), {
           ...options,

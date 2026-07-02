@@ -111,7 +111,7 @@ const agent = DBOS.registerWorkflow(async (question: string) => {
 
 ## Concurrency
 
-Run **one durable model call at a time within a single workflow**. DBOS derives each step's replay identity from the order steps are reached, but the AI SDK issues concurrent model calls in a nondeterministic order — so on recovery a checkpoint could be bound to the wrong call, silently returning one call's result for another. To prevent this, the middleware throws if it detects a second durable model call starting while one is already in flight in the same workflow. This covers `Promise.all` over `generateText`/`streamText`, `embedMany` on inputs larger than the model's per-call limit (which the SDK batches in parallel), and parallel tool calls that themselves invoke models.
+Run **one durable model call at a time within a single workflow**. DBOS derives each step's replay identity from the order steps are reached, but the AI SDK issues concurrent model calls in a nondeterministic order — so on recovery a checkpoint could be bound to the wrong call, silently returning one call's result for another. To prevent this, the middleware throws if it detects a second durable model call starting while one is already in flight in the same workflow. This covers `Promise.all` over `generateText`/`streamText`, `embedMany` on inputs larger than the model's per-call limit (which the SDK batches in parallel — see [Embeddings](#embeddings) for the `maxParallelCalls: 1` remedy), and parallel tool calls that themselves invoke models.
 
 Sequential calls — including a normal tool-calling loop, where each model call completes before the next begins — are unaffected.
 
@@ -144,8 +144,10 @@ const embeddingModel = wrapEmbeddingModel({
   middleware: durableEmbeddingCalls({ retriesAllowed: true }),
 });
 
-const { embeddings } = await embedMany({ model: embeddingModel, values: chunks });
+const { embeddings } = await embedMany({ model: embeddingModel, values: chunks, maxParallelCalls: 1 });
 ```
+
+Pass `maxParallelCalls: 1` when embedding more values than the model's per-call limit. `embedMany` otherwise splits the input into batches and runs them concurrently, which the concurrency guard rejects (their step order would be nondeterministic on replay); `maxParallelCalls: 1` runs the batches sequentially, keeping them durable and replay-safe.
 
 ## Serialization
 

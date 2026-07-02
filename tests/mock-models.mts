@@ -111,10 +111,15 @@ export class MockEmbeddingModel implements EmbeddingModelV4 {
   readonly specificationVersion = 'v4';
   readonly provider = 'mock';
   readonly modelId = 'mock-embed';
-  readonly maxEmbeddingsPerCall = undefined;
+  readonly maxEmbeddingsPerCall: number | undefined;
   readonly supportsParallelCalls = true;
 
   embedCalls = 0;
+
+  // A finite maxEmbeddingsPerCall makes embedMany split large inputs into batches (parallel by default).
+  constructor(maxEmbeddingsPerCall?: number) {
+    this.maxEmbeddingsPerCall = maxEmbeddingsPerCall;
+  }
 
   async doEmbed(options: EmbeddingModelV4CallOptions): Promise<EmbeddingModelV4Result> {
     this.embedCalls++;
