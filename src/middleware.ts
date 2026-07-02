@@ -116,6 +116,8 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
             const { done, value: part } = await reader.read();
             if (done) break;
             if (part.type === 'error') {
+              // A cancelled consumer abandoned this call; don't let a post-cancel failure become the step outcome, or replay would fail where the live run succeeded.
+              if (cancelled) break;
               throw part.error instanceof Error ? part.error : new Error(String(part.error));
             }
             if (!buffered) emit(part);

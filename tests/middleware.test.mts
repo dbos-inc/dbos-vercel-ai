@@ -217,6 +217,24 @@ const cancelWorkflow = DBOS.registerWorkflow(
   { name: 'cancelWorkflow' },
 );
 
+const cancelErrorMock = new MockLanguageModel();
+const cancelErrorModel = wrapLanguageModel({ model: cancelErrorMock, middleware: durableCalls() });
+
+// Reads two parts, cancels, then the model stream errors. The step must record a success (not the
+// post-cancel error), so a fork replays identically instead of failing where the live run succeeded.
+const cancelErrorWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const streamResult = await cancelErrorModel.doStream({ prompt: userPrompt });
+    const reader = streamResult.stream.getReader();
+    await reader.read();
+    await reader.read();
+    await reader.cancel();
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return 'cancelled before error';
+  },
+  { name: 'cancelErrorWorkflow' },
+);
+
 const recoveryMock = new MockLanguageModel();
 const recoveryModel = wrapLanguageModel({ model: recoveryMock, middleware: durableCalls() });
 
@@ -501,6 +519,26 @@ test('cancelling the consumer stream still checkpoints the full model call', asy
   assert.equal(cancelMock.streamCalls, 1);
   const steps = await DBOS.listWorkflowSteps(workflowID);
   assert.ok(steps !== undefined && steps.some((s) => s.name === 'mock.mock-model.stream'));
+});
+
+test('cancel then model failure records a success, so a fork replays identically instead of failing', async () => {
+  cancelErrorMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'a' },
+    { type: 'text-delta', id: 't1', delta: 'b' },
+    { type: 'error', error: new Error('upstream failure after cancel') },
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(cancelErrorWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'cancelled before error');
+  assert.equal(cancelErrorMock.streamCalls, 1);
+
+  // Fork after the stream step: it replays from its checkpoint. Before the fix the step was
+  // recorded as an error and the fork threw; now it's a success and replays identically.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof cancelErrorWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 'cancelled before error');
+  assert.equal(cancelErrorMock.streamCalls, 1);
 });
 
 test('invoking a workflow twice with the same ID does not repeat model calls', async () => {
