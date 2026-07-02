@@ -14,7 +14,7 @@ import type {
   LanguageModelV4StreamResult,
   LanguageModelV4Usage,
 } from '@ai-sdk/provider';
-import { tool, type ToolSet } from 'ai';
+import { dynamicTool, jsonSchema, tool, type ToolSet } from 'ai';
 import { z } from 'zod';
 
 export function usage(inputTokens = 10, outputTokens = 20): LanguageModelV4Usage {
@@ -79,14 +79,17 @@ export class MockLanguageModel implements LanguageModelV4 {
   readonly modelId = 'mock-model';
   readonly supportedUrls: Record<string, RegExp[]> = {};
 
-  // Queue an Error to fail that doGenerate call; queue an 'error' stream part to fail that doStream partway.
+  // Queue an Error to fail that doGenerate call; queue an 'error' stream part to fail that doStream partway,
+  // or an Error in a part list to fail the stream itself (read() rejects) at that point.
   generateResults: (LanguageModelV4GenerateResult | Error)[] = [];
-  streamPartLists: LanguageModelV4StreamPart[][] = [];
+  streamPartLists: (LanguageModelV4StreamPart | Error)[][] = [];
   generateCalls = 0;
   streamCalls = 0;
+  generateOptions: LanguageModelV4CallOptions[] = [];
 
-  async doGenerate(_options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
+  async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     this.generateCalls++;
+    this.generateOptions.push(options);
     const result = this.generateResults.shift();
     if (result === undefined) {
       throw new Error('MockLanguageModel: no generate responses left');
@@ -107,6 +110,11 @@ export class MockLanguageModel implements LanguageModelV4 {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
         async start(controller) {
           for (const part of parts) {
+            if (part instanceof Error) {
+              // Stream-level failure: reads reject, unlike an 'error' part.
+              controller.error(part);
+              return;
+            }
             controller.enqueue(part);
             // Yield to the event loop so parts arrive asynchronously, as from a network.
             await new Promise((resolve) => setImmediate(resolve));
@@ -196,6 +204,43 @@ export class MockMCPClient {
         },
       }),
     };
+  }
+
+  async close(): Promise<void> {}
+}
+
+// Mimics @ai-sdk/mcp's rebuilt tools: dynamicTool with title/metadata/toModelOutput plus a spread _meta.
+export class RichMockMCPClient {
+  screenshotCalls = 0;
+
+  async tools(): Promise<ToolSet> {
+    const screenshot = dynamicTool({
+      description: 'Take a screenshot',
+      title: 'Screenshot',
+      metadata: { clientName: 'mock-mcp', toolName: 'screenshot' },
+      inputSchema: jsonSchema({ type: 'object', properties: {}, additionalProperties: false }),
+      execute: async () => {
+        this.screenshotCalls++;
+        return {
+          content: [
+            { type: 'text', text: 'took screenshot' },
+            { type: 'image', data: 'QUJD', mimeType: 'image/png' },
+          ],
+        };
+      },
+      toModelOutput: ({ output }) => {
+        const result = output as { content: { type: string; text?: string; data?: string; mimeType?: string }[] };
+        return {
+          type: 'content',
+          value: result.content.map((part) =>
+            part.type === 'image'
+              ? { type: 'file' as const, mediaType: part.mimeType!, data: { type: 'data' as const, data: part.data! } }
+              : { type: 'text' as const, text: part.text! },
+          ),
+        };
+      },
+    });
+    return { screenshot: Object.assign(screenshot, { _meta: { 'mcp/app': { uri: 'ui://screenshot' } } }) };
   }
 
   async close(): Promise<void> {}

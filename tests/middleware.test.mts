@@ -30,6 +30,7 @@ import {
   MockImageModel,
   MockLanguageModel,
   MockMCPClient,
+  RichMockMCPClient,
   textResponse,
   textStreamParts,
   toolCallResponse,
@@ -256,6 +257,23 @@ const cancelErrorWorkflow = DBOS.registerWorkflow(
   { name: 'cancelErrorWorkflow' },
 );
 
+const cancelRejectMock = new MockLanguageModel();
+const cancelRejectModel = wrapLanguageModel({ model: cancelRejectMock, middleware: durableCalls() });
+
+// Like cancelErrorWorkflow, but the model stream rejects (stream-level failure) after the cancel instead of sending an error part.
+const cancelRejectWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const streamResult = await cancelRejectModel.doStream({ prompt: userPrompt });
+    const reader = streamResult.stream.getReader();
+    await reader.read();
+    await reader.read();
+    await reader.cancel();
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return 'cancelled before rejection';
+  },
+  { name: 'cancelRejectWorkflow' },
+);
+
 const recoveryMock = new MockLanguageModel();
 const recoveryModel = wrapLanguageModel({ model: recoveryMock, middleware: durableCalls() });
 
@@ -364,6 +382,27 @@ const parallelMcpWorkflow = DBOS.registerWorkflow(
     return result.text;
   },
   { name: 'parallelMcpWorkflow' },
+);
+
+const richMcpMock = new MockLanguageModel();
+const richMcpModel = wrapLanguageModel({ model: richMcpMock, middleware: durableCalls() });
+const richMcpClient = new RichMockMCPClient();
+
+const richMcpWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const tools = await durableMCPTools(richMcpClient);
+    const result = await generateText({ model: richMcpModel, prompt, tools, stopWhen: stepCountIs(5), maxRetries: 0 });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    const screenshot = tools.screenshot!;
+    return {
+      text: result.text,
+      title: screenshot.title,
+      metadata: screenshot.metadata,
+      meta: (screenshot as { _meta?: unknown })._meta,
+      converts: typeof screenshot.toModelOutput === 'function',
+    };
+  },
+  { name: 'richMcpWorkflow' },
 );
 
 // #4: an explicit `shouldRetry: undefined` must still fall back to the default classification.
@@ -674,6 +713,25 @@ test('cancel then model failure records a success, so a fork replays identically
   assert.equal(cancelErrorMock.streamCalls, 1);
 });
 
+test('cancel then stream-level rejection records a success, so a fork replays identically', async () => {
+  cancelRejectMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'a' },
+    { type: 'text-delta', id: 't1', delta: 'b' },
+    new Error('connection reset after cancel'),
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(cancelRejectWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'cancelled before rejection');
+  assert.equal(cancelRejectMock.streamCalls, 1);
+
+  // Fork after the stream step: before the fix the rejection was recorded as the step outcome and the fork threw here.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof cancelRejectWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 'cancelled before rejection');
+  assert.equal(cancelRejectMock.streamCalls, 1);
+});
+
 test('invoking a workflow twice with the same ID does not repeat model calls', async () => {
   generateMock.generateResults.push(textResponse('only once'));
   const workflowID = randomUUID();
@@ -796,6 +854,48 @@ test('parallel MCP tool calls each execute durably and replay without re-executi
   assert.equal(await forked.getResult(), 'Fetched weather and time for Paris.');
   assert.equal(parallelMcpClient.weatherCalls, 1); // not re-executed on replay
   assert.equal(parallelMcpClient.timeCalls, 1);
+});
+
+test('MCP tool results reach the model as converted content; title/metadata/_meta survive checkpointing', async () => {
+  richMcpMock.generateResults.push(toolCallResponse('screenshot', '{}'), textResponse('Here is your screenshot.'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(richMcpWorkflow, { workflowID })('take a screenshot');
+  const result = await handle.getResult();
+  assert.equal(result.text, 'Here is your screenshot.');
+  assert.equal(result.title, 'Screenshot');
+  assert.deepEqual(result.metadata, { clientName: 'mock-mcp', toolName: 'screenshot' });
+  assert.deepEqual(result.meta, { 'mcp/app': { uri: 'ui://screenshot' } });
+  assert.equal(result.converts, true);
+  assert.equal(richMcpClient.screenshotCalls, 1);
+
+  // The follow-up model call must see the tool result as converted content (text + file), not raw MCP JSON.
+  const followUp = richMcpMock.generateOptions.at(-1)!;
+  const toolMessage = followUp.prompt.find((m) => m.role === 'tool')!;
+  const resultPart = (toolMessage.content as { type: string; output?: { type: string; value: unknown } }[]).find(
+    (p) => p.type === 'tool-result',
+  )!;
+  assert.equal(resultPart.output!.type, 'content');
+  const value = resultPart.output!.value as { type: string; text?: string; mediaType?: string; data?: unknown }[];
+  assert.deepEqual(value[0], { type: 'text', text: 'took screenshot' });
+  assert.equal(value[1]!.type, 'file');
+  assert.equal(value[1]!.mediaType, 'image/png');
+  assert.deepEqual(value[1]!.data, { type: 'data', data: 'QUJD' });
+
+  // Fork past all steps: tools rebuilt from the checkpointed listing must carry the same fields and converter.
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof richMcpWorkflow>>(workflowID, noopStep.functionID);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof richMcpWorkflow>>;
+  assert.equal(replayed.title, 'Screenshot');
+  assert.deepEqual(replayed.meta, { 'mcp/app': { uri: 'ui://screenshot' } });
+  assert.equal(replayed.converts, true);
+  assert.equal(richMcpClient.screenshotCalls, 1); // tool not re-executed on replay
+});
+
+test('tools without toModelOutput are not given one', async () => {
+  const tools = await durableMCPTools(new MockMCPClient());
+  assert.equal(tools.getWeather!.toModelOutput, undefined);
+  assert.equal(tools.getWeather!.title, undefined);
 });
 
 test('explicit shouldRetry: undefined falls back to the default classification', async () => {

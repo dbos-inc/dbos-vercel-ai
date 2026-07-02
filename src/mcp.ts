@@ -10,7 +10,33 @@ export interface MCPClientLike {
 
 interface DurableToolDef {
   description?: string;
+  title?: string;
+  metadata?: ToolSet[string]['metadata'];
+  meta?: unknown;
+  convertsOutput: boolean;
   inputJsonSchema: unknown;
+}
+
+type ToolModelOutput = Awaited<ReturnType<NonNullable<ToolSet[string]['toModelOutput']>>>;
+
+// Mirror of @ai-sdk/mcp's toModelOutput: MCP content becomes model content (text stays text, images become files).
+function mcpToolOutput(output: unknown): ToolModelOutput {
+  const result = output as { content?: unknown };
+  if (result === null || typeof result !== 'object' || !Array.isArray(result.content)) {
+    return { type: 'json', value: output } as ToolModelOutput;
+  }
+  return {
+    type: 'content',
+    value: result.content.map((part: { type?: string; text?: string; data?: string; mimeType?: string }) => {
+      if (part.type === 'text' && typeof part.text === 'string') {
+        return { type: 'text' as const, text: part.text };
+      }
+      if (part.type === 'image' && part.data !== undefined && part.mimeType !== undefined) {
+        return { type: 'file' as const, mediaType: part.mimeType, data: { type: 'data' as const, data: part.data } };
+      }
+      return { type: 'text' as const, text: JSON.stringify(part) };
+    }),
+  };
 }
 
 /**
@@ -29,18 +55,28 @@ export async function durableMCPTools(client: MCPClientLike, options: StepConfig
     const tools = await client.tools();
     const defs: Record<string, DurableToolDef> = {};
     for (const [name, tool] of Object.entries(tools)) {
-      const description = typeof tool.description === 'string' ? tool.description : undefined;
-      // Await: a Schema's jsonSchema may be a Promise, which would otherwise checkpoint as {} and yield an empty schema.
-      defs[name] = { description, inputJsonSchema: await asSchema(tool.inputSchema).jsonSchema };
+      defs[name] = {
+        description: typeof tool.description === 'string' ? tool.description : undefined,
+        title: typeof tool.title === 'string' ? tool.title : undefined,
+        metadata: tool.metadata,
+        meta: (tool as { _meta?: unknown })._meta,
+        convertsOutput: typeof tool.toModelOutput === 'function',
+        // Await: a Schema's jsonSchema may be a Promise, which would otherwise checkpoint as {} and yield an empty schema.
+        inputJsonSchema: await asSchema(tool.inputSchema).jsonSchema,
+      };
     }
     return defs;
   });
 
   const durable: ToolSet = {};
   for (const [name, def] of Object.entries(listed)) {
-    durable[name] = dynamicTool({
+    const reconstructed = dynamicTool({
       description: def.description ?? '',
+      title: def.title,
+      metadata: def.metadata,
       inputSchema: jsonSchema(def.inputJsonSchema as Parameters<typeof jsonSchema>[0]),
+      // MCP clients convert results via a pure toModelOutput; reapply an equivalent so results reach the model as content, not raw JSON.
+      toModelOutput: def.convertsOutput ? ({ output }) => mcpToolOutput(output) : undefined,
       // Re-fetch the live tool inside the step (its execute closure can't be checkpointed); replay returns the recorded result.
       execute: (input: unknown, execOptions) =>
         run(`mcp.tool.${name}`, async () => {
@@ -49,6 +85,8 @@ export async function durableMCPTools(client: MCPClientLike, options: StepConfig
           return tool.execute(input, execOptions);
         }),
     });
+    // @ai-sdk/mcp spreads the MCP _meta onto the tool object; preserve it for consumers that read it.
+    durable[name] = def.meta === undefined ? reconstructed : Object.assign(reconstructed, { _meta: def.meta });
   }
   return durable;
 }

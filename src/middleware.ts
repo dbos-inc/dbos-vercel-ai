@@ -102,21 +102,27 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
       step = DBOS.runStep(
         async () => {
           executed = true;
-          const streamResult = await doStream();
           const accumulator = new StreamAccumulator();
-          const reader = streamResult.stream.getReader();
-          for (;;) {
-            const { done, value: part } = await reader.read();
-            if (done) break;
-            if (part.type === 'error') {
-              // A cancelled consumer abandoned this call; don't let a post-cancel failure become the step outcome, or replay would fail where the live run succeeded.
-              if (cancelled) break;
-              throw part.error instanceof Error ? part.error : new Error(String(part.error));
+          let streamResult: Awaited<ReturnType<typeof doStream>> | undefined;
+          try {
+            streamResult = await doStream();
+            const reader = streamResult.stream.getReader();
+            for (;;) {
+              const { done, value: part } = await reader.read();
+              if (done) break;
+              if (part.type === 'error') {
+                // A cancelled consumer abandoned this call; don't let a post-cancel failure become the step outcome, or replay would fail where the live run succeeded.
+                if (cancelled) break;
+                throw part.error instanceof Error ? part.error : new Error(String(part.error));
+              }
+              if (!buffered) emit(part);
+              accumulator.add(part);
             }
-            if (!buffered) emit(part);
-            accumulator.add(part);
+          } catch (error) {
+            // Same rule for stream-level failures (doStream or a read rejecting) after a cancel.
+            if (!cancelled) throw error;
           }
-          return encodeBinaryContent(accumulator.result(streamResult.request, streamResult.response));
+          return encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
         },
         { ...stepConfig, name: stepConfig.name ?? stepName(model, 'stream') },
       );
