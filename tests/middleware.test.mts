@@ -2,16 +2,19 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { DBOS } from '@dbos-inc/dbos-sdk';
+import { Client as PgClient } from 'pg';
 import { embedMany, generateText, stepCountIs, streamText, tool, wrapEmbeddingModel, wrapLanguageModel } from 'ai';
 import { z } from 'zod';
 import type { LanguageModelV4StreamPart } from '@ai-sdk/provider';
 import { durableCalls, durableEmbeddingCalls } from '../src/index.js';
 import {
+  contentResponse,
   MockEmbeddingModel,
   MockLanguageModel,
   textResponse,
   textStreamParts,
   toolCallResponse,
+  usage,
 } from './mock-models.mjs';
 
 const systemDatabaseUrl =
@@ -105,6 +108,125 @@ const embedWorkflow = DBOS.registerWorkflow(
     return { count: result.embeddings.length, first: result.embeddings[0] };
   },
   { name: 'embedWorkflow' },
+);
+
+const retryMock = new MockLanguageModel();
+const retryModel = wrapLanguageModel({
+  model: retryMock,
+  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 }),
+});
+
+const retryWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    // maxRetries: 0 disables the AI SDK's own retry layer so the test observes
+    // DBOS step retries in isolation.
+    const result = await generateText({ model: retryModel, prompt, maxRetries: 0 });
+    return result.text;
+  },
+  { name: 'retryWorkflow' },
+);
+
+const errorMock = new MockLanguageModel();
+const errorModel = wrapLanguageModel({ model: errorMock, middleware: durableCalls() });
+
+const errorWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = await generateText({ model: errorModel, prompt, maxRetries: 0 });
+    return result.text;
+  },
+  { name: 'errorWorkflow' },
+);
+
+const fileMock = new MockLanguageModel();
+const fileModel = wrapLanguageModel({ model: fileMock, middleware: durableCalls() });
+
+const fileWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = await generateText({ model: fileModel, prompt });
+    const file = result.files[0]!;
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { text: result.text, mediaType: file.mediaType, bytes: Array.from(file.uint8Array) };
+  },
+  { name: 'fileWorkflow' },
+);
+
+const reasoningMock = new MockLanguageModel();
+const reasoningModel = wrapLanguageModel({ model: reasoningMock, middleware: durableCalls() });
+
+const reasoningWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = streamText({ model: reasoningModel, prompt });
+    const text = await result.text;
+    const reasoning = await result.reasoningText;
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { text, reasoning };
+  },
+  { name: 'reasoningWorkflow' },
+);
+
+const bufferedMock = new MockLanguageModel();
+const bufferedModel = wrapLanguageModel({
+  model: bufferedMock,
+  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 }),
+});
+
+const bufferedStreamWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = streamText({ model: bufferedModel, prompt });
+    const deltas: string[] = [];
+    for await (const delta of result.textStream) {
+      deltas.push(delta);
+    }
+    return { deltas, text: await result.text };
+  },
+  { name: 'bufferedStreamWorkflow' },
+);
+
+const userPrompt = [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hi' }] }];
+
+const failStreamMock = new MockLanguageModel();
+const failStreamModel = wrapLanguageModel({ model: failStreamMock, middleware: durableCalls() });
+
+const failStreamWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const streamResult = await failStreamModel.doStream({ prompt: userPrompt });
+    const reader = streamResult.stream.getReader();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    return 'unreachable';
+  },
+  { name: 'failStreamWorkflow' },
+);
+
+const cancelMock = new MockLanguageModel();
+const cancelModel = wrapLanguageModel({ model: cancelMock, middleware: durableCalls() });
+
+const cancelWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const streamResult = await cancelModel.doStream({ prompt: userPrompt });
+    const reader = streamResult.stream.getReader();
+    await reader.read();
+    await reader.read();
+    await reader.cancel();
+    // Give the still-running step time to drain the model stream and checkpoint.
+    await DBOS.sleep(500);
+    return 'cancelled early';
+  },
+  { name: 'cancelWorkflow' },
+);
+
+const recoveryMock = new MockLanguageModel();
+const recoveryModel = wrapLanguageModel({ model: recoveryMock, middleware: durableCalls() });
+
+const recoveryWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = await generateText({ model: recoveryModel, prompt });
+    const go = await DBOS.recv<string>('go', 30);
+    return { text: result.text, go };
+  },
+  { name: 'recoveryWorkflow' },
 );
 
 before(async () => {
@@ -227,4 +349,181 @@ test('wrapped models work outside DBOS workflows without checkpointing', async (
   const result = await generateText({ model: generateModel, prompt: 'hi' });
   assert.equal(result.text, 'outside a workflow');
   assert.equal(generateMock.generateCalls, before + 1);
+});
+
+test('streaming outside a workflow passes through live', async () => {
+  streamMock.streamPartLists.push(textStreamParts(['no', ' workflow']));
+  const before = streamMock.streamCalls;
+  const result = streamText({ model: streamModel, prompt: 'hi' });
+  const deltas: string[] = [];
+  for await (const delta of result.textStream) {
+    deltas.push(delta);
+  }
+  assert.deepEqual(deltas, ['no', ' workflow']);
+  assert.equal(streamMock.streamCalls, before + 1);
+});
+
+test('failed model calls are retried durably until success', async () => {
+  retryMock.generateResults.push(new Error('transient upstream failure'), textResponse('recovered'));
+  const handle = await DBOS.startWorkflow(retryWorkflow, { workflowID: randomUUID() })('hi');
+  assert.equal(await handle.getResult(), 'recovered');
+  assert.equal(retryMock.generateCalls, 2);
+});
+
+test('permanent model failures propagate and fail the workflow', async () => {
+  errorMock.generateResults.push(new Error('model exploded'));
+  const handle = await DBOS.startWorkflow(errorWorkflow, { workflowID: randomUUID() })('hi');
+  await assert.rejects(handle.getResult(), /model exploded/);
+  assert.equal(errorMock.generateCalls, 1);
+});
+
+test('recovery resumes mid-tool-loop without repeating completed work', async () => {
+  toolMock.generateResults.push(toolCallResponse('getWeather', '{"city":"Oslo"}'), textResponse('Rainy in Oslo.'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(toolWorkflow, { workflowID })('weather in Oslo?');
+  assert.equal(await handle.getResult(), 'Rainy in Oslo.');
+  const callsBefore = toolMock.generateCalls;
+  const toolExecutionsBefore = toolExecutions;
+
+  // Fork after step 0 (first model call) and step 1 (tool step), i.e. mid-loop:
+  // both replay from checkpoints and only the second model call re-executes.
+  toolMock.generateResults.push(textResponse('Recovered: rainy in Oslo.'));
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof toolWorkflow>>(workflowID, 2);
+  assert.equal(await forked.getResult(), 'Recovered: rainy in Oslo.');
+  assert.equal(toolMock.generateCalls, callsBefore + 1);
+  assert.equal(toolExecutions, toolExecutionsBefore);
+});
+
+test('binary file content survives checkpointing and replay', async () => {
+  const bytes = [137, 80, 78, 71, 3, 250];
+  fileMock.generateResults.push(
+    contentResponse([
+      { type: 'file', mediaType: 'image/png', data: { type: 'data', data: new Uint8Array(bytes) } },
+      { type: 'text', text: 'made you an image' },
+    ]),
+  );
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(fileWorkflow, { workflowID })('draw');
+  const original = await handle.getResult();
+  assert.deepEqual(original.bytes, bytes);
+  assert.equal(original.mediaType, 'image/png');
+  assert.equal(original.text, 'made you an image');
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof fileWorkflow>>(workflowID, 1);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof fileWorkflow>>;
+  assert.deepEqual(replayed.bytes, bytes);
+  assert.equal(fileMock.generateCalls, 1);
+});
+
+test('reasoning content is checkpointed and replayed', async () => {
+  reasoningMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'reasoning-start', id: 'r1' },
+    { type: 'reasoning-delta', id: 'r1', delta: 'thinking...' },
+    { type: 'reasoning-end', id: 'r1' },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'The answer is 42.' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(reasoningWorkflow, { workflowID })('hi');
+  const original = await handle.getResult();
+  assert.equal(original.text, 'The answer is 42.');
+  assert.equal(original.reasoning, 'thinking...');
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof reasoningWorkflow>>(workflowID, 1);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof reasoningWorkflow>>;
+  assert.equal(replayed.text, 'The answer is 42.');
+  assert.equal(replayed.reasoning, 'thinking...');
+  assert.equal(reasoningMock.streamCalls, 1);
+});
+
+test('streaming with retries buffers output until an attempt succeeds', async () => {
+  bufferedMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', delta: 'partial garbage from failed attempt' },
+      { type: 'error', error: new Error('connection reset') },
+    ],
+    textStreamParts(['Good', ' answer']),
+  );
+  const handle = await DBOS.startWorkflow(bufferedStreamWorkflow, { workflowID: randomUUID() })('hi');
+  const result = await handle.getResult();
+  // Nothing from the failed attempt leaks to the consumer; the successful
+  // attempt is flushed after completion as one delta per text block.
+  assert.deepEqual(result.deltas, ['Good answer']);
+  assert.equal(result.text, 'Good answer');
+  assert.equal(bufferedMock.streamCalls, 2);
+});
+
+test('mid-stream errors fail the model call', async () => {
+  failStreamMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'about to fail' },
+    { type: 'error', error: new Error('boom') },
+  ]);
+  const handle = await DBOS.startWorkflow(failStreamWorkflow, { workflowID: randomUUID() })();
+  await assert.rejects(handle.getResult(), /boom/);
+  assert.equal(failStreamMock.streamCalls, 1);
+});
+
+test('cancelling the consumer stream still checkpoints the full model call', async () => {
+  cancelMock.streamPartLists.push(textStreamParts(['Hello', ' world']));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(cancelWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'cancelled early');
+  assert.equal(cancelMock.streamCalls, 1);
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.ok(steps !== undefined && steps.some((s) => s.name === 'mock.mock-model.stream'));
+});
+
+test('invoking a workflow twice with the same ID does not repeat model calls', async () => {
+  generateMock.generateResults.push(textResponse('only once'));
+  const workflowID = randomUUID();
+  const first = await DBOS.startWorkflow(generateWorkflow, { workflowID })('hi');
+  const original = await first.getResult();
+  const callsAfter = generateMock.generateCalls;
+
+  const second = await DBOS.startWorkflow(generateWorkflow, { workflowID })('hi');
+  const repeated = await second.getResult();
+  assert.equal(repeated.text, original.text);
+  assert.equal(generateMock.generateCalls, callsAfter);
+});
+
+// Keep this test last: it shuts down and relaunches DBOS mid-suite.
+test('recovered workflows replay model calls and messages from checkpoints', async () => {
+  recoveryMock.generateResults.push(textResponse('durable answer'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(recoveryWorkflow, { workflowID })('hi');
+  await DBOS.send(workflowID, 'proceed', 'go');
+  const original = await handle.getResult();
+  assert.equal(original.text, 'durable answer');
+  assert.equal(original.go, 'proceed');
+  assert.equal(recoveryMock.generateCalls, 1);
+
+  // Simulate a crash that lost the completion: flip the workflow back to
+  // PENDING (the same technique the DBOS SDK's own recovery tests use), then
+  // relaunch. Launch-time recovery re-executes the workflow function; the model
+  // call and the recv must both replay from checkpoints (no mock responses are
+  // queued and no message is re-sent, so real re-execution would fail).
+  const client = new PgClient({ connectionString: systemDatabaseUrl });
+  await client.connect();
+  try {
+    await client.query(
+      "UPDATE dbos.workflow_status SET status = 'PENDING', recovery_attempts = 0 WHERE workflow_uuid = $1",
+      [workflowID],
+    );
+  } finally {
+    await client.end();
+  }
+  await DBOS.shutdown();
+  await DBOS.launch();
+
+  const recovered = await DBOS.retrieveWorkflow<Awaited<ReturnType<typeof recoveryWorkflow>>>(workflowID).getResult();
+  assert.equal(recovered.text, 'durable answer');
+  assert.equal(recovered.go, 'proceed');
+  assert.equal(recoveryMock.generateCalls, 1);
 });

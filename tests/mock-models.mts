@@ -66,7 +66,9 @@ export class MockLanguageModel implements LanguageModelV4 {
   readonly modelId = 'mock-model';
   readonly supportedUrls: Record<string, RegExp[]> = {};
 
-  generateResults: LanguageModelV4GenerateResult[] = [];
+  // Queue an Error to make that doGenerate call fail; queue a stream part of
+  // type 'error' to make that doStream call fail partway through.
+  generateResults: (LanguageModelV4GenerateResult | Error)[] = [];
   streamPartLists: LanguageModelV4StreamPart[][] = [];
   generateCalls = 0;
   streamCalls = 0;
@@ -76,6 +78,9 @@ export class MockLanguageModel implements LanguageModelV4 {
     const result = this.generateResults.shift();
     if (result === undefined) {
       throw new Error('MockLanguageModel: no generate responses left');
+    }
+    if (result instanceof Error) {
+      throw result;
     }
     return result;
   }

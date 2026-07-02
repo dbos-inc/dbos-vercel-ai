@@ -64,6 +64,8 @@ durableCalls({
 });
 ```
 
+Note that the AI SDK has its own retry layer (`maxRetries` on `generateText` et al., default 2), which composes multiplicatively with DBOS step retries — each AI SDK retry is a fresh step. If you enable DBOS retries, consider passing `maxRetries: 0` to the AI SDK call so retry behavior is governed in one place.
+
 ## Streaming
 
 `streamText` works inside workflows. On first execution, stream parts are passed through to your code live as the model produces them, and the assembled result is checkpointed when the stream completes. On recovery, the checkpointed result is replayed as a short synthetic stream (one delta per text block), so your workflow code runs identically either way.
