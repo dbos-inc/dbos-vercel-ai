@@ -2,9 +2,13 @@
 
 [DBOS](https://docs.dbos.dev/) durable execution for the [Vercel AI SDK](https://ai-sdk.dev/).
 
-This package makes AI SDK model calls **durable**: each call to a language model runs as a DBOS step whose result is checkpointed in Postgres. If your program crashes or restarts mid-agent, DBOS recovers the workflow and replays completed model calls from their checkpoints instead of calling the model again — no repeated LLM spend, no lost progress, and tool calls resume exactly where they left off.
+This package makes AI SDK **agents** durable.
+All you have to do is wrap your model with `durableCalls` and run your generation inside a DBOS workflow.
+Then, this integration automatically checkpoints every action your agents take in Postgres.
+If your process crashes mid-agent, DBOS replays the completed steps from their checkpoints and the agent resumes exactly where it left off.
 
-It works as standard AI SDK [middleware](https://ai-sdk.dev/docs/ai-sdk-core/middleware), so you keep your provider, your model configuration, and the familiar `generateText` / `streamText` API.
+This integration works as standard AI SDK [middleware](https://ai-sdk.dev/docs/ai-sdk-core/middleware), so you keep your provider, your model configuration, and the familiar `generateText` / `streamText` API.
+The durability is transparent to your agent code.
 
 ```ts
 import { DBOS } from '@dbos-inc/dbos-sdk';
@@ -32,7 +36,7 @@ const researchAgent = DBOS.registerWorkflow(
 DBOS.setConfig({ name: 'my-agent', systemDatabaseUrl: process.env.DBOS_SYSTEM_DATABASE_URL });
 await DBOS.launch();
 
-console.log(await researchAgent('Why did the DBOS integration cross the road?'));
+console.log(await researchAgent('Why did the agent cross the road?'));
 ```
 
 ## Installation
@@ -45,11 +49,13 @@ Requires `ai` v7+ and a Postgres database for DBOS.
 
 ## How it works
 
-`durableCalls()` returns AI SDK language-model middleware that intercepts `doGenerate` and `doStream`. Inside a DBOS workflow, each model call runs through [`DBOS.runStep`](https://docs.dbos.dev/typescript/tutorials/step-tutorial):
+Running an agent inside a DBOS workflow makes three things durable:
 
-- On first execution, the model is called and the complete result (content, usage, finish reason, response metadata) is checkpointed in the DBOS system database.
-- If the workflow is interrupted and recovered, checkpointed calls return their recorded results without contacting the model, and execution resumes from the first incomplete step.
-- Outside a workflow (or inside another step), the middleware calls the model directly with no checkpointing, so the same wrapped model works anywhere in your app.
+- **Every model call.** `durableCalls()` is AI SDK middleware that intercepts `doGenerate`/`doStream` and runs each call through [`DBOS.runStep`](https://docs.dbos.dev/typescript/tutorials/step-tutorial). The complete result (content, usage, finish reason, response metadata) is checkpointed in Postgres; on recovery, a completed call returns its recorded result without contacting the model.
+- **The agent loop.** Because the workflow re-executes deterministically on recovery and each model call replays from its checkpoint, a multi-step, tool-calling agent resumes from the first unfinished step instead of restarting from the beginning.
+- **Tool calls.** MCP tools (via [`durableMCPTools`](#mcp-tools)) are checkpointed automatically. Your own tools' side effects are durable when you wrap their `execute` in `DBOS.runStep` (see [Tools](#tools)).
+
+Outside a workflow (or inside another step) the wrapped model calls the provider directly with no checkpointing, so the same model works anywhere in your app.
 
 All DBOS step options are accepted and apply per model call:
 
@@ -59,6 +65,7 @@ durableCalls({
   maxAttempts: 5,         // total attempts when retries are allowed (default: 3)
   intervalSeconds: 1,     // delay before first retry (default: 1)
   backoffRate: 2,         // exponential backoff multiplier (default: 2)
+  shouldRetry: (error) => true,  // per-error retry predicate (default: skip provider-declared non-retryable errors)
   timeoutMS: 60000,       // per-attempt timeout
   name: 'my-model-call',  // step name (default: "<provider>.<modelId>.<operation>")
 });
@@ -88,7 +95,7 @@ To stream tokens to another process (e.g. the workflow runs on a queue worker an
 
 ## Tools
 
-Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop. Make tool side effects durable by running them as steps:
+Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop. A tool's `execute` is your own code, though: wrap its side effects in a DBOS step so they're checkpointed too.
 
 ```ts
 import { tool, stepCountIs } from 'ai';
@@ -129,9 +136,9 @@ const agent = DBOS.registerWorkflow(async (question: string) => {
 
 ## Concurrency
 
-Run **one durable model call at a time within a single workflow**. DBOS derives each step's replay identity from the order steps are reached, but the AI SDK issues concurrent model calls in a nondeterministic order — so on recovery a checkpoint could be bound to the wrong call, silently returning one call's result for another. To prevent this, the middleware throws if it detects a second durable model call starting while one is already in flight in the same workflow. This covers `Promise.all` over `generateText`/`streamText`, `embedMany` on inputs larger than the model's per-call limit (which the SDK batches in parallel — see [Embeddings](#embeddings) for the `maxParallelCalls: 1` remedy), and parallel tool calls that themselves invoke models.
+Run **one durable model call at a time within a single workflow**. DBOS derives each step's replay identity from the order steps are reached, but the AI SDK issues concurrent model calls in a nondeterministic order — so on recovery a checkpoint could be bound to the wrong call, silently returning one call's result for another. To prevent this, the middleware throws if it detects a second durable model call starting while one is already in flight in the same workflow.
 
-Sequential calls — including a normal tool-calling loop, where each model call completes before the next begins — are unaffected.
+Sequential calls (including a normal tool-calling loop, where each model call completes before the next begins) are unaffected.
 
 To fan out model calls in parallel, give each its own **child workflow**, which gets an independent, deterministic step-ID space:
 
@@ -180,12 +187,3 @@ const imageModel = wrapImageModel({ model: openai.imageModel('gpt-image-1'), mid
 const { images } = await generateImage({ model: imageModel, prompt: 'a durable cat' });
 ```
 
-Requesting more images than the model's per-call limit (`generateImage({ n })`) is fine: the SDK generates them in parallel batches, but it dispatches them synchronously, so their step order is deterministic on replay — no concurrency guard needed (unlike `embedMany`). As with text, run *separate* concurrent `generateImage` calls in their own child workflows.
-
-## Serialization
-
-DBOS checkpoints step results with a superjson-based serializer, so `Date`, `URL`, `Map`, `Set`, and `Buffer` values in model responses survive recovery intact (e.g., `response.timestamp` stays a `Date`). Binary file content generated by models (`Uint8Array`) is transparently converted to base64 — a representation the AI SDK accepts natively — before checkpointing.
-
-## Development
-
-See [DEVELOPING.md](./DEVELOPING.md) for building, testing (requires a local Postgres database), and the release process.
