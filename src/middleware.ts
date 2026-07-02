@@ -7,32 +7,14 @@ import type {
   LanguageModelV4FinishReason,
   LanguageModelV4GenerateResult,
   LanguageModelV4Middleware,
+  LanguageModelV4Reasoning,
   LanguageModelV4ResponseMetadata,
   LanguageModelV4StreamPart,
+  LanguageModelV4Text,
   LanguageModelV4Usage,
   SharedV4ProviderMetadata,
   SharedV4Warning,
 } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
-
-/**
- * Options for {@link durableCalls} and {@link durableEmbeddingCalls}.
- *
- * Extends the DBOS {@link StepConfig}, so all step options
- * (retriesAllowed, maxAttempts, intervalSeconds, backoffRate, shouldRetry, timeoutMS, name)
- * apply to the wrapped model calls.
- */
-export interface DurableCallsOptions extends StepConfig {
-  /**
-   * If set, every raw stream part produced by streaming calls (`doStream`) is also
-   * written to the DBOS workflow stream with this key, so tokens can be consumed
-   * from outside the workflow with `DBOS.readStream(workflowID, streamKey)`
-   * (e.g., an HTTP handler streaming to a browser while the workflow runs elsewhere).
-   *
-   * Note that stream writes from steps are not checkpointed: if the step is retried,
-   * parts from failed attempts remain in the stream (at-least-once delivery).
-   */
-  streamKey?: string;
-}
 
 function isInWorkflowFunction(): boolean {
   // True only in workflow code proper: not in a step (the enclosing step provides
@@ -45,6 +27,44 @@ function assertNotInTransaction(operation: string) {
     throw new Error(
       `Cannot call ${operation} inside a DBOS transaction. AI model calls perform network I/O; move this call to workflow or step code.`,
     );
+  }
+}
+
+// Count of durable model-call steps currently executing within each workflow,
+// keyed by workflow ID. DBOS derives a step's replay identity from a synchronous
+// per-workflow counter captured in the order steps are reached — but the AI SDK
+// can issue model calls concurrently (parallel generateText/streamText, embedMany
+// over more values than the model's per-call limit, or parallel tool sub-agents),
+// and it reaches them in a nondeterministic order. On recovery that order can
+// differ, binding a checkpoint to the wrong call: silently for same-model calls
+// (identical step names), or as a replay crash for different ones. The middleware
+// cannot make the AI SDK deterministic, so it refuses to start a second concurrent
+// durable call rather than risk corruption; run each in its own child workflow.
+const inflightModelCalls = new Map<string, number>();
+
+function enterDurableModelCall(): string {
+  const workflowID = DBOS.workflowID!;
+  const inflight = inflightModelCalls.get(workflowID) ?? 0;
+  if (inflight > 0) {
+    throw new Error(
+      `Concurrent durable model calls detected in workflow "${workflowID}". The Vercel AI SDK ` +
+        `issues concurrent calls (e.g. Promise.all over generateText/streamText, embedMany over ` +
+        `inputs larger than the model's per-call limit, or parallel tool sub-agents) in a ` +
+        `nondeterministic order, which is unsafe for DBOS replay and can silently bind a checkpoint ` +
+        `to the wrong call on recovery. Run each concurrent model call in its own child workflow with ` +
+        `DBOS.startWorkflow instead. See the "Concurrency" section of the README.`,
+    );
+  }
+  inflightModelCalls.set(workflowID, inflight + 1);
+  return workflowID;
+}
+
+function exitDurableModelCall(workflowID: string): void {
+  const inflight = (inflightModelCalls.get(workflowID) ?? 1) - 1;
+  if (inflight > 0) {
+    inflightModelCalls.set(workflowID, inflight);
+  } else {
+    inflightModelCalls.delete(workflowID);
   }
 }
 
@@ -65,8 +85,8 @@ function assertNotInTransaction(operation: string) {
  * Used outside a DBOS workflow (or inside another step), the middleware calls
  * the model directly without checkpointing, so the same wrapped model works anywhere.
  */
-export function durableCalls(options: DurableCallsOptions = {}): LanguageModelV4Middleware {
-  const { streamKey, ...stepConfig } = options;
+export function durableCalls(options: StepConfig = {}): LanguageModelV4Middleware {
+  const stepConfig = options;
   return {
     specificationVersion: 'v4',
 
@@ -75,10 +95,15 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelV4
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
-      return await DBOS.runStep(async () => encodeBinaryContent(await doGenerate()), {
-        ...stepConfig,
-        name: stepConfig.name ?? stepName(model, 'generate'),
-      });
+      const workflowID = enterDurableModelCall();
+      try {
+        return await DBOS.runStep(async () => encodeBinaryContent(await doGenerate()), {
+          ...stepConfig,
+          name: stepConfig.name ?? stepName(model, 'generate'),
+        });
+      } finally {
+        exitDurableModelCall(workflowID);
+      }
     },
 
     wrapStream: async ({ doStream, model }) => {
@@ -86,6 +111,7 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelV4
       if (!isInWorkflowFunction()) {
         return await doStream();
       }
+      const workflowID = enterDurableModelCall();
 
       // With retries enabled, a failed attempt may have already produced parts, so
       // live pass-through would deliver output from multiple attempts. Instead,
@@ -95,19 +121,24 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelV4
       let executed = false;
       let cancelled = false;
       let controller!: ReadableStreamDefaultController<LanguageModelV4StreamPart>;
+      let step!: Promise<LanguageModelV4GenerateResult>;
       const stream = new ReadableStream<LanguageModelV4StreamPart>({
         start(c) {
           controller = c;
         },
-        cancel() {
+        // On cancellation the step keeps draining the model to a checkpoint. Await
+        // it so a workflow that cancels early still blocks until the result is
+        // durable, instead of racing the checkpoint against workflow completion.
+        async cancel() {
           cancelled = true;
+          await step.catch(() => {});
         },
       });
       const emit = (part: LanguageModelV4StreamPart) => {
         if (!cancelled) controller.enqueue(part);
       };
 
-      const step = DBOS.runStep(
+      step = DBOS.runStep(
         async () => {
           executed = true;
           const streamResult = await doStream();
@@ -120,7 +151,6 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelV4
               throw part.error instanceof Error ? part.error : new Error(String(part.error));
             }
             if (!buffered) emit(part);
-            if (streamKey !== undefined) await DBOS.writeStream(streamKey, part);
             accumulator.add(part);
           }
           return encodeBinaryContent(accumulator.result(streamResult.request, streamResult.response));
@@ -133,17 +163,19 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelV4
       // checkpointed, so consumers finish strictly after the result is durable.
       // If the step was replayed from a checkpoint (or ran buffered), the closure
       // above never emitted, so synthesize the parts from the recorded result.
-      void step.then(
-        (recorded) => {
-          if ((buffered || !executed) && !cancelled) {
-            for (const part of replayParts(recorded)) emit(part);
-          }
-          if (!cancelled) controller.close();
-        },
-        (error: unknown) => {
-          if (!cancelled) controller.error(error);
-        },
-      );
+      void step
+        .then(
+          (recorded) => {
+            if ((buffered || !executed) && !cancelled) {
+              for (const part of replayParts(recorded)) emit(part);
+            }
+            if (!cancelled) controller.close();
+          },
+          (error: unknown) => {
+            if (!cancelled) controller.error(error);
+          },
+        )
+        .finally(() => exitDurableModelCall(workflowID));
 
       return { stream };
     },
@@ -162,10 +194,15 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelV
       if (!isInWorkflowFunction()) {
         return await doEmbed();
       }
-      return await DBOS.runStep(async () => doEmbed(), {
-        ...options,
-        name: options.name ?? stepName(model, 'embed'),
-      });
+      const workflowID = enterDurableModelCall();
+      try {
+        return await DBOS.runStep(async () => doEmbed(), {
+          ...options,
+          name: options.name ?? stepName(model, 'embed'),
+        });
+      } finally {
+        exitDurableModelCall(workflowID);
+      }
     },
   };
 }
@@ -209,41 +246,56 @@ class StreamAccumulator {
   private readonly warnings: SharedV4Warning[] = [];
   private providerMetadata?: SharedV4ProviderMetadata;
   private responseMetadata?: LanguageModelV4ResponseMetadata;
-  private readonly textBlocks = new Map<string, { text: string; providerMetadata?: SharedV4ProviderMetadata }>();
-  private readonly reasoningBlocks = new Map<string, { text: string; providerMetadata?: SharedV4ProviderMetadata }>();
+  // These map a block id to the text/reasoning content object that is ALSO already
+  // in `content`. Blocks are appended to `content` at their `-start` and mutated in
+  // place, so `content` preserves arrival order — matching the AI SDK's own stream
+  // recorder. (Deferring the push to `-end` would place any part that arrives while
+  // a block is open ahead of that block, and would drop a block that never closes.)
+  private readonly textBlocks = new Map<string, LanguageModelV4Text>();
+  private readonly reasoningBlocks = new Map<string, LanguageModelV4Reasoning>();
 
   add(part: LanguageModelV4StreamPart): void {
     switch (part.type) {
       case 'stream-start':
         this.warnings.push(...part.warnings);
         break;
-      case 'text-start':
-        this.textBlocks.set(part.id, { text: '' });
-        break;
-      case 'text-delta': {
-        const block = this.textBlocks.get(part.id) ?? { text: '' };
-        block.text += part.delta;
+      case 'text-start': {
+        const block: LanguageModelV4Text = { type: 'text', text: '', providerMetadata: part.providerMetadata };
         this.textBlocks.set(part.id, block);
+        this.content.push(block);
+        break;
+      }
+      case 'text-delta': {
+        const block = this.getOrCreateText(part.id);
+        block.text += part.delta;
+        if (part.providerMetadata) block.providerMetadata = part.providerMetadata;
         break;
       }
       case 'text-end': {
-        const block = this.textBlocks.get(part.id) ?? { text: '' };
-        this.content.push({ type: 'text', text: block.text, providerMetadata: part.providerMetadata });
+        const block = this.textBlocks.get(part.id);
+        if (block && part.providerMetadata) block.providerMetadata = part.providerMetadata;
         this.textBlocks.delete(part.id);
         break;
       }
-      case 'reasoning-start':
-        this.reasoningBlocks.set(part.id, { text: '' });
-        break;
-      case 'reasoning-delta': {
-        const block = this.reasoningBlocks.get(part.id) ?? { text: '' };
-        block.text += part.delta;
+      case 'reasoning-start': {
+        const block: LanguageModelV4Reasoning = {
+          type: 'reasoning',
+          text: '',
+          providerMetadata: part.providerMetadata,
+        };
         this.reasoningBlocks.set(part.id, block);
+        this.content.push(block);
+        break;
+      }
+      case 'reasoning-delta': {
+        const block = this.getOrCreateReasoning(part.id);
+        block.text += part.delta;
+        if (part.providerMetadata) block.providerMetadata = part.providerMetadata;
         break;
       }
       case 'reasoning-end': {
-        const block = this.reasoningBlocks.get(part.id) ?? { text: '' };
-        this.content.push({ type: 'reasoning', text: block.text, providerMetadata: part.providerMetadata });
+        const block = this.reasoningBlocks.get(part.id);
+        if (block && part.providerMetadata) block.providerMetadata = part.providerMetadata;
         this.reasoningBlocks.delete(part.id);
         break;
       }
@@ -268,6 +320,28 @@ class StreamAccumulator {
         this.content.push(part);
         break;
     }
+  }
+
+  // Fallbacks for a malformed stream that emits a delta without a preceding start:
+  // create the block in arrival position rather than dropping the text.
+  private getOrCreateText(id: string): LanguageModelV4Text {
+    let block = this.textBlocks.get(id);
+    if (!block) {
+      block = { type: 'text', text: '' };
+      this.textBlocks.set(id, block);
+      this.content.push(block);
+    }
+    return block;
+  }
+
+  private getOrCreateReasoning(id: string): LanguageModelV4Reasoning {
+    let block = this.reasoningBlocks.get(id);
+    if (!block) {
+      block = { type: 'reasoning', text: '' };
+      this.reasoningBlocks.set(id, block);
+      this.content.push(block);
+    }
+    return block;
   }
 
   result(

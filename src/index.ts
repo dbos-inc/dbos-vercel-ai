@@ -1,1 +1,1 @@
-export { durableCalls, durableEmbeddingCalls, DurableCallsOptions } from './middleware';
+export { durableCalls, durableEmbeddingCalls } from './middleware';

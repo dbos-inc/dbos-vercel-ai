@@ -5,7 +5,6 @@ import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client as PgClient } from 'pg';
 import { embedMany, generateText, stepCountIs, streamText, tool, wrapEmbeddingModel, wrapLanguageModel } from 'ai';
 import { z } from 'zod';
-import type { LanguageModelV4StreamPart } from '@ai-sdk/provider';
 import { durableCalls, durableEmbeddingCalls } from '../src/index.js';
 import {
   contentResponse,
@@ -83,20 +82,6 @@ const streamWorkflow = DBOS.registerWorkflow(
     return { deltas, text: await result.text, finishReason: await result.finishReason };
   },
   { name: 'streamWorkflow' },
-);
-
-const forwardMock = new MockLanguageModel();
-const forwardModel = wrapLanguageModel({
-  model: forwardMock,
-  middleware: durableCalls({ streamKey: 'llm-stream' }),
-});
-
-const forwardWorkflow = DBOS.registerWorkflow(
-  async (prompt: string) => {
-    const result = streamText({ model: forwardModel, prompt });
-    return { text: await result.text };
-  },
-  { name: 'forwardWorkflow' },
 );
 
 const embedMock = new MockEmbeddingModel();
@@ -209,9 +194,9 @@ const cancelWorkflow = DBOS.registerWorkflow(
     const reader = streamResult.stream.getReader();
     await reader.read();
     await reader.read();
+    // cancel() awaits the in-flight step, so the model call is durably checkpointed
+    // before the workflow proceeds — no sleep needed to avoid racing the checkpoint.
     await reader.cancel();
-    // Give the still-running step time to drain the model stream and checkpoint.
-    await DBOS.sleep(500);
     return 'cancelled early';
   },
   { name: 'cancelWorkflow' },
@@ -227,6 +212,43 @@ const recoveryWorkflow = DBOS.registerWorkflow(
     return { text: result.text, go };
   },
   { name: 'recoveryWorkflow' },
+);
+
+const concurrentMock = new MockLanguageModel();
+const concurrentModel = wrapLanguageModel({ model: concurrentMock, middleware: durableCalls() });
+
+const concurrentWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const [a, b] = await Promise.all([
+      generateText({ model: concurrentModel, prompt: 'A' }),
+      generateText({ model: concurrentModel, prompt: 'B' }),
+    ]);
+    return [a.text, b.text];
+  },
+  { name: 'concurrentWorkflow' },
+);
+
+// Streams a `source` part while a text block is still open, to check the
+// accumulator keeps arrival order ([text, source]) rather than pushing the
+// complete part ahead of the not-yet-closed text.
+const orderingMock = new MockLanguageModel();
+const orderingModel = wrapLanguageModel({
+  model: orderingMock,
+  // Buffered (retries) mode so the consumer sees the parts synthesized from the
+  // accumulated/checkpointed content — i.e. this asserts the accumulator's order.
+  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 }),
+});
+
+const orderingWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = streamText({ model: orderingModel, prompt: 'hi' });
+    const types: string[] = [];
+    for (const part of await result.content) {
+      types.push(part.type);
+    }
+    return { types, text: await result.text };
+  },
+  { name: 'orderingWorkflow' },
 );
 
 before(async () => {
@@ -313,25 +335,6 @@ test('replayed workflows synthesize the stream from the checkpoint', async () =>
   assert.equal(replayed.text, 'ABC');
   assert.deepEqual(replayed.deltas, ['ABC']);
   assert.equal(replayed.finishReason, 'stop');
-});
-
-test('streamKey forwards raw stream parts to a DBOS workflow stream', async () => {
-  forwardMock.streamPartLists.push(textStreamParts(['Hi', ' there']));
-  const workflowID = randomUUID();
-  const handle = await DBOS.startWorkflow(forwardWorkflow, { workflowID })('hi');
-  const result = await handle.getResult();
-  assert.equal(result.text, 'Hi there');
-
-  const parts: LanguageModelV4StreamPart[] = [];
-  for await (const part of DBOS.readStream<LanguageModelV4StreamPart>(workflowID, 'llm-stream')) {
-    parts.push(part);
-  }
-  assert.deepEqual(
-    parts.map((p) => p.type),
-    ['stream-start', 'response-metadata', 'text-start', 'text-delta', 'text-delta', 'text-end', 'finish'],
-  );
-  const metadata = parts[1]!;
-  assert.ok(metadata.type === 'response-metadata' && metadata.timestamp instanceof Date);
 });
 
 test('embedMany runs as a durable step inside a workflow', async () => {
@@ -491,6 +494,30 @@ test('invoking a workflow twice with the same ID does not repeat model calls', a
   const repeated = await second.getResult();
   assert.equal(repeated.text, original.text);
   assert.equal(generateMock.generateCalls, callsAfter);
+});
+
+test('concurrent durable model calls in one workflow are refused, not silently corrupted', async () => {
+  concurrentMock.generateResults.push(textResponse('A result'), textResponse('B result'));
+  const handle = await DBOS.startWorkflow(concurrentWorkflow, { workflowID: randomUUID() })();
+  await assert.rejects(handle.getResult(), /Concurrent durable model calls/);
+});
+
+test('accumulator preserves arrival order when a part interleaves an open text block', async () => {
+  orderingMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'According to ' },
+    { type: 'source', sourceType: 'url', id: 's1', url: 'https://example.com', title: 'Example' },
+    { type: 'text-delta', id: 't1', delta: 'the docs' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const handle = await DBOS.startWorkflow(orderingWorkflow, { workflowID: randomUUID() })();
+  const result = await handle.getResult();
+  // The source arrived while the text block was open; content must stay in arrival
+  // order (text then source), not [source, text].
+  assert.deepEqual(result.types, ['text', 'source']);
+  assert.equal(result.text, 'According to the docs');
 });
 
 // Keep this test last: it shuts down and relaunches DBOS mid-suite.

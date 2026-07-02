@@ -80,23 +80,9 @@ const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
 }, { name: 'streamingAgent' });
 ```
 
-Two notes on streaming:
+**Retries and streaming.** When `retriesAllowed` is set, live pass-through is disabled for streaming calls: a failed attempt may already have produced partial output, so parts are instead emitted all at once after an attempt succeeds. Non-streaming calls are unaffected.
 
-- **Consuming tokens from another process.** If the workflow runs on a queue worker but you want to stream tokens to a browser, set `streamKey`. Every raw stream part is then also written to a [DBOS workflow stream](https://docs.dbos.dev/typescript/tutorials/workflow-tutorial#workflow-streaming) that any process can read:
-
-  ```ts
-  const model = wrapLanguageModel({
-    model: openai('gpt-5'),
-    middleware: durableCalls({ streamKey: 'llm-stream' }),
-  });
-
-  // In an HTTP handler, possibly in a different process:
-  for await (const part of DBOS.readStream(workflowID, 'llm-stream')) {
-    // forward text-delta parts to the client
-  }
-  ```
-
-- **Retries and streaming.** When `retriesAllowed` is set, live pass-through is disabled for streaming calls: a failed attempt may already have produced partial output, so parts are instead emitted all at once after an attempt succeeds. Non-streaming calls are unaffected.
+To stream tokens to another process (e.g. the workflow runs on a queue worker and an HTTP handler streams to a browser), write parts to a [DBOS workflow stream](https://docs.dbos.dev/typescript/tutorials/workflow-tutorial#workflow-streaming) from your own consumer loop and read them elsewhere with `DBOS.readStream`.
 
 ## Tools
 
@@ -121,6 +107,28 @@ const agent = DBOS.registerWorkflow(async (question: string) => {
   });
   return result.text;
 }, { name: 'weatherAgent' });
+```
+
+## Concurrency
+
+Run **one durable model call at a time within a single workflow**. DBOS derives each step's replay identity from the order steps are reached, but the AI SDK issues concurrent model calls in a nondeterministic order — so on recovery a checkpoint could be bound to the wrong call, silently returning one call's result for another. To prevent this, the middleware throws if it detects a second durable model call starting while one is already in flight in the same workflow. This covers `Promise.all` over `generateText`/`streamText`, `embedMany` on inputs larger than the model's per-call limit (which the SDK batches in parallel), and parallel tool calls that themselves invoke models.
+
+Sequential calls — including a normal tool-calling loop, where each model call completes before the next begins — are unaffected.
+
+To fan out model calls in parallel, give each its own **child workflow**, which gets an independent, deterministic step-ID space:
+
+```ts
+const summarizeOne = DBOS.registerWorkflow(
+  async (doc: string) => (await generateText({ model, prompt: `Summarize: ${doc}` })).text,
+  { name: 'summarizeOne' },
+);
+
+const summarizeAll = DBOS.registerWorkflow(async (docs: string[]) => {
+  const handles = await Promise.all(
+    docs.map((doc) => DBOS.startWorkflow(summarizeOne)(doc)),
+  );
+  return Promise.all(handles.map((h) => h.getResult()));
+}, { name: 'summarizeAll' });
 ```
 
 ## Embeddings
