@@ -21,7 +21,7 @@ function isNonRetryable(error: unknown): boolean {
   );
 }
 
-// Inject a default shouldRetry that skips provider-declared non-retryable errors (e.g. a 401), unless the caller set one.
+// Inject a default shouldRetry that skips provider-declared non-retryable errors (e.g. a 401); a caller-provided one wins, but an explicit `undefined` falls back to the default.
 export function withErrorClassification(options: StepConfig): StepConfig {
-  return { shouldRetry: (error: unknown) => !isNonRetryable(error), ...options };
+  return { ...options, shouldRetry: options.shouldRetry ?? ((error: unknown) => !isNonRetryable(error)) };
 }

@@ -4,6 +4,7 @@ import { after, before, test } from 'node:test';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client as PgClient } from 'pg';
 import {
+  asSchema,
   embedMany,
   generateImage,
   generateText,
@@ -15,7 +16,13 @@ import {
   wrapLanguageModel,
 } from 'ai';
 import { z } from 'zod';
-import { durableCalls, durableEmbeddingCalls, durableImageCalls, durableMCPTools } from '../src/index.js';
+import {
+  durableCalls,
+  durableEmbeddingCalls,
+  durableImageCalls,
+  durableMCPTools,
+  type MCPClientLike,
+} from '../src/index.js';
 import {
   contentResponse,
   IMAGE_BYTES,
@@ -357,6 +364,54 @@ const parallelMcpWorkflow = DBOS.registerWorkflow(
     return result.text;
   },
   { name: 'parallelMcpWorkflow' },
+);
+
+// #4: an explicit `shouldRetry: undefined` must still fall back to the default classification.
+const undefinedRetryMock = new MockLanguageModel();
+const undefinedRetryModel = wrapLanguageModel({
+  model: undefinedRetryMock,
+  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 5, intervalSeconds: 0, shouldRetry: undefined }),
+});
+const undefinedRetryWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: undefinedRetryModel, prompt: 'hi', maxRetries: 0 })).text,
+  { name: 'undefinedRetryWorkflow' },
+);
+
+// A caller-provided shouldRetry must win over the default (here: never retry, even a retryable error).
+const overrideRetryMock = new MockLanguageModel();
+const overrideRetryModel = wrapLanguageModel({
+  model: overrideRetryMock,
+  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0, shouldRetry: () => false }),
+});
+const overrideRetryWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: overrideRetryModel, prompt: 'hi', maxRetries: 0 })).text,
+  { name: 'overrideRetryWorkflow' },
+);
+
+// #7: an MCP tool whose schema exposes its JSON Schema asynchronously (a PromiseLike jsonSchema).
+const asyncSchemaClient = {
+  async tools() {
+    return {
+      ping: {
+        description: 'ping a host',
+        inputSchema: {
+          [Symbol.for('vercel.ai.schema')]: true,
+          jsonSchema: Promise.resolve({ type: 'object', properties: { host: { type: 'string' } }, required: ['host'] }),
+          validate: undefined,
+        },
+        execute: async () => 'pong',
+      },
+    };
+  },
+  async close() {},
+} as unknown as MCPClientLike;
+
+const asyncSchemaWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const tools = await durableMCPTools(asyncSchemaClient);
+    return await asSchema((tools.ping as { inputSchema: unknown }).inputSchema).jsonSchema;
+  },
+  { name: 'asyncSchemaWorkflow' },
 );
 
 before(async () => {
@@ -741,6 +796,31 @@ test('parallel MCP tool calls each execute durably and replay without re-executi
   assert.equal(await forked.getResult(), 'Fetched weather and time for Paris.');
   assert.equal(parallelMcpClient.weatherCalls, 1); // not re-executed on replay
   assert.equal(parallelMcpClient.timeCalls, 1);
+});
+
+test('explicit shouldRetry: undefined falls back to the default classification', async () => {
+  undefinedRetryMock.generateResults.push(Object.assign(new Error('bad request'), { isRetryable: false }));
+  const handle = await DBOS.startWorkflow(undefinedRetryWorkflow, { workflowID: randomUUID() })();
+  await assert.rejects(handle.getResult(), /bad request/);
+  // Before the fix, an explicit `shouldRetry: undefined` disabled classification → 5 retries.
+  assert.equal(undefinedRetryMock.generateCalls, 1);
+});
+
+test('a caller-provided shouldRetry overrides the default', async () => {
+  // A plain Error is retryable under the default; shouldRetry: () => false must prevent any retry.
+  overrideRetryMock.generateResults.push(new Error('transient'));
+  const handle = await DBOS.startWorkflow(overrideRetryWorkflow, { workflowID: randomUUID() })();
+  await assert.rejects(handle.getResult(), /transient/);
+  assert.equal(overrideRetryMock.generateCalls, 1);
+});
+
+test('MCP tool with an async JSON schema is awaited before checkpointing (not stored as an empty Promise)', async () => {
+  const handle = await DBOS.startWorkflow(asyncSchemaWorkflow, { workflowID: randomUUID() })();
+  const schema = (await handle.getResult()) as { type?: string; properties?: unknown; required?: unknown };
+  // Without the await, the Promise checkpoints as {} and this schema would be empty.
+  assert.equal(schema.type, 'object');
+  assert.deepEqual(schema.properties, { host: { type: 'string' } });
+  assert.deepEqual(schema.required, ['host']);
 });
 
 // Keep this test last: it shuts down and relaunches DBOS mid-suite.

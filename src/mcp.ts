@@ -30,7 +30,8 @@ export async function durableMCPTools(client: MCPClientLike, options: StepConfig
     const defs: Record<string, DurableToolDef> = {};
     for (const [name, tool] of Object.entries(tools)) {
       const description = typeof tool.description === 'string' ? tool.description : undefined;
-      defs[name] = { description, inputJsonSchema: asSchema(tool.inputSchema).jsonSchema };
+      // Await: a Schema's jsonSchema may be a Promise, which would otherwise checkpoint as {} and yield an empty schema.
+      defs[name] = { description, inputJsonSchema: await asSchema(tool.inputSchema).jsonSchema };
     }
     return defs;
   });
