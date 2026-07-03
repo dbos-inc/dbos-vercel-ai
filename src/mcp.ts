@@ -2,10 +2,22 @@ import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
 import { isInWorkflowFunction, withErrorClassification } from './internal';
 
-// Structural type for an MCP client (e.g. from @ai-sdk/mcp) — only what we use.
+// Structural type for an MCP client (e.g. from @ai-sdk/mcp) — deliberately loose: the AI SDK ecosystem
+// exact-pins @ai-sdk/provider-utils, so precise Tool types fail to match across skewed copies.
 export interface MCPClientLike {
-  tools(options?: unknown): Promise<ToolSet>;
+  tools(options?: unknown): Promise<Record<string, unknown>>;
   close?(): Promise<void>;
+}
+
+// Duck-typed view of a client tool; every field is verified at runtime before use.
+interface MCPToolLike {
+  description?: unknown;
+  title?: unknown;
+  metadata?: ToolSet[string]['metadata'];
+  _meta?: unknown;
+  toModelOutput?: unknown;
+  inputSchema?: unknown;
+  execute?: (input: unknown, options: unknown) => unknown;
 }
 
 export interface DurableMCPToolsOptions extends StepConfig {
@@ -60,15 +72,16 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
   const listed = await run('mcp.listTools', async () => {
     const tools = await client.tools(toolOptions);
     const defs: Record<string, DurableToolDef> = {};
-    for (const [name, tool] of Object.entries(tools)) {
+    for (const [name, rawTool] of Object.entries(tools)) {
+      const tool = rawTool as MCPToolLike;
       defs[name] = {
         description: typeof tool.description === 'string' ? tool.description : undefined,
         title: typeof tool.title === 'string' ? tool.title : undefined,
         metadata: tool.metadata,
-        meta: (tool as { _meta?: unknown })._meta,
+        meta: tool._meta,
         convertsOutput: typeof tool.toModelOutput === 'function',
         // Await: a Schema's jsonSchema may be a Promise, which would otherwise checkpoint as {} and yield an empty schema.
-        inputJsonSchema: await asSchema(tool.inputSchema).jsonSchema,
+        inputJsonSchema: await asSchema(tool.inputSchema as Parameters<typeof asSchema>[0]).jsonSchema,
       };
     }
     return defs;
@@ -86,8 +99,8 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
       // Re-fetch the live tool inside the step (its execute closure can't be checkpointed); replay returns the recorded result.
       execute: (input: unknown, execOptions) =>
         run(`mcp.tool.${name}`, async () => {
-          const tool = (await client.tools(toolOptions))[name];
-          if (!tool?.execute) throw new Error(`MCP tool "${name}" is not executable.`);
+          const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
+          if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
           return tool.execute(input, execOptions);
         }),
     });
