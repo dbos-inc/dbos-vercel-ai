@@ -106,6 +106,38 @@ const streamWorkflow = DBOS.registerWorkflow(
   { name: 'streamWorkflow' },
 );
 
+const streamToolMock = new MockLanguageModel();
+const streamToolModel = wrapLanguageModel({ model: streamToolMock, middleware: durableCalls() });
+let streamToolExecutions = 0;
+
+const streamToolWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = streamText({
+      model: streamToolModel,
+      prompt,
+      tools: {
+        getWeather: tool({
+          description: 'Get the weather for a city',
+          inputSchema: z.object({ city: z.string() }),
+          execute: async ({ city }) =>
+            DBOS.runStep(
+              async () => {
+                streamToolExecutions++;
+                return `rainy in ${city}`;
+              },
+              { name: 'getWeather' },
+            ),
+        }),
+      },
+      stopWhen: stepCountIs(5),
+    });
+    const text = await result.text;
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return text;
+  },
+  { name: 'streamToolWorkflow' },
+);
+
 const embedMock = new MockEmbeddingModel();
 const embedModel = wrapEmbeddingModel({ model: embedMock, middleware: durableEmbeddingCalls() });
 
@@ -187,22 +219,22 @@ const reasoningWorkflow = DBOS.registerWorkflow(
   { name: 'reasoningWorkflow' },
 );
 
-const bufferedMock = new MockLanguageModel();
-const bufferedModel = wrapLanguageModel({
-  model: bufferedMock,
-  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 }),
+const retryStreamMock = new MockLanguageModel();
+const retryStreamModel = wrapLanguageModel({
+  model: retryStreamMock,
+  middleware: durableCalls({ maxAttempts: 3, intervalSeconds: 0 }),
 });
 
-const bufferedStreamWorkflow = DBOS.registerWorkflow(
+const retryStreamWorkflow = DBOS.registerWorkflow(
   async (prompt: string) => {
-    const result = streamText({ model: bufferedModel, prompt });
+    const result = streamText({ model: retryStreamModel, prompt });
     const deltas: string[] = [];
     for await (const delta of result.textStream) {
       deltas.push(delta);
     }
     return { deltas, text: await result.text };
   },
-  { name: 'bufferedStreamWorkflow' },
+  { name: 'retryStreamWorkflow' },
 );
 
 const userPrompt = [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hi' }] }];
@@ -316,11 +348,7 @@ const concurrentWorkflow = DBOS.registerWorkflow(
 
 // Streams a source part while a text block is still open, to check the accumulator keeps arrival order ([text, source]).
 const orderingMock = new MockLanguageModel();
-const orderingModel = wrapLanguageModel({
-  model: orderingMock,
-  // Buffered (retries) mode so the consumer sees parts synthesized from the checkpointed content — asserts the accumulator's order.
-  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 }),
-});
+const orderingModel = wrapLanguageModel({ model: orderingMock, middleware: durableCalls() });
 
 const orderingWorkflow = DBOS.registerWorkflow(
   async () => {
@@ -329,6 +357,7 @@ const orderingWorkflow = DBOS.registerWorkflow(
     for (const part of await result.content) {
       types.push(part.type);
     }
+    await DBOS.runStep(async () => 'noop', { name: 'noop' }); // trailing step so a fork replays the stream from its checkpoint
     return { types, text: await result.text };
   },
   { name: 'orderingWorkflow' },
@@ -368,6 +397,16 @@ const nonRetryModel = wrapLanguageModel({
 const nonRetryWorkflow = DBOS.registerWorkflow(
   async () => (await generateText({ model: nonRetryModel, prompt: 'hi', maxRetries: 0 })).text,
   { name: 'nonRetryWorkflow' },
+);
+
+const abortMock = new MockLanguageModel();
+const abortModel = wrapLanguageModel({
+  model: abortMock,
+  middleware: durableCalls({ maxAttempts: 5, intervalSeconds: 0 }),
+});
+const abortWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: abortModel, prompt: 'hi', maxRetries: 0 })).text,
+  { name: 'abortWorkflow' },
 );
 
 const mcpToolMock = new MockLanguageModel();
@@ -565,6 +604,38 @@ test('replayed workflows synthesize the stream from the checkpoint', async () =>
   assert.equal(replayed.finishReason, 'stop');
 });
 
+test('streaming tool call runs as a durable step ordered after the model step, and replays without re-executing', async () => {
+  streamToolMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'tool-input-start', id: 'call-1', toolName: 'getWeather' },
+      { type: 'tool-input-delta', id: 'call-1', delta: '{"city":"Oslo"}' },
+      { type: 'tool-input-end', id: 'call-1' },
+      { type: 'tool-call', toolCallId: 'call-1', toolName: 'getWeather', input: '{"city":"Oslo"}' },
+      { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+    ],
+    textStreamParts(['Rainy in Oslo.']),
+  );
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(streamToolWorkflow, { workflowID })('weather in Oslo?');
+  assert.equal(await handle.getResult(), 'Rainy in Oslo.');
+  assert.equal(streamToolExecutions, 1);
+  assert.equal(streamToolMock.streamCalls, 2);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const streamStep = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
+  const toolStep = steps!.find((s) => s.name === 'getWeather')!;
+  // The tool runs on 'finish', which is withheld until the model step is durable, so its step is ordered after it.
+  assert.ok(streamStep.functionID < toolStep.functionID);
+
+  // Fork past every model/tool step: all replay from checkpoints, so nothing is re-invoked.
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof streamToolWorkflow>>(workflowID, noopStep.functionID);
+  assert.equal(await forked.getResult(), 'Rainy in Oslo.');
+  assert.equal(streamToolExecutions, 1);
+  assert.equal(streamToolMock.streamCalls, 2);
+});
+
 test('embedMany runs as a durable step inside a workflow', async () => {
   const handle = await DBOS.startWorkflow(embedWorkflow, { workflowID: randomUUID() })(['a', 'b']);
   const result = await handle.getResult();
@@ -613,8 +684,8 @@ test('failed model calls are retried durably until success', async () => {
   assert.equal(retryMock.generateCalls, 2);
 });
 
-test('permanent model failures propagate and fail the workflow', async () => {
-  errorMock.generateResults.push(new Error('model exploded'));
+test('permanent (non-retryable) model failures propagate and fail the workflow', async () => {
+  errorMock.generateResults.push(Object.assign(new Error('model exploded'), { isRetryable: false }));
   const handle = await DBOS.startWorkflow(errorWorkflow, { workflowID: randomUUID() })('hi');
   await assert.rejects(handle.getResult(), /model exploded/);
   assert.equal(errorMock.generateCalls, 1);
@@ -681,25 +752,19 @@ test('reasoning content is checkpointed and replayed', async () => {
   assert.equal(reasoningMock.streamCalls, 1);
 });
 
-test('streaming with retries buffers output until an attempt succeeds', async () => {
-  bufferedMock.streamPartLists.push(
-    [
-      { type: 'stream-start', warnings: [] },
-      { type: 'text-start', id: 't1' },
-      { type: 'text-delta', id: 't1', delta: 'partial garbage from failed attempt' },
-      { type: 'error', error: new Error('connection reset') },
-    ],
-    textStreamParts(['Good', ' answer']),
-  );
-  const handle = await DBOS.startWorkflow(bufferedStreamWorkflow, { workflowID: randomUUID() })('hi');
+test('a pre-stream failure is retried durably, then the successful attempt streams live', async () => {
+  // doStream rejects before any part is emitted, so the retry re-streams cleanly with nothing leaked.
+  retryStreamMock.streamCallErrors.push(new Error('connection reset'));
+  retryStreamMock.streamPartLists.push(textStreamParts(['Good', ' answer']));
+  const handle = await DBOS.startWorkflow(retryStreamWorkflow, { workflowID: randomUUID() })('hi');
   const result = await handle.getResult();
-  // Nothing from the failed attempt leaks to the consumer; the successful attempt is flushed after completion as one delta per block.
-  assert.deepEqual(result.deltas, ['Good answer']);
+  // The successful attempt streams live, one delta per part (not collapsed as a buffered replay would).
+  assert.deepEqual(result.deltas, ['Good', ' answer']);
   assert.equal(result.text, 'Good answer');
-  assert.equal(bufferedMock.streamCalls, 2);
+  assert.equal(retryStreamMock.streamCalls, 2);
 });
 
-test('mid-stream errors fail the model call', async () => {
+test('a mid-stream error fails the model call and is not retried once output has streamed live', async () => {
   failStreamMock.streamPartLists.push([
     { type: 'stream-start', warnings: [] },
     { type: 'text-start', id: 't1' },
@@ -708,6 +773,7 @@ test('mid-stream errors fail the model call', async () => {
   ]);
   const handle = await DBOS.startWorkflow(failStreamWorkflow, { workflowID: randomUUID() })();
   await assert.rejects(handle.getResult(), /boom/);
+  // Retries are on by default, but parts already streamed live, so re-streaming would duplicate output: no retry.
   assert.equal(failStreamMock.streamCalls, 1);
 });
 
@@ -804,11 +870,18 @@ test('accumulator preserves arrival order when a part interleaves an open text b
     { type: 'text-end', id: 't1' },
     { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
   ]);
-  const handle = await DBOS.startWorkflow(orderingWorkflow, { workflowID: randomUUID() })();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(orderingWorkflow, { workflowID })();
   const result = await handle.getResult();
   // The source arrived while the text block was open; content must stay in arrival order (text then source), not [source, text].
   assert.deepEqual(result.types, ['text', 'source']);
   assert.equal(result.text, 'According to the docs');
+
+  // Fork past the stream step: the checkpointed content replays via replayParts, which must preserve arrival order too.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof orderingWorkflow>>(workflowID, 1);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof orderingWorkflow>>;
+  assert.deepEqual(replayed.types, ['text', 'source']);
+  assert.equal(replayed.text, 'According to the docs');
 });
 
 test('generateImage runs as a durable step, bytes survive, and replay does not re-call the model', async () => {
@@ -839,6 +912,14 @@ test('multi-image generateImage: parallel batches are durable and replay in the 
   const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof multiImageWorkflow>>;
   assert.deepEqual(replayed, original); // deterministic: same batch → same funcID → same checkpoint → same order
   assert.equal(multiImageMock.generateCalls, 3);
+});
+
+test('an abort error is treated as terminal and not retried', async () => {
+  abortMock.generateResults.push(Object.assign(new Error('the operation was aborted'), { name: 'AbortError' }));
+  const handle = await DBOS.startWorkflow(abortWorkflow, { workflowID: randomUUID() })();
+  await assert.rejects(handle.getResult(), /aborted/);
+  // maxAttempts is 5, but an abort must not be retried.
+  assert.equal(abortMock.generateCalls, 1);
 });
 
 test('a provider non-retryable error is not retried even with retriesAllowed', async () => {

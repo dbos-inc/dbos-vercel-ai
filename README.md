@@ -61,23 +61,25 @@ All DBOS step options are accepted and apply per model call:
 
 ```ts
 durableCalls({
-  retriesAllowed: true,   // retry failed model calls (default: false)
+  retriesAllowed: true,   // retry failed model calls (default: true)
   maxAttempts: 5,         // total attempts when retries are allowed (default: 3)
   intervalSeconds: 1,     // delay before first retry (default: 1)
   backoffRate: 2,         // exponential backoff multiplier (default: 2)
-  shouldRetry: (error) => true,  // per-error retry predicate (default: skip provider-declared non-retryable errors)
+  shouldRetry: (error) => true,  // per-error retry predicate (default: skip provider-declared non-retryable errors and aborts)
   timeoutMS: 60000,       // per-attempt timeout
   name: 'my-model-call',  // step name (default: "<provider>.<modelId>.<operation>")
 });
 ```
 
-When `retriesAllowed` is set, a default `shouldRetry` skips errors the provider marks non-retryable (an AI SDK `APICallError`/`GatewayError` with `isRetryable === false`, e.g. a 401 or an invalid-request 400), so permanent failures fail fast instead of retrying `maxAttempts` times. Pass your own `shouldRetry` to override it.
+Retries are on by default so that a transient provider error is absorbed inside a single durable step.
+The default `shouldRetry` treats errors the provider marks non-retryable (an AI SDK `APICallError`/`GatewayError` with `isRetryable === false`, e.g. a 401 or an invalid-request 400) and aborts/timeouts as terminal, so they fail fast instead of retrying `maxAttempts` times. 
+Pass your own `shouldRetry` to override it, or `retriesAllowed: false` to disable step retries.
 
-Note that the AI SDK has its own retry layer (`maxRetries` on `generateText` et al., default 2), which composes multiplicatively with DBOS step retries — each AI SDK retry is a fresh step. If you enable DBOS retries, consider passing `maxRetries: 0` to the AI SDK call so retry behavior is governed in one place.
+Because DBOS owns retries by default, pass `maxRetries: 0` to the AI SDK call so retry behavior is governed in one place; otherwise the two compose multiplicatively and each AI SDK retry is a fresh step.
 
 ## Streaming
 
-`streamText` works inside workflows. On first execution, stream parts are passed through to your code live as the model produces them, and the assembled result is checkpointed when the stream completes. On recovery, the checkpointed result is replayed as a short synthetic stream (one delta per text block), so your workflow code runs identically either way.
+`streamText` works inside workflows. On first execution, stream parts are passed through to your code live as the model produces them, and the assembled result is checkpointed when the stream completes. The terminal `finish` part is held back until that checkpoint is durable, so any tool calls the model requests (which the AI SDK runs on `finish`) and the durable steps they perform never checkpoint ahead of the model call itself. On recovery, the checkpointed result is replayed as a short synthetic stream (one delta per text block), so your workflow code runs identically either way.
 
 ```ts
 const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
@@ -89,7 +91,7 @@ const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
 }, { name: 'streamingAgent' });
 ```
 
-**Retries and streaming.** When `retriesAllowed` is set, live pass-through is disabled for streaming calls: a failed attempt may already have produced partial output, so parts are instead emitted all at once after an attempt succeeds. Non-streaming calls are unaffected.
+**Retries and streaming.** Streaming stays live even with retries on. A failure that occurs before any part has streamed (e.g. a connection error when the request opens — the common transient case) is retried transparently. Once parts have streamed to your code, a later failure is *not* retried, because re-running the call would duplicate the output already delivered; it surfaces as a stream error instead, exactly as an un-wrapped `streamText` would.
 
 To stream tokens to another process (e.g. the workflow runs on a queue worker and an HTTP handler streams to a browser), write parts to a [DBOS workflow stream](https://docs.dbos.dev/typescript/tutorials/workflow-tutorial#workflow-streaming) from your own consumer loop and read them elsewhere with `DBOS.readStream`.
 

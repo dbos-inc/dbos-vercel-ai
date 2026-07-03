@@ -79,11 +79,9 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       }
       const workflowID = enterDurableModelCall('stream');
 
-      // With retries, buffer and emit only after success so parts from a failed attempt aren't delivered live.
-      const buffered = stepConfig.retriesAllowed === true;
-
       let executed = false;
       let cancelled = false;
+      let emittedLive = false;
       let controller!: ReadableStreamDefaultController<LanguageModelV4StreamPart>;
       let step!: Promise<LanguageModelV4GenerateResult>;
       const stream = new ReadableStream<LanguageModelV4StreamPart>({
@@ -97,7 +95,17 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         },
       });
       const emit = (part: LanguageModelV4StreamPart) => {
-        if (!cancelled) controller.enqueue(part);
+        if (!cancelled) {
+          controller.enqueue(part);
+          emittedLive = true;
+        }
+      };
+
+      // Once any part has streamed live, a retry would re-stream from scratch and duplicate output, so stop retrying.
+      const streamStepConfig: StepConfig = {
+        ...stepConfig,
+        shouldRetry: async (error: unknown) =>
+          !emittedLive && (stepConfig.shouldRetry ? await stepConfig.shouldRetry(error) : true),
       };
 
       step = DBOS.runStep(
@@ -116,7 +124,9 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
                 if (cancelled) break;
                 throw part.error instanceof Error ? part.error : new Error(String(part.error));
               }
-              if (!buffered) emit(part);
+              // Stream deltas live, but withhold 'finish' until the checkpoint is durable: the AI SDK runs tool calls
+              // (and thus downstream durable steps) on 'finish', which must not checkpoint before this model step.
+              if (part.type !== 'finish') emit(part);
               accumulator.add(part);
             }
           } catch (error) {
@@ -125,17 +135,27 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
           }
           return encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
         },
-        { ...stepConfig, name: stepConfig.name ?? stepName(model, 'stream') },
+        { ...streamStepConfig, name: stepConfig.name ?? stepName(model, 'stream') },
       );
 
-      // Return the stream now and drive it from the settled step: replay/buffered runs emit synthesized parts, then close so consumers finish only after the result is durable.
+      // Drive the returned stream from the settled step: a live run emits only the withheld 'finish' (deltas already
+      // streamed); a recovered run synthesizes the whole stream from the checkpoint. Either way consumers finish
+      // only after the result is durable.
       void step
         .then(
           (recorded) => {
-            if ((buffered || !executed) && !cancelled) {
+            if (cancelled) return;
+            if (executed) {
+              emit({
+                type: 'finish',
+                finishReason: recorded.finishReason,
+                usage: recorded.usage,
+                providerMetadata: recorded.providerMetadata,
+              });
+            } else {
               for (const part of replayParts(recorded)) emit(part);
             }
-            if (!cancelled) controller.close();
+            controller.close();
           },
           (error: unknown) => {
             if (!cancelled) controller.error(error);
