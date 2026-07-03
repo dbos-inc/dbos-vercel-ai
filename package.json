@@ -42,14 +42,12 @@
     "llm",
     "agent"
   ],
-  "dependencies": {
-    "@ai-sdk/provider": "^4.0.0"
-  },
   "peerDependencies": {
     "@dbos-inc/dbos-sdk": "*",
     "ai": "^7.0.0"
   },
   "devDependencies": {
+    "@ai-sdk/provider": "^4.0.0",
     "@arethetypeswrong/cli": "^0.18.0",
     "@dbos-inc/dbos-sdk": "^4.23.6",
     "@types/node": "^24.0.0",

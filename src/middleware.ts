@@ -1,15 +1,16 @@
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
+// Public signatures use ai's middleware aliases: ai is the single peer instance, so the types always
+// match the consumer's wrap* calls. @ai-sdk/provider (dev-only) never appears in the published types —
+// the AI SDK ecosystem exact-pins it, and duplicate copies don't unify.
+import type { EmbeddingModelMiddleware, ImageModelMiddleware, LanguageModelMiddleware } from 'ai' with { 'resolution-mode': 'import' };
 import type {
   EmbeddingModelV4,
-  EmbeddingModelV4Middleware,
   ImageModelV4,
-  ImageModelV4Middleware,
   ImageModelV4Result,
   LanguageModelV4,
   LanguageModelV4Content,
   LanguageModelV4FinishReason,
   LanguageModelV4GenerateResult,
-  LanguageModelV4Middleware,
   LanguageModelV4Reasoning,
   LanguageModelV4ResponseMetadata,
   LanguageModelV4StreamPart,
@@ -50,7 +51,7 @@ function exitDurableModelCall(workflowID: string): void {
 }
 
 /** AI SDK language-model middleware that runs each model call as a durable, checkpointed DBOS step (replayed on recovery); outside a workflow it calls the model directly. */
-export function durableCalls(options: StepConfig = {}): LanguageModelV4Middleware {
+export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware {
   const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
@@ -148,7 +149,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelV4Middlewar
 }
 
 /** AI SDK embedding-model middleware that runs each embedding call as a durable DBOS step, like {@link durableCalls}. */
-export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelV4Middleware {
+export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelMiddleware {
   const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
@@ -175,7 +176,7 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelV
  * No concurrency guard: generateImage splits `n > maxImagesPerCall` into batches it dispatches synchronously (no
  * await before doGenerate), so their step order is deterministic on replay — unlike embedMany's parallel batches.
  */
-export function durableImageCalls(options: StepConfig = {}): ImageModelV4Middleware {
+export function durableImageCalls(options: StepConfig = {}): ImageModelMiddleware {
   const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
