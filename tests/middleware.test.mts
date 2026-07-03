@@ -274,6 +274,20 @@ const cancelRejectWorkflow = DBOS.registerWorkflow(
   { name: 'cancelRejectWorkflow' },
 );
 
+const earlyCancelMock = new MockLanguageModel();
+const earlyCancelModel = wrapLanguageModel({ model: earlyCancelMock, middleware: durableCalls() });
+
+// Cancels before the model call settles; a later doStream rejection must not become the step outcome.
+const earlyCancelWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const streamResult = await earlyCancelModel.doStream({ prompt: userPrompt });
+    await streamResult.stream.cancel();
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return 'cancelled immediately';
+  },
+  { name: 'earlyCancelWorkflow' },
+);
+
 const recoveryMock = new MockLanguageModel();
 const recoveryModel = wrapLanguageModel({ model: recoveryMock, middleware: durableCalls() });
 
@@ -732,6 +746,21 @@ test('cancel then stream-level rejection records a success, so a fork replays id
   assert.equal(cancelRejectMock.streamCalls, 1);
 });
 
+test('cancel before doStream settles: a later rejection still checkpoints a success', async () => {
+  earlyCancelMock.streamCallErrors.push(new Error('connect failed after cancel'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(earlyCancelWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'cancelled immediately');
+
+  // Checkpoint-level assertion: this consumer shape masks a recorded error live, so inspect the step directly.
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const streamStep = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
+  assert.equal(streamStep.error, null);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof earlyCancelWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 'cancelled immediately');
+});
+
 test('invoking a workflow twice with the same ID does not repeat model calls', async () => {
   generateMock.generateResults.push(textResponse('only once'));
   const workflowID = randomUUID();
@@ -876,6 +905,7 @@ test('MCP tool results reach the model as converted content; title/metadata/_met
   )!;
   assert.equal(resultPart.output!.type, 'content');
   const value = resultPart.output!.value as { type: string; text?: string; mediaType?: string; data?: unknown }[];
+  // Lowercase proves the built-in conversion ran (the client's own converter would uppercase).
   assert.deepEqual(value[0], { type: 'text', text: 'took screenshot' });
   assert.equal(value[1]!.type, 'file');
   assert.equal(value[1]!.mediaType, 'image/png');

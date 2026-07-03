@@ -100,8 +100,17 @@ export class MockLanguageModel implements LanguageModelV4 {
     return result;
   }
 
+  // Queue an Error here to make doStream itself reject (after a tick) instead of returning a stream.
+  streamCallErrors: Error[] = [];
+
   async doStream(_options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
     this.streamCalls++;
+    const callError = this.streamCallErrors.shift();
+    if (callError) {
+      // Reject after a tick so a consumer cancelling right away wins the race.
+      await new Promise((resolve) => setImmediate(resolve));
+      throw callError;
+    }
     const parts = this.streamPartLists.shift();
     if (parts === undefined) {
       throw new Error('MockLanguageModel: no stream responses left');
@@ -235,7 +244,8 @@ export class RichMockMCPClient {
           value: result.content.map((part) =>
             part.type === 'image'
               ? { type: 'file' as const, mediaType: part.mimeType!, data: { type: 'data' as const, data: part.data! } }
-              : { type: 'text' as const, text: part.text! },
+              : // Uppercase distinguishes this converter from the middleware's built-in conversion (which keeps text as-is).
+                { type: 'text' as const, text: part.text!.toUpperCase() },
           ),
         };
       },
