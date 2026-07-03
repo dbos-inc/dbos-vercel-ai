@@ -515,7 +515,7 @@ const asyncSchemaClient = {
 const asyncSchemaWorkflow = DBOS.registerWorkflow(
   async () => {
     const tools = await durableMCPTools(asyncSchemaClient);
-    return await asSchema((tools.ping as { inputSchema: unknown }).inputSchema).jsonSchema;
+    return await asSchema((tools.ping as { inputSchema: Parameters<typeof asSchema>[0] }).inputSchema).jsonSchema;
   },
   { name: 'asyncSchemaWorkflow' },
 );
