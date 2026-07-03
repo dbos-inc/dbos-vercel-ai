@@ -1,0 +1,62 @@
+{
+  "name": "@dbos-inc/vercel-ai",
+  "version": "0.0.0-placeholder",
+  "description": "DBOS durable execution integration for the Vercel AI SDK",
+  "license": "MIT",
+  "type": "commonjs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dbos-inc/dbos-vercel-ai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dbos-inc/dbos-vercel-ai/issues"
+  },
+  "homepage": "https://docs.dbos.dev/",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "tsx --test tests/*.test.mts",
+    "check:package": "npm run build && publint && attw --pack .",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "dbos",
+    "ai",
+    "vercel",
+    "ai-sdk",
+    "durable-execution",
+    "workflow",
+    "llm",
+    "agent"
+  ],
+  "peerDependencies": {
+    "@dbos-inc/dbos-sdk": "*",
+    "ai": "^7.0.0"
+  },
+  "devDependencies": {
+    "@ai-sdk/provider": "^4.0.0",
+    "@arethetypeswrong/cli": "^0.18.0",
+    "@dbos-inc/dbos-sdk": "^4.23.6",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.20.0",
+    "ai": "^7.0.0",
+    "pg": "^8.22.0",
+    "publint": "^0.3.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0",
+    "zod": "^4.0.0"
+  }
+}
