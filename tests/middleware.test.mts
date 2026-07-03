@@ -398,6 +398,20 @@ const parallelMcpWorkflow = DBOS.registerWorkflow(
   { name: 'parallelMcpWorkflow' },
 );
 
+const subsetMcpMock = new MockLanguageModel();
+const subsetMcpModel = wrapLanguageModel({ model: subsetMcpMock, middleware: durableCalls() });
+const subsetMcpClient = new MockMCPClient();
+const subsetSchemas = { schemas: { getWeather: {} } };
+
+const subsetMcpWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const tools = await durableMCPTools(subsetMcpClient, { toolOptions: subsetSchemas });
+    const result = await generateText({ model: subsetMcpModel, prompt, tools, stopWhen: stepCountIs(5), maxRetries: 0 });
+    return { text: result.text, toolNames: Object.keys(tools) };
+  },
+  { name: 'subsetMcpWorkflow' },
+);
+
 const richMcpMock = new MockLanguageModel();
 const richMcpModel = wrapLanguageModel({ model: richMcpMock, middleware: durableCalls() });
 const richMcpClient = new RichMockMCPClient();
@@ -920,6 +934,21 @@ test('MCP tool results reach the model as converted content; title/metadata/_met
   assert.deepEqual(replayed.meta, { 'mcp/app': { uri: 'ui://screenshot' } });
   assert.equal(replayed.converts, true);
   assert.equal(richMcpClient.screenshotCalls, 1); // tool not re-executed on replay
+});
+
+test('toolOptions forward to the client on listing and on each tool call', async () => {
+  subsetMcpMock.generateResults.push(toolCallResponse('getWeather', '{"city":"Lima"}'), textResponse('Sunny in Lima.'));
+  const handle = await DBOS.startWorkflow(subsetMcpWorkflow, { workflowID: randomUUID() })('weather in Lima?');
+  const result = await handle.getResult();
+  assert.equal(result.text, 'Sunny in Lima.');
+  // Schemas subsetting: only the explicitly listed tool is exposed to the model.
+  assert.deepEqual(result.toolNames, ['getWeather']);
+  assert.equal(subsetMcpClient.weatherCalls, 1);
+  // Both the listing and the in-step re-fetch received the same options.
+  assert.equal(subsetMcpClient.toolsOptionsLog.length, 2);
+  for (const opts of subsetMcpClient.toolsOptionsLog) {
+    assert.deepEqual(opts, subsetSchemas);
+  }
 });
 
 test('tools without toModelOutput are not given one', async () => {

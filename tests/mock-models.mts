@@ -188,14 +188,16 @@ export class MockMCPClient {
   listCalls = 0;
   weatherCalls = 0;
   timeCalls = 0;
+  toolsOptionsLog: unknown[] = [];
 
   get executeCalls(): number {
     return this.weatherCalls + this.timeCalls;
   }
 
-  async tools(): Promise<ToolSet> {
+  async tools(options?: { schemas?: Record<string, unknown> }): Promise<ToolSet> {
     this.listCalls++;
-    return {
+    this.toolsOptionsLog.push(options);
+    const all: ToolSet = {
       getWeather: tool({
         description: 'Get the weather for a city',
         inputSchema: z.object({ city: z.string() }),
@@ -213,6 +215,9 @@ export class MockMCPClient {
         },
       }),
     };
+    if (!options?.schemas) return all;
+    // Schemas mode subsets like @ai-sdk/mcp: only explicitly listed tools are returned.
+    return Object.fromEntries(Object.entries(all).filter(([name]) => name in options.schemas!));
   }
 
   async close(): Promise<void> {}

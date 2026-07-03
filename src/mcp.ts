@@ -2,10 +2,15 @@ import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
 import { isInWorkflowFunction, withErrorClassification } from './internal';
 
-// Structural type for an MCP client (e.g. from @ai-sdk/mcp or ai's experimental_createMCPClient) — only what we use.
+// Structural type for an MCP client (e.g. from @ai-sdk/mcp) — only what we use.
 export interface MCPClientLike {
   tools(options?: unknown): Promise<ToolSet>;
   close?(): Promise<void>;
+}
+
+export interface DurableMCPToolsOptions extends StepConfig {
+  /** Forwarded to client.tools() on listing and on each call (e.g. { schemas } for subsetting and output schemas). */
+  toolOptions?: unknown;
 }
 
 interface DurableToolDef {
@@ -44,15 +49,16 @@ function mcpToolOutput(output: unknown): ToolModelOutput {
  * list (JSON schemas) is checkpointed so recovery needs no live connection, and each tool call is
  * checkpointed so a recovered workflow replays results instead of re-invoking the tool.
  */
-export async function durableMCPTools(client: MCPClientLike, options: StepConfig = {}): Promise<ToolSet> {
-  const stepConfig = withErrorClassification(options);
+export async function durableMCPTools(client: MCPClientLike, options: DurableMCPToolsOptions = {}): Promise<ToolSet> {
+  const { toolOptions, ...stepOptions } = options;
+  const stepConfig = withErrorClassification(stepOptions);
   const { asSchema, dynamicTool, jsonSchema } = await import('ai');
   const run = <T>(name: string, fn: () => Promise<T>): Promise<T> =>
     isInWorkflowFunction() ? DBOS.runStep(fn, { ...stepConfig, name }) : fn();
 
   // Checkpoint the tool list as plain JSON schemas, so replay reconstructs tools without the live client.
   const listed = await run('mcp.listTools', async () => {
-    const tools = await client.tools();
+    const tools = await client.tools(toolOptions);
     const defs: Record<string, DurableToolDef> = {};
     for (const [name, tool] of Object.entries(tools)) {
       defs[name] = {
@@ -80,7 +86,7 @@ export async function durableMCPTools(client: MCPClientLike, options: StepConfig
       // Re-fetch the live tool inside the step (its execute closure can't be checkpointed); replay returns the recorded result.
       execute: (input: unknown, execOptions) =>
         run(`mcp.tool.${name}`, async () => {
-          const tool = (await client.tools())[name];
+          const tool = (await client.tools(toolOptions))[name];
           if (!tool?.execute) throw new Error(`MCP tool "${name}" is not executable.`);
           return tool.execute(input, execOptions);
         }),

@@ -120,18 +120,26 @@ const agent = DBOS.registerWorkflow(async (question: string) => {
 
 ### MCP tools
 
-`durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (from `@ai-sdk/mcp` or `ai`'s `experimental_createMCPClient`) so both the tool listing and every tool call run as durable steps. The tool list is checkpointed as JSON schemas, so a recovered workflow reconstructs the tools without the live connection, and each tool call is checkpointed so recovery replays results instead of re-invoking the tool:
+`durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (e.g. from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps. The tool list is checkpointed as JSON schemas, so a recovered workflow reconstructs the tools without the live connection, and each tool call is checkpointed so recovery replays results instead of re-invoking the tool:
 
 ```ts
-import { experimental_createMCPClient } from 'ai';
+import { createMCPClient } from '@ai-sdk/mcp';
 import { durableMCPTools } from '@dbos-inc/vercel-ai';
 
 const agent = DBOS.registerWorkflow(async (question: string) => {
-  const mcpClient = await experimental_createMCPClient({ transport: { type: 'http', url: MCP_URL } });
+  const mcpClient = await createMCPClient({ transport: { type: 'http', url: MCP_URL } });
   const tools = await durableMCPTools(mcpClient);
   const result = await generateText({ model, prompt: question, tools, stopWhen: stepCountIs(10) });
   return result.text;
 }, { name: 'mcpAgent' });
+```
+
+To use the client's explicit-schema mode (tool subsetting, typed inputs, output schemas), pass `toolOptions`; it is forwarded to `client.tools()` for both the listing and each tool call:
+
+```ts
+const tools = await durableMCPTools(mcpClient, {
+  toolOptions: { schemas: { 'get-weather': { inputSchema: z.object({ city: z.string() }) } } },
+});
 ```
 
 ## Concurrency
