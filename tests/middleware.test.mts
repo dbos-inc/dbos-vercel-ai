@@ -149,6 +149,18 @@ const embedWorkflow = DBOS.registerWorkflow(
   { name: 'embedWorkflow' },
 );
 
+const embedReplayMock = new MockEmbeddingModel();
+const embedReplayModel = wrapEmbeddingModel({ model: embedReplayMock, middleware: durableEmbeddingCalls() });
+
+const embedReplayWorkflow = DBOS.registerWorkflow(
+  async (values: string[]) => {
+    const result = await embedMany({ model: embedReplayModel, values });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' }); // trailing step to fork past (replays the embed step)
+    return { count: result.embeddings.length, first: result.embeddings[0] };
+  },
+  { name: 'embedReplayWorkflow' },
+);
+
 // Finite per-call limit makes embedMany split inputs into batches (parallel by default).
 const batchEmbedMock = new MockEmbeddingModel(2);
 const batchEmbedModel = wrapEmbeddingModel({ model: batchEmbedMock, middleware: durableEmbeddingCalls() });
@@ -645,6 +657,24 @@ test('embedMany runs as a durable step inside a workflow', async () => {
   assert.equal(embedMock.embedCalls, 1);
 });
 
+test('embedMany checkpoints as a durable step and replays from the checkpoint without re-calling the model', async () => {
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(embedReplayWorkflow, { workflowID })(['a', 'b']);
+  const original = await handle.getResult();
+  assert.equal(original.count, 2);
+  assert.equal(embedReplayMock.embedCalls, 1);
+
+  // The embed call must be recorded as a durable step (not silently run live).
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.ok(steps?.some((s) => s.name === 'mock.mock-embed.embed'), 'embedding recorded as a durable step');
+
+  // Fork past the embed step: it replays from its checkpoint, so the model is not re-called.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof embedReplayWorkflow>>(workflowID, 1);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof embedReplayWorkflow>>;
+  assert.deepEqual(replayed, original);
+  assert.equal(embedReplayMock.embedCalls, 1); // not re-called on replay
+});
+
 test('multi-batch embedMany (parallel batches) trips the guard with a remedy in the message', async () => {
   const handle = await DBOS.startWorkflow(parallelEmbedWorkflow, { workflowID: randomUUID() })(['a', 'b', 'c', 'd']);
   await assert.rejects(handle.getResult(), /Concurrent durable model calls.*maxParallelCalls: 1/s);
@@ -777,14 +807,25 @@ test('a mid-stream error fails the model call and is not retried once output has
   assert.equal(failStreamMock.streamCalls, 1);
 });
 
+// Reads the checkpointed output of the stream step so cancel tests can assert what was actually recorded.
+async function recordedStreamStep(workflowID: string) {
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const step = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
+  return { step, output: step.output as { content: { type: string; text?: string }[]; finishReason: { unified: string } } };
+}
+
 test('cancelling the consumer stream still checkpoints the full model call', async () => {
   cancelMock.streamPartLists.push(textStreamParts(['Hello', ' world']));
   const workflowID = randomUUID();
   const handle = await DBOS.startWorkflow(cancelWorkflow, { workflowID })();
   assert.equal(await handle.getResult(), 'cancelled early');
   assert.equal(cancelMock.streamCalls, 1);
-  const steps = await DBOS.listWorkflowSteps(workflowID);
-  assert.ok(steps !== undefined && steps.some((s) => s.name === 'mock.mock-model.stream'));
+  // The step must record the full model output, not a truncated/empty result from stopping at the cancel.
+  const { step, output } = await recordedStreamStep(workflowID);
+  assert.equal(step.error, null);
+  assert.equal(output.content.length, 1);
+  assert.equal(output.content[0]!.text, 'Hello world');
+  assert.equal(output.finishReason.unified, 'stop');
 });
 
 test('cancel then model failure records a success, so a fork replays identically instead of failing', async () => {
@@ -799,6 +840,10 @@ test('cancel then model failure records a success, so a fork replays identically
   const handle = await DBOS.startWorkflow(cancelErrorWorkflow, { workflowID })();
   assert.equal(await handle.getResult(), 'cancelled before error');
   assert.equal(cancelErrorMock.streamCalls, 1);
+  // The post-cancel error is swallowed: the partial content read before it is recorded as a successful step.
+  const { step, output } = await recordedStreamStep(workflowID);
+  assert.equal(step.error, null);
+  assert.equal(output.content[0]!.text, 'ab');
 
   // Fork after the stream step: it replays from its checkpoint. Before the fix the step was
   // recorded as an error and the fork threw; now it's a success and replays identically.
@@ -819,6 +864,10 @@ test('cancel then stream-level rejection records a success, so a fork replays id
   const handle = await DBOS.startWorkflow(cancelRejectWorkflow, { workflowID })();
   assert.equal(await handle.getResult(), 'cancelled before rejection');
   assert.equal(cancelRejectMock.streamCalls, 1);
+  // The post-cancel rejection is swallowed too: the partial content read before it is recorded as a success.
+  const { step, output } = await recordedStreamStep(workflowID);
+  assert.equal(step.error, null);
+  assert.equal(output.content[0]!.text, 'ab');
 
   // Fork after the stream step: before the fix the rejection was recorded as the step outcome and the fork threw here.
   const forked = await DBOS.forkWorkflow<ReturnType<typeof cancelRejectWorkflow>>(workflowID, 1);
@@ -833,9 +882,9 @@ test('cancel before doStream settles: a later rejection still checkpoints a succ
   assert.equal(await handle.getResult(), 'cancelled immediately');
 
   // Checkpoint-level assertion: this consumer shape masks a recorded error live, so inspect the step directly.
-  const steps = await DBOS.listWorkflowSteps(workflowID);
-  const streamStep = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
-  assert.equal(streamStep.error, null);
+  const { step, output } = await recordedStreamStep(workflowID);
+  assert.equal(step.error, null); // a success, not the post-cancel doStream rejection
+  assert.deepEqual(output.content, []); // cancelled before any content arrived
 
   const forked = await DBOS.forkWorkflow<ReturnType<typeof earlyCancelWorkflow>>(workflowID, 1);
   assert.equal(await forked.getResult(), 'cancelled immediately');
