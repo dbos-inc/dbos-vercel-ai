@@ -1,6 +1,6 @@
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
-import { assertNotInTransaction, isInWorkflowFunction, withErrorClassification } from './internal';
+import { assertNotInTransaction, isInWorkflowFunction, tagConsumerAbort, withErrorClassification } from './internal';
 
 // Structural type for an MCP client (e.g. from @ai-sdk/mcp) — deliberately loose: the AI SDK ecosystem
 // exact-pins @ai-sdk/provider-utils, so precise Tool types fail to match across skewed copies.
@@ -103,19 +103,26 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
       // MCP clients convert results via a pure toModelOutput; reapply an equivalent so results reach the model as content, not raw JSON.
       toModelOutput: def.convertsOutput ? ({ output }) => mcpToolOutput(output) : undefined,
       // Re-fetch the live tool inside the step (its execute closure can't be checkpointed); replay returns the recorded result.
-      execute: (input: unknown, execOptions) =>
-        run(`mcp.tool.${name}`, async () => {
-          const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
-          if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
-          const output = await tool.execute(input, execOptions);
-          // A streaming execute can't checkpoint mid-flight; drain it and record the final value (the last yield).
-          if (isAsyncIterable(output)) {
-            let last: unknown;
-            for await (last of output);
-            return last;
+      execute: (input: unknown, execOptions) => {
+        const signal = (execOptions as { abortSignal?: AbortSignal } | undefined)?.abortSignal;
+        return run(`mcp.tool.${name}`, async () => {
+          try {
+            const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
+            if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
+            const output = await tool.execute(input, execOptions);
+            // A streaming execute can't checkpoint mid-flight; drain it and record the final value (the last yield).
+            if (isAsyncIterable(output)) {
+              let last: unknown;
+              for await (last of output);
+              return last;
+            }
+            return output;
+          } catch (error) {
+            // A consumer abort isn't a tool failure; mark its checkpoint so a replay can tell the two apart.
+            throw signal?.aborted ? tagConsumerAbort(error) : error;
           }
-          return output;
-        }),
+        });
+      },
     });
     // @ai-sdk/mcp spreads the MCP _meta onto the tool object; preserve it for consumers that read it.
     durable[name] = def.meta === undefined ? reconstructed : Object.assign(reconstructed, { _meta: def.meta });

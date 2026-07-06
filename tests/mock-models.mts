@@ -91,6 +91,10 @@ export class MockLanguageModel implements LanguageModelV4 {
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     this.generateCalls++;
     this.generateOptions.push(options);
+    if (options.abortSignal?.aborted) {
+      // Real providers reject once the call's abortSignal fires.
+      throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    }
     const result = this.generateResults.shift();
     if (result === undefined) {
       throw new Error('MockLanguageModel: no generate responses left');

@@ -696,6 +696,126 @@ const timeoutStreamWorkflow = DBOS.registerWorkflow(
   { name: 'timeoutStreamWorkflow' },
 );
 
+// An aborted MCP tool call checkpoints a tagged error; replaying it must not resurrect the agent loop.
+let slowToolStarted: (() => void) | undefined;
+let slowToolExecutions = 0;
+const makeSlowToolClient = () =>
+  ({
+    async tools() {
+      return {
+        slowTool: {
+          description: 'a slow tool',
+          inputSchema: {
+            [Symbol.for('vercel.ai.schema')]: true,
+            jsonSchema: { type: 'object', properties: {} },
+            validate: undefined,
+          },
+          // Hangs until the call's abortSignal fires, then rejects like a real RPC.
+          execute: (_input: unknown, options: { abortSignal?: AbortSignal }) =>
+            new Promise((_resolve, reject) => {
+              slowToolExecutions++;
+              slowToolStarted?.();
+              options.abortSignal?.addEventListener('abort', () =>
+                reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })),
+              );
+            }),
+        },
+      };
+    },
+    async close() {},
+  }) as unknown as MCPClientLike;
+
+const abortToolMock = new MockLanguageModel();
+const abortToolModel = wrapLanguageModel({ model: abortToolMock, middleware: durableCalls() });
+const abortToolClient = makeSlowToolClient();
+let abortToolAbort: (() => void) | undefined;
+
+const abortToolWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    abortToolAbort = () => controller.abort();
+    const tools = await durableMCPTools(abortToolClient);
+    try {
+      const result = streamText({
+        model: abortToolModel,
+        prompt: 'hi',
+        tools,
+        abortSignal: controller.signal,
+        stopWhen: stepCountIs(5),
+        maxRetries: 0,
+      });
+      const deltas: string[] = [];
+      for await (const delta of result.textStream) {
+        deltas.push(delta);
+      }
+      await result.text;
+      return 'completed';
+    } catch {
+      await DBOS.runStep(async () => 'noop', { name: 'noop' });
+      return 'aborted';
+    }
+  },
+  { name: 'abortToolWorkflow' },
+);
+
+const abortGenMock = new MockLanguageModel();
+const abortGenModel = wrapLanguageModel({ model: abortGenMock, middleware: durableCalls() });
+const abortGenClient = makeSlowToolClient();
+let abortGenAbort: (() => void) | undefined;
+
+const abortGenWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    abortGenAbort = () => controller.abort();
+    const tools = await durableMCPTools(abortGenClient);
+    try {
+      const result = await generateText({
+        model: abortGenModel,
+        prompt: 'hi',
+        tools,
+        abortSignal: controller.signal,
+        stopWhen: stepCountIs(5),
+        maxRetries: 0,
+      });
+      return result.text;
+    } catch {
+      await DBOS.runStep(async () => 'noop', { name: 'noop' });
+      return 'aborted';
+    }
+  },
+  { name: 'abortGenWorkflow' },
+);
+
+// A checkpointed abort refusal must not poison later recoveries' legitimate model calls.
+const abortRecoverMock = new MockLanguageModel();
+const abortRecoverModel = wrapLanguageModel({ model: abortRecoverMock, middleware: durableCalls() });
+const abortRecoverClient = makeSlowToolClient();
+let abortRecoverAbort: (() => void) | undefined;
+
+const abortRecoverWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    abortRecoverAbort = () => controller.abort();
+    const tools = await durableMCPTools(abortRecoverClient);
+    try {
+      const result = await generateText({
+        model: abortRecoverModel,
+        prompt: 'hi',
+        tools,
+        abortSignal: controller.signal,
+        stopWhen: stepCountIs(5),
+        maxRetries: 0,
+      });
+      return result.text;
+    } catch {
+      // Recovery path: a fresh, un-aborted model call.
+      const recovery = await generateText({ model: abortRecoverModel, prompt: 'recover', maxRetries: 0 });
+      return recovery.text;
+    }
+  },
+  { name: 'abortRecoverWorkflow' },
+);
+
 // A throwing isRetryable accessor must not replace the step's real error or disable retries.
 const evilRetryMock = new MockLanguageModel();
 const evilRetryModel = wrapLanguageModel({
@@ -1481,6 +1601,97 @@ test('aborting mid-stream checkpoints the partial output as a success and replay
   // Replay delivers the checkpointed partial content as one delta per block; no abort fires.
   assert.equal(replayed.join(''), recordedText);
   assert.equal(abortStreamMock.streamCalls, 1);
+});
+
+test('an aborted MCP tool call does not resurrect the streamText agent loop on replay', async () => {
+  abortToolMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'tool-input-start', id: 'call-1', toolName: 'slowTool' },
+    { type: 'tool-input-end', id: 'call-1' },
+    { type: 'tool-call', toolCallId: 'call-1', toolName: 'slowTool', input: '{}' },
+    { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+  ]);
+  const started = new Promise<void>((resolve) => (slowToolStarted = resolve));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(abortToolWorkflow, { workflowID })();
+  await started;
+  abortToolAbort!();
+  assert.equal(await handle.getResult(), 'aborted');
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'mcp.tool.slowTool')!;
+  assert.ok(toolStep.error !== null, 'aborted tool call recorded as a step error');
+  const streamCallsBefore = abortToolMock.streamCalls;
+  const executionsBefore = slowToolExecutions;
+
+  // Fork past the aborted tool step: the replay must end where the aborted run ended, not dispatch new model calls.
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof abortToolWorkflow>>(workflowID, noopStep.functionID);
+  assert.equal(await forked.getResult(), 'aborted');
+  assert.equal(abortToolMock.streamCalls, streamCallsBefore); // no resurrected model call
+  assert.equal(slowToolExecutions, executionsBefore); // tool not re-invoked
+});
+
+test('a crash between an aborted tool step and the next model checkpoint does not resurrect generateText', async () => {
+  abortGenMock.generateResults.push(toolCallResponse('slowTool', '{}'));
+  const started = new Promise<void>((resolve) => (slowToolStarted = resolve));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(abortGenWorkflow, { workflowID })();
+  await started;
+  abortGenAbort!();
+  assert.equal(await handle.getResult(), 'aborted');
+  // Live, the loop continued to a second model call, which threw the abort and checkpointed it.
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const modelSteps = steps!.filter((s) => s.name === 'mock.mock-model.generate');
+  assert.equal(modelSteps.length, 2);
+  assert.ok(modelSteps[1]!.error !== null);
+
+  const callsBefore = abortGenMock.generateCalls;
+  const executionsBefore = slowToolExecutions;
+
+  // Fork before the aborted model step checkpointed (the crash window): replay must refuse, not run a fresh model call.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof abortGenWorkflow>>(workflowID, modelSteps[1]!.functionID);
+  assert.equal(await forked.getResult(), 'aborted');
+  assert.equal(abortGenMock.generateCalls, callsBefore); // no fresh model call in the crash window
+  assert.equal(slowToolExecutions, executionsBefore);
+
+  // The refusal itself checkpointed at the aborted run's frontier, so further replays are deterministic.
+  const forkedSteps = await DBOS.listWorkflowSteps(forked.workflowID);
+  const refusal = forkedSteps!.find((s) => s.functionID === modelSteps[1]!.functionID)!;
+  assert.match(String(refusal.error), /abort/i);
+});
+
+test('later recoveries past a checkpointed abort refusal are not wrongly refused', async () => {
+  abortRecoverMock.generateResults.push(toolCallResponse('slowTool', '{}'), textResponse('recovered live'));
+  const started = new Promise<void>((resolve) => (slowToolStarted = resolve));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(abortRecoverWorkflow, { workflowID })();
+  await started;
+  abortRecoverAbort!();
+  assert.equal(await handle.getResult(), 'recovered live');
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const modelSteps = steps!.filter((s) => s.name === 'mock.mock-model.generate');
+  assert.equal(modelSteps.length, 3); // tool-call turn, aborted call, catch-path recovery call
+
+  // Recovery #1 (crash window): the replay refuses at the aborted step, then the catch path runs live.
+  abortRecoverMock.generateResults.push(textResponse('recovered fork1'));
+  const forked1 = await DBOS.forkWorkflow<ReturnType<typeof abortRecoverWorkflow>>(
+    workflowID,
+    modelSteps[1]!.functionID,
+  );
+  assert.equal(await forked1.getResult(), 'recovered fork1');
+
+  // Recovery #2 replays BOTH the marked tool step and the checkpointed refusal; the catch path's live model
+  // call past the old frontier has a marker-free prompt and must run, not be refused.
+  const fork1Steps = await DBOS.listWorkflowSteps(forked1.workflowID);
+  const fork1Models = fork1Steps!.filter((s) => s.name === 'mock.mock-model.generate');
+  abortRecoverMock.generateResults.push(textResponse('recovered fork2'));
+  const forked2 = await DBOS.forkWorkflow<ReturnType<typeof abortRecoverWorkflow>>(
+    forked1.workflowID,
+    fork1Models[2]!.functionID,
+  );
+  assert.equal(await forked2.getResult(), 'recovered fork2');
 });
 
 test('a throwing isRetryable accessor does not replace the step error or disable retries', async () => {
