@@ -98,7 +98,8 @@ const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
 
 ## Tools
 
-Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop. A tool's `execute` is your own code, though: wrap its side effects in a DBOS step so they're checkpointed too.
+Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop.
+You should wrap your tool's `execute` in a DBOS step so it is checkpointed too.
 
 ```ts
 import { tool, stepCountIs } from 'ai';
@@ -123,7 +124,8 @@ const agent = DBOS.registerWorkflow(async (question: string) => {
 
 ### MCP tools
 
-`durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (e.g. from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps. The tool list is checkpointed as JSON schemas, so a recovered workflow reconstructs the tools without the live connection, and each tool call is checkpointed so recovery replays results instead of re-invoking the tool:
+`durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (e.g. from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps.
+Each tool call is checkpointed so recovery replays results instead of re-invoking the tool:
 
 ```ts
 import { createMCPClient } from '@ai-sdk/mcp';
@@ -147,11 +149,12 @@ const tools = await durableMCPTools(mcpClient, {
 
 ## Concurrency
 
-Run **one durable model call at a time within a single workflow**. DBOS derives each step's replay identity from the order steps are reached, but the AI SDK issues concurrent model calls in a nondeterministic order — so on recovery a checkpoint could be bound to the wrong call, silently returning one call's result for another. To prevent this, the middleware throws if it detects a second durable model call starting while one is already in flight in the same workflow.
-
+Run **one durable model call at a time within a single workflow**.
+DBOS requires workflows to be deterministic, but the AI SDK issues concurrent model calls in nondeterministic order.
+To guard against nondeterminism, this integration throws an error if it detects concurrent durable model calls in the same workflow.
 Sequential calls (including a normal tool-calling loop, where each model call completes before the next begins) are unaffected.
 
-To fan out model calls in parallel, give each its own **child workflow**, which gets an independent, deterministic step-ID space:
+To fan out model calls in parallel, give each its own **child workflow**:
 
 ```ts
 const summarizeOne = DBOS.registerWorkflow(
@@ -169,7 +172,7 @@ const summarizeAll = DBOS.registerWorkflow(async (docs: string[]) => {
 
 ## Embeddings
 
-`durableEmbeddingCalls` does the same for embedding models:
+`durableEmbeddingCalls` enables durable calls to embedding models:
 
 ```ts
 import { embedMany, wrapEmbeddingModel } from 'ai';
@@ -187,7 +190,7 @@ Pass `maxParallelCalls: 1` when embedding more values than the model's per-call 
 
 ## Images
 
-`durableImageCalls` makes image generation durable. Generated image bytes are base64-encoded before checkpointing (the `.uint8Array`/`.base64` accessors on the result work either way):
+`durableImageCalls` makes image generation durable:
 
 ```ts
 import { generateImage, wrapImageModel } from 'ai';
