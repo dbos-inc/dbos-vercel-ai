@@ -83,8 +83,9 @@ You can stream model responses in a workflow with `streamText`.
 When streaming model output in a workflow, only the final output is checkpointed, not individual deltas.
 As a consequence:
 
-- You can safely forward streamed deltas to a UI or print them to a terminal, but you should not perform durable actions on them. Instead, wait until the stream is complete before calling tools or otherwise progressing your workflow.
-- Do not break out of a stream before it is complete. Instead, either explicitly abort the stream or wait for it to complete before progressing your workflow.
+- You can safely forward streamed deltas to a UI or print them to a terminal, but you should not perform durable actions on them. Run your own durable steps on the complete result, after the stream ends. Tool calls the AI SDK makes during the stream are already safe: they run only after the model call is checkpointed.
+- Do not break out of a stream before it is complete. To stop early, either drain the stream (`await result.consumeStream()`) or abort it.
+- To abort, pass an `abortSignal` to `streamText` and fire it. The output streamed so far is checkpointed as the call's durable result. After an abort, use the deltas you collected.
 
 ```ts
 const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
