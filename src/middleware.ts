@@ -72,12 +72,15 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       }
     },
 
-    wrapStream: async ({ doStream, model }) => {
+    wrapStream: async ({ doStream, params, model }) => {
       assertNotInTransaction('stream');
       if (!isInWorkflowFunction()) {
         return await doStream();
       }
       const workflowID = enterDurableModelCall('stream');
+      // An aborted consumer is done with this call, like a cancelled one: the AI SDK ends the stream gracefully on
+      // abort, so a post-abort failure must checkpoint as a (partial) success or replay would fail where the live run didn't.
+      const aborted = () => params.abortSignal?.aborted === true;
 
       let executed = false;
       let cancelled = false;
@@ -124,8 +127,8 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
                 const { done, value: part } = await reader.read();
                 if (done) break;
                 if (part.type === 'error') {
-                  // A cancelled consumer abandoned this call; don't let a post-cancel failure become the step outcome, or replay would fail where the live run succeeded.
-                  if (cancelled) break;
+                  // A cancelled or aborted consumer abandoned this call; don't let a late failure become the step outcome, or replay would fail where the live run succeeded.
+                  if (cancelled || aborted()) break;
                   throw toStepError(part.error);
                 }
                 // Stream deltas live, but withhold 'finish' until the checkpoint is durable: the AI SDK runs tool calls
@@ -135,12 +138,12 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
                 accumulator.add(part);
               }
               // No terminal part and no output: fail (retryably) like the AI SDK's NoOutputGeneratedError, instead of checkpointing a permanent empty success.
-              if (!sawFinish && !accumulator.hasContent && !cancelled) {
+              if (!sawFinish && !accumulator.hasContent && !cancelled && !aborted()) {
                 throw new Error('Model stream ended without a finish part or any output.');
               }
             } catch (error) {
-              // Same rule for stream-level failures (doStream or a read rejecting) after a cancel.
-              if (!cancelled) throw error;
+              // Same rule for stream-level failures (doStream or a read rejecting) after a cancel or abort.
+              if (!cancelled && !aborted()) throw error;
             } finally {
               // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
               void reader?.cancel().catch(() => {});

@@ -105,7 +105,7 @@ export class MockLanguageModel implements LanguageModelV4 {
   // Counts model-stream cancellations (the middleware tearing down the provider connection).
   streamCancellations = 0;
 
-  async doStream(_options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
+  async doStream(options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
     this.streamCalls++;
     const callError = this.streamCallErrors.shift();
     if (callError) {
@@ -122,6 +122,11 @@ export class MockLanguageModel implements LanguageModelV4 {
         async start(controller) {
           try {
             for (const part of parts) {
+              if (options.abortSignal?.aborted) {
+                // Real providers reject reads once the call's abortSignal fires.
+                controller.error(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+                return;
+              }
               if (part instanceof Error) {
                 // Stream-level failure: reads reject, unlike an 'error' part.
                 controller.error(part);

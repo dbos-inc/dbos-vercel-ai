@@ -660,6 +660,24 @@ const streamingToolWorkflow = DBOS.registerWorkflow(
   { name: 'streamingToolWorkflow' },
 );
 
+// Aborting mid-stream must checkpoint the partial output as a success, so recovery replays the graceful abort.
+const abortStreamMock = new MockLanguageModel();
+const abortStreamModel = wrapLanguageModel({ model: abortStreamMock, middleware: durableCalls() });
+const abortStreamWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const abortController = new AbortController();
+    const result = streamText({ model: abortStreamModel, prompt: 'hi', abortSignal: abortController.signal, maxRetries: 0 });
+    const deltas: string[] = [];
+    for await (const delta of result.textStream) {
+      deltas.push(delta);
+      if (deltas.length === 2) abortController.abort();
+    }
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return deltas;
+  },
+  { name: 'abortStreamWorkflow' },
+);
+
 // A throwing isRetryable accessor must not replace the step's real error or disable retries.
 const evilRetryMock = new MockLanguageModel();
 const evilRetryModel = wrapLanguageModel({
@@ -1375,6 +1393,31 @@ test('a streaming MCP tool execute checkpoints its final value, not an empty obj
   // The follow-up model call saw the final value, not {}.
   const followUp = streamingToolMock.generateOptions.at(-1)!;
   assert.ok(JSON.stringify(followUp.prompt).includes('lift off'));
+});
+
+test('aborting mid-stream checkpoints the partial output as a success and replays gracefully', async () => {
+  abortStreamMock.streamPartLists.push(textStreamParts(['a', 'b', 'c', 'd', 'e']));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(abortStreamWorkflow, { workflowID })();
+  // The AI SDK ends an aborted stream gracefully, so the live workflow completes.
+  const original = await handle.getResult();
+  assert.ok(original.length >= 2, `expected partial deltas, got ${original.length}`);
+  assert.equal(abortStreamMock.streamCalls, 1); // an abort is never retried
+
+  // The step must record the partial output as a success, not the post-abort AbortError.
+  const { step, output } = await recordedStreamStep(workflowID);
+  assert.equal(step.error, null);
+  const recordedText = output.content[0]!.text!;
+  assert.ok(recordedText.length >= 2 && recordedText.length < 5, `expected a partial checkpoint, got "${recordedText}"`);
+  assert.ok('abcde'.startsWith(recordedText));
+
+  // Fork past the stream step: before the fix the checkpoint was an AbortError, and replay threw where
+  // the live run completed (the replayed execution's abortSignal is not aborted, so ai treats it as a hard error).
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof abortStreamWorkflow>>(workflowID, 1);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof abortStreamWorkflow>>;
+  // Replay delivers the checkpointed partial content as one delta per block; no abort fires.
+  assert.equal(replayed.join(''), recordedText);
+  assert.equal(abortStreamMock.streamCalls, 1);
 });
 
 test('a throwing isRetryable accessor does not replace the step error or disable retries', async () => {
