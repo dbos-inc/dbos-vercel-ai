@@ -81,6 +81,18 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       // An aborted consumer is done with this call, like a cancelled one: post-abort failures must checkpoint as a (partial) success, or replay would fail where the live run ended gracefully.
       const aborted = () => params.abortSignal?.aborted === true;
 
+      // Free the concurrency guard as soon as the consumer detaches (abort/cancel), not only when the step
+      // settles: this call's step is already sequenced, so a sequential follow-up in the same workflow is
+      // deterministic on replay and must not be rejected as concurrent while this step drains in the background.
+      let guardReleased = false;
+      const releaseGuard = () => {
+        if (guardReleased) return;
+        guardReleased = true;
+        params.abortSignal?.removeEventListener('abort', releaseGuard);
+        exitDurableModelCall(workflowID);
+      };
+      params.abortSignal?.addEventListener('abort', releaseGuard, { once: true });
+
       let executed = false;
       let cancelled = false;
       let emittedLive = false;
@@ -93,6 +105,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         // Await the step so an early cancel still blocks until the model result is checkpointed.
         async cancel() {
           cancelled = true;
+          releaseGuard();
           // Post-cancel failures normally checkpoint as a success; anything else (e.g. a failed checkpoint write) is only visible here.
           await step.catch((error: unknown) =>
             DBOS.logger.warn(`Durable model call step failed after consumer cancel: ${String(error)}`),
@@ -161,7 +174,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         );
       } catch (error) {
         // runStep can throw synchronously (e.g. a shutdown race); don't leak the guard entry.
-        exitDurableModelCall(workflowID);
+        releaseGuard();
         throw error;
       }
 
@@ -188,7 +201,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             if (!cancelled) controller.error(error);
           },
         )
-        .finally(() => exitDurableModelCall(workflowID));
+        .finally(releaseGuard);
 
       return { stream };
     },

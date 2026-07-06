@@ -29,6 +29,7 @@ import {
   MockEmbeddingModel,
   MockImageModel,
   MockLanguageModel,
+  MockLateAbortStreamModel,
   MockMCPClient,
   RichMockMCPClient,
   textResponse,
@@ -676,6 +677,29 @@ const abortStreamWorkflow = DBOS.registerWorkflow(
     return deltas;
   },
   { name: 'abortStreamWorkflow' },
+);
+
+// A follow-up durable call after aborting a stream must not be rejected as concurrent: the stream step is
+// already sequenced (its funcID is assigned), so the follow-up is deterministic on replay even while the
+// aborted stream step drains and checkpoints in the background.
+const guardRaceMock = new MockLateAbortStreamModel();
+const guardRaceModel = wrapLanguageModel({ model: guardRaceMock, middleware: durableCalls() });
+const guardRaceWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    const result = streamText({ model: guardRaceModel, prompt: 'hi', abortSignal: controller.signal, maxRetries: 0 });
+    try {
+      for await (const _delta of result.textStream) {
+        controller.abort(); // stop after the first delta
+      }
+    } catch {
+      /* aborted */
+    }
+    // Fires while the aborted stream step is still checkpointing; before the fix this tripped the in-flight guard.
+    const follow = await generateText({ model: guardRaceModel, prompt: 'summarize', maxRetries: 0 });
+    return follow.text;
+  },
+  { name: 'guardRaceWorkflow' },
 );
 
 // A timed-out (abandoned) stream attempt must stop reading/emitting so it can't interleave with its retry.
@@ -1597,6 +1621,14 @@ test('aborting mid-stream checkpoints the partial output as a success and replay
   // Replay delivers the checkpointed partial content as one delta per block; no abort fires.
   assert.equal(replayed.join(''), recordedText);
   assert.equal(abortStreamMock.streamCalls, 1);
+});
+
+test('a durable call after aborting a stream is not rejected as concurrent', async () => {
+  guardRaceMock.generateResults.push(textResponse('summary'));
+  const handle = await DBOS.startWorkflow(guardRaceWorkflow, { workflowID: randomUUID() })();
+  // Before the fix the guard stayed held until the aborted stream step settled, so this follow-up threw
+  // "Concurrent durable model calls ..." and the workflow rejected.
+  assert.equal(await handle.getResult(), 'summary');
 });
 
 test('an MCP tool aborted with a DOMException reason checkpoints the real error, not a TypeError', async () => {

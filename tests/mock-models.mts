@@ -158,6 +158,51 @@ export class MockLanguageModel implements LanguageModelV4 {
   }
 }
 
+// Streams deltas, then—once the consumer aborts—emits one more buffered part before tearing down after a
+// short latency. That late part unblocks streamText early, so the consumer detaches while the durable stream
+// step is still checkpointing: the setup for the sequential-follow-up race against the concurrency guard.
+export class MockLateAbortStreamModel implements LanguageModelV4 {
+  readonly specificationVersion = 'v4';
+  readonly provider = 'mock';
+  readonly modelId = 'mock-model';
+  readonly supportedUrls: Record<string, RegExp[]> = {};
+  generateResults: LanguageModelV4GenerateResult[] = [];
+  teardownMs = 20;
+
+  async doGenerate(): Promise<LanguageModelV4GenerateResult> {
+    const result = this.generateResults.shift();
+    if (result === undefined) throw new Error('MockLateAbortStreamModel: no generate responses left');
+    return result;
+  }
+
+  async doStream(options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
+    const teardownMs = this.teardownMs;
+    const stream = new ReadableStream<LanguageModelV4StreamPart>({
+      async start(controller) {
+        const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+        try {
+          controller.enqueue({ type: 'stream-start', warnings: [] });
+          controller.enqueue({ type: 'text-start', id: 't1' });
+          for (let i = 0; i < 100; i++) {
+            if (options.abortSignal?.aborted) {
+              controller.enqueue({ type: 'text-delta', id: 't1', delta: 'late' });
+              await sleep(teardownMs);
+              controller.error(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+              return;
+            }
+            controller.enqueue({ type: 'text-delta', id: 't1', delta: `d${i}` });
+            await sleep(2);
+          }
+          controller.close();
+        } catch {
+          // Torn down mid-emission.
+        }
+      },
+    });
+    return { stream };
+  }
+}
+
 export class MockEmbeddingModel implements EmbeddingModelV4 {
   readonly specificationVersion = 'v4';
   readonly provider = 'mock';
