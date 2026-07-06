@@ -79,7 +79,12 @@ Because DBOS owns retries by default, pass `maxRetries: 0` to the AI SDK call so
 
 ## Streaming
 
-`streamText` works inside workflows. On first execution, stream parts are passed through to your code live as the model produces them, and the assembled result is checkpointed when the stream completes. The terminal `finish` part is held back until that checkpoint is durable, so any tool calls the model requests (which the AI SDK runs on `finish`) and the durable steps they perform never checkpoint ahead of the model call itself. On recovery, the checkpointed result is replayed as a short synthetic stream (one delta per text block), so your workflow code runs identically either way.
+You can stream model responses in a workflow with `streamText`.
+When streaming in a workflow, only the final model output is checkpointed, not individual deltas.
+As a consequence:
+
+- While you can safely forward streamed deltas to a UI or print them to a terminal, you should not perform durable actions on them. Instead, wait until the stream is complete before calling tools or taking further actions.
+- Do not break out of a stream before it is complete. Instead, either explicitly abort the stream or wait for it to complete before progressing your workflow.
 
 ```ts
 const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
@@ -90,10 +95,6 @@ const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
   return await result.text;
 }, { name: 'streamingAgent' });
 ```
-
-**Retries and streaming.** Streaming stays live even with retries on. A failure that occurs before any part has streamed (e.g. a connection error when the request opens — the common transient case) is retried transparently. Once parts have streamed to your code, a later failure is *not* retried, because re-running the call would duplicate the output already delivered; it surfaces as a stream error instead, exactly as an un-wrapped `streamText` would.
-
-To stream tokens to another process (e.g. the workflow runs on a queue worker and an HTTP handler streams to a browser), write parts to a [DBOS workflow stream](https://docs.dbos.dev/typescript/tutorials/workflow-tutorial#workflow-streaming) from your own consumer loop and read them elsewhere with `DBOS.readStream`.
 
 ## Tools
 
