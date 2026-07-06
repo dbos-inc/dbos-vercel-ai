@@ -80,7 +80,7 @@ Because DBOS owns retries by default, pass `maxRetries: 0` to the AI SDK call so
 ## Streaming
 
 You can stream model responses in a workflow with `streamText`.
-When streaming in a workflow, only the final model output is checkpointed, not individual deltas.
+When streaming model output in a workflow, only the final output is checkpointed, not individual deltas.
 As a consequence:
 
 - While you can safely forward streamed deltas to a UI or print them to a terminal, you should not perform durable actions on them. Instead, wait until the stream is complete before calling tools or taking further actions.
