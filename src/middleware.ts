@@ -94,7 +94,10 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         // Await the step so an early cancel still blocks until the model result is checkpointed.
         async cancel() {
           cancelled = true;
-          await step.catch(() => {});
+          // Post-cancel failures normally checkpoint as a success; anything else (e.g. a failed checkpoint write) is only visible here.
+          await step.catch((error: unknown) =>
+            DBOS.logger.warn(`Durable model call step failed after consumer cancel: ${String(error)}`),
+          );
         },
       });
       const emit = (part: LanguageModelV4StreamPart) => {
@@ -117,14 +120,19 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
           async () => {
             executed = true;
             const accumulator = new StreamAccumulator();
+            // A timed-out attempt is abandoned by DBOS (its outcome is discarded) but keeps running; stop it so it can't emit alongside a retry.
+            const timeoutSignal = DBOS.stepStatus?.timeoutSignal;
             let streamResult: Awaited<ReturnType<typeof doStream>> | undefined;
             let reader: ReadableStreamDefaultReader<LanguageModelV4StreamPart> | undefined;
             let sawFinish = false;
+            const abandon = () => void reader?.cancel().catch(() => {});
+            timeoutSignal?.addEventListener('abort', abandon, { once: true });
             try {
               streamResult = await doStream();
               reader = streamResult.stream.getReader();
               for (;;) {
                 const { done, value: part } = await reader.read();
+                if (timeoutSignal?.aborted) throw (timeoutSignal.reason ?? new Error('step attempt timed out'));
                 if (done) break;
                 if (part.type === 'error') {
                   // A cancelled or aborted consumer abandoned this call; don't let a late failure become the step outcome, or replay would fail where the live run succeeded.
@@ -145,6 +153,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
               // Same rule for stream-level failures (doStream or a read rejecting) after a cancel or abort.
               if (!cancelled && !aborted()) throw error;
             } finally {
+              timeoutSignal?.removeEventListener('abort', abandon);
               // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
               void reader?.cancel().catch(() => {});
             }

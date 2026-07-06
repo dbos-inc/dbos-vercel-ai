@@ -80,9 +80,10 @@ export class MockLanguageModel implements LanguageModelV4 {
   readonly supportedUrls: Record<string, RegExp[]> = {};
 
   // Queue an Error to fail that doGenerate call; queue an 'error' stream part to fail that doStream partway,
-  // or an Error in a part list to fail the stream itself (read() rejects) at that point.
+  // an Error in a part list to fail the stream itself (read() rejects) at that point, or a function to gate
+  // the stream (emission pauses until the returned promise resolves).
   generateResults: (LanguageModelV4GenerateResult | Error)[] = [];
-  streamPartLists: (LanguageModelV4StreamPart | Error)[][] = [];
+  streamPartLists: (LanguageModelV4StreamPart | Error | (() => Promise<void>))[][] = [];
   generateCalls = 0;
   streamCalls = 0;
   generateOptions: LanguageModelV4CallOptions[] = [];
@@ -126,6 +127,10 @@ export class MockLanguageModel implements LanguageModelV4 {
                 // Real providers reject reads once the call's abortSignal fires.
                 controller.error(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
                 return;
+              }
+              if (typeof part === 'function') {
+                await part();
+                continue;
               }
               if (part instanceof Error) {
                 // Stream-level failure: reads reject, unlike an 'error' part.

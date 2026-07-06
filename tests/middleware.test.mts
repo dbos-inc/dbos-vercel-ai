@@ -678,6 +678,24 @@ const abortStreamWorkflow = DBOS.registerWorkflow(
   { name: 'abortStreamWorkflow' },
 );
 
+// A timed-out (abandoned) stream attempt must stop reading/emitting so it can't interleave with its retry.
+const timeoutStreamMock = new MockLanguageModel();
+const timeoutStreamModel = wrapLanguageModel({
+  model: timeoutStreamMock,
+  middleware: durableCalls({ timeoutMS: 100, maxAttempts: 2, intervalSeconds: 0 }),
+});
+const timeoutLiveDeltas: string[] = [];
+const timeoutStreamWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = streamText({ model: timeoutStreamModel, prompt: 'hi', maxRetries: 0 });
+    for await (const delta of result.textStream) {
+      timeoutLiveDeltas.push(delta);
+    }
+    return { text: await result.text };
+  },
+  { name: 'timeoutStreamWorkflow' },
+);
+
 // A throwing isRetryable accessor must not replace the step's real error or disable retries.
 const evilRetryMock = new MockLanguageModel();
 const evilRetryModel = wrapLanguageModel({
@@ -1393,6 +1411,51 @@ test('a streaming MCP tool execute checkpoints its final value, not an empty obj
   // The follow-up model call saw the final value, not {}.
   const followUp = streamingToolMock.generateOptions.at(-1)!;
   assert.ok(JSON.stringify(followUp.prompt).includes('lift off'));
+});
+
+test('a timed-out (abandoned) stream attempt stops emitting and cannot interleave with its retry', async () => {
+  let releaseStalled!: () => void;
+  const stalled = new Promise<void>((resolve) => (releaseStalled = resolve));
+  let releaseRetry!: () => void;
+  const retryGate = new Promise<void>((resolve) => (releaseRetry = resolve));
+
+  // Attempt 1 stalls before emitting anything (its timeout fires and DBOS abandons it, then retries);
+  // its stream later wakes up while attempt 2 is still mid-stream and the consumer is listening.
+  timeoutStreamMock.streamPartLists.push(
+    [
+      () => stalled,
+      { type: 'stream-start', warnings: [] },
+      { type: 'text-start', id: 'x1' },
+      { type: 'text-delta', id: 'x1', delta: 'DUP' },
+      { type: 'text-end', id: 'x1' },
+      { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+    ],
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', delta: 'Good' },
+      () => retryGate,
+      { type: 'text-delta', id: 't1', delta: ' answer' },
+      { type: 'text-end', id: 't1' },
+      { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+    ],
+  );
+
+  const handle = await DBOS.startWorkflow(timeoutStreamWorkflow, { workflowID: randomUUID() })();
+  // Wait until the retry is mid-stream, then wake the abandoned attempt while the stream is still open.
+  for (let i = 0; i < 500 && !timeoutLiveDeltas.includes('Good'); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(timeoutLiveDeltas.includes('Good'), 'retry attempt never streamed');
+  releaseStalled();
+  await new Promise((resolve) => setTimeout(resolve, 50)); // give the abandoned stream time to (incorrectly) emit
+  releaseRetry();
+
+  const result = await handle.getResult();
+  // The abandoned attempt contributes nothing; only the retry reaches the consumer and the checkpoint.
+  assert.deepEqual(timeoutLiveDeltas, ['Good', ' answer']);
+  assert.equal(result.text, 'Good answer');
+  assert.equal(timeoutStreamMock.streamCalls, 2);
 });
 
 test('aborting mid-stream checkpoints the partial output as a success and replays gracefully', async () => {
