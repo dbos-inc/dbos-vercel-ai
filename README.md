@@ -83,7 +83,7 @@ You can stream model responses in a workflow with `streamText`.
 When streaming model output in a workflow, only the final output is checkpointed, not individual deltas.
 As a consequence:
 
-- While you can safely forward streamed deltas to a UI or print them to a terminal, you should not perform durable actions on them. Instead, wait until the stream is complete before calling tools or taking further actions.
+- You can safely forward streamed deltas to a UI or print them to a terminal, but you should not perform durable actions on them. Instead, wait until the stream is complete before calling tools or otherwise progressing your workflow.
 - Do not break out of a stream before it is complete. Instead, either explicitly abort the stream or wait for it to complete before progressing your workflow.
 
 ```ts
