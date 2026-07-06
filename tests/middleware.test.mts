@@ -532,6 +532,145 @@ const asyncSchemaWorkflow = DBOS.registerWorkflow(
   { name: 'asyncSchemaWorkflow' },
 );
 
+// A structured (non-Error) error-part payload must keep its JSON message and isRetryable classification.
+const structuredErrorMock = new MockLanguageModel();
+const structuredErrorModel = wrapLanguageModel({
+  model: structuredErrorMock,
+  middleware: durableCalls({ maxAttempts: 3, intervalSeconds: 0 }),
+});
+const structuredErrorWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const streamResult = await structuredErrorModel.doStream({ prompt: userPrompt });
+    const reader = streamResult.stream.getReader();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    return 'unreachable';
+  },
+  { name: 'structuredErrorWorkflow' },
+);
+
+// A stream ending with no finish part and no output must fail the attempt (retryably), not checkpoint an empty success.
+const emptyStreamMock = new MockLanguageModel();
+const emptyStreamModel = wrapLanguageModel({
+  model: emptyStreamMock,
+  middleware: durableCalls({ maxAttempts: 3, intervalSeconds: 0 }),
+});
+const emptyStreamWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = streamText({ model: emptyStreamModel, prompt, maxRetries: 0 });
+    const deltas: string[] = [];
+    for await (const delta of result.textStream) {
+      deltas.push(delta);
+    }
+    return { deltas, text: await result.text };
+  },
+  { name: 'emptyStreamWorkflow' },
+);
+
+// Collects raw stream parts so replay-grammar tests can inspect exactly what the middleware emits.
+const replayPartsMock = new MockLanguageModel();
+const replayPartsModel = wrapLanguageModel({ model: replayPartsMock, middleware: durableCalls() });
+type CollectedPart = { type: string; id?: string; toolName?: string; delta?: string; providerMetadata?: unknown };
+const replayPartsWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const streamResult = await replayPartsModel.doStream({ prompt: userPrompt });
+    const reader = streamResult.stream.getReader();
+    const parts: CollectedPart[] = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const part = value as CollectedPart;
+      parts.push({
+        type: part.type,
+        id: part.id,
+        toolName: part.toolName,
+        delta: part.delta,
+        providerMetadata: part.providerMetadata,
+      });
+    }
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return parts;
+  },
+  { name: 'replayPartsWorkflow' },
+);
+
+// Split response-metadata parts must merge per-field (like the AI SDK), not clobber earlier fields.
+const metadataMock = new MockLanguageModel();
+const metadataModel = wrapLanguageModel({ model: metadataMock, middleware: durableCalls() });
+const metadataWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = streamText({ model: metadataModel, prompt: 'hi', maxRetries: 0 });
+    const text = await result.text;
+    const response = await result.response;
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { id: response.id, modelId: response.modelId, text };
+  },
+  { name: 'metadataWorkflow' },
+);
+
+// maxImagesPerCall 2 keeps n=2 in one call, so a single (spec-violating) mixed string/bytes batch reaches the encoder.
+const mixedImageMock = new MockImageModel(2);
+const mixedImageModel = wrapImageModel({ model: mixedImageMock, middleware: durableImageCalls() });
+const mixedImageWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const { images } = await generateImage({ model: mixedImageModel, prompt: 'mixed', n: 2 });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return images.map((image) => Array.from(image.uint8Array));
+  },
+  { name: 'mixedImageWorkflow' },
+);
+
+// An MCP tool whose execute streams (returns an AsyncIterable): the checkpoint must record the final value.
+const streamingToolClient = {
+  async tools() {
+    return {
+      countdown: {
+        description: 'count down and lift off',
+        inputSchema: {
+          [Symbol.for('vercel.ai.schema')]: true,
+          jsonSchema: { type: 'object', properties: {}, additionalProperties: false },
+          validate: undefined,
+        },
+        execute: async function* () {
+          yield { status: 'counting' };
+          yield 'lift off';
+        },
+      },
+    };
+  },
+  async close() {},
+} as unknown as MCPClientLike;
+
+const streamingToolMock = new MockLanguageModel();
+const streamingToolModel = wrapLanguageModel({ model: streamingToolMock, middleware: durableCalls() });
+const streamingToolWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const tools = await durableMCPTools(streamingToolClient);
+    const result = await generateText({
+      model: streamingToolModel,
+      prompt,
+      tools,
+      stopWhen: stepCountIs(5),
+      maxRetries: 0,
+    });
+    return result.text;
+  },
+  { name: 'streamingToolWorkflow' },
+);
+
+// A throwing isRetryable accessor must not replace the step's real error or disable retries.
+const evilRetryMock = new MockLanguageModel();
+const evilRetryModel = wrapLanguageModel({
+  model: evilRetryMock,
+  middleware: durableCalls({ maxAttempts: 2, intervalSeconds: 0 }),
+});
+const evilRetryWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: evilRetryModel, prompt: 'hi', maxRetries: 0 })).text,
+  { name: 'evilRetryWorkflow' },
+);
+
 before(async () => {
   DBOS.setConfig({ name: 'dbos-vercel-ai-test', systemDatabaseUrl });
   await DBOS.launch();
@@ -805,6 +944,8 @@ test('a mid-stream error fails the model call and is not retried once output has
   await assert.rejects(handle.getResult(), /boom/);
   // Retries are on by default, but parts already streamed live, so re-streaming would duplicate output: no retry.
   assert.equal(failStreamMock.streamCalls, 1);
+  // The abandoned model stream is torn down, not left draining the provider connection.
+  assert.equal(failStreamMock.streamCancellations, 1);
 });
 
 // Reads the checkpointed output of the stream step so cancel tests can assert what was actually recorded.
@@ -1110,6 +1251,151 @@ test('MCP tool with an async JSON schema is awaited before checkpointing (not st
   assert.equal(schema.type, 'object');
   assert.deepEqual(schema.properties, { host: { type: 'string' } });
   assert.deepEqual(schema.required, ['host']);
+});
+
+test('a structured error-part payload keeps its JSON message and non-retryable classification', async () => {
+  structuredErrorMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'error', error: { message: 'quota exceeded', code: 'insufficient_quota', isRetryable: false } },
+  ]);
+  const handle = await DBOS.startWorkflow(structuredErrorWorkflow, { workflowID: randomUUID() })();
+  // Before the fix the payload became Error("[object Object]").
+  await assert.rejects(handle.getResult(), /quota exceeded[\s\S]*insufficient_quota/);
+  // The payload's isRetryable: false is honored: no retry despite maxAttempts 3.
+  assert.equal(structuredErrorMock.streamCalls, 1);
+});
+
+test('a stream ending with no finish and no output is retried, not checkpointed as an empty success', async () => {
+  // Attempt 1 closes cleanly after only stream-start (no finish, no content); attempt 2 succeeds.
+  emptyStreamMock.streamPartLists.push([{ type: 'stream-start', warnings: [] }], textStreamParts(['Recovered']));
+  const handle = await DBOS.startWorkflow(emptyStreamWorkflow, { workflowID: randomUUID() })('hi');
+  const result = await handle.getResult();
+  // Before the fix, attempt 1 checkpointed a permanent empty success (text '') and never retried.
+  assert.equal(result.text, 'Recovered');
+  assert.deepEqual(result.deltas, ['Recovered']);
+  assert.equal(emptyStreamMock.streamCalls, 2);
+});
+
+test('a stream that never produces output fails the step after retries instead of succeeding empty', async () => {
+  const emptyParts = (): Parameters<typeof emptyStreamMock.streamPartLists.push>[0] => [
+    { type: 'stream-start', warnings: [] },
+  ];
+  emptyStreamMock.streamPartLists.push(emptyParts(), emptyParts(), emptyParts());
+  const callsBefore = emptyStreamMock.streamCalls;
+  const handle = await DBOS.startWorkflow(emptyStreamWorkflow, { workflowID: randomUUID() })('hi');
+  await assert.rejects(handle.getResult(), /without a finish part/);
+  assert.equal(emptyStreamMock.streamCalls, callsBefore + 3); // retried to maxAttempts
+});
+
+test('replay re-synthesizes tool-input parts and start-part metadata from the checkpoint', async () => {
+  replayPartsMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1', providerMetadata: { mock: { redacted: true } } },
+    { type: 'text-delta', id: 't1', delta: 'Calling a tool.' },
+    { type: 'text-end', id: 't1' },
+    { type: 'tool-input-start', id: 'call-9', toolName: 'getWeather' },
+    { type: 'tool-input-delta', id: 'call-9', delta: '{"city":"Nice"}' },
+    { type: 'tool-input-end', id: 'call-9' },
+    { type: 'tool-call', toolCallId: 'call-9', toolName: 'getWeather', input: '{"city":"Nice"}' },
+    { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(replayPartsWorkflow, { workflowID })();
+  await handle.getResult();
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof replayPartsWorkflow>>(workflowID, 1);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof replayPartsWorkflow>>;
+  assert.equal(replayPartsMock.streamCalls, 1);
+
+  // The tool-input grammar is synthesized around the tool-call; ids must match the toolCallId (what consumer callbacks key on).
+  const inputStart = replayed.find((p) => p.type === 'tool-input-start')!;
+  assert.equal(inputStart.id, 'call-9');
+  assert.equal(inputStart.toolName, 'getWeather');
+  const types = replayed.map((p) => p.type);
+  assert.deepEqual(types.slice(types.indexOf('tool-input-start'), types.indexOf('tool-call') + 1), [
+    'tool-input-start',
+    'tool-input-delta',
+    'tool-input-end',
+    'tool-call',
+  ]);
+  assert.equal(replayed.find((p) => p.type === 'tool-input-delta')!.delta, '{"city":"Nice"}');
+  // Start parts carry the checkpointed providerMetadata on replay too.
+  assert.deepEqual(replayed.find((p) => p.type === 'text-start')!.providerMetadata, { mock: { redacted: true } });
+});
+
+test('split response-metadata parts merge per-field in the checkpoint', async () => {
+  metadataMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'response-metadata', id: 'resp-split' },
+    { type: 'response-metadata', modelId: 'mock-model-9' },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'ok' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(metadataWorkflow, { workflowID })();
+  const original = await handle.getResult();
+  assert.equal(original.id, 'resp-split');
+  assert.equal(original.modelId, 'mock-model-9');
+
+  // Before the fix the second part clobbered the first and the replayed response lost its id.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof metadataWorkflow>>(workflowID, 1);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof metadataWorkflow>>;
+  assert.equal(replayed.id, 'resp-split');
+  assert.equal(replayed.modelId, 'mock-model-9');
+});
+
+test('a mixed string/bytes image batch is encoded per element, not corrupted', async () => {
+  // Spec-violating but defensive: images[0] is bytes, images[1] is already base64.
+  mixedImageMock.imageOverrides.push([new Uint8Array([1, 2, 3]), Buffer.from('ABC').toString('base64')]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(mixedImageWorkflow, { workflowID })();
+  const original = await handle.getResult();
+  assert.deepEqual(original[0], [1, 2, 3]);
+  assert.deepEqual(original[1], [65, 66, 67]); // 'ABC' — before the fix this was double-encoded garbage
+  assert.equal(mixedImageMock.generateCalls, 1); // n=2 within maxImagesPerCall → single call
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof mixedImageWorkflow>>(workflowID, 1);
+  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof mixedImageWorkflow>>;
+  assert.deepEqual(replayed, original);
+});
+
+test('a streaming MCP tool execute checkpoints its final value, not an empty object', async () => {
+  streamingToolMock.generateResults.push(toolCallResponse('countdown', '{}'), textResponse('Lift off confirmed.'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(streamingToolWorkflow, { workflowID })('count down');
+  assert.equal(await handle.getResult(), 'Lift off confirmed.');
+
+  // The checkpoint records the last yielded value; before the fix the generator serialized as {}.
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'mcp.tool.countdown')!;
+  assert.equal(toolStep.output, 'lift off');
+
+  // The follow-up model call saw the final value, not {}.
+  const followUp = streamingToolMock.generateOptions.at(-1)!;
+  assert.ok(JSON.stringify(followUp.prompt).includes('lift off'));
+});
+
+test('a throwing isRetryable accessor does not replace the step error or disable retries', async () => {
+  const makeEvil = () => {
+    const error = new Error('real failure');
+    Object.defineProperty(error, 'isRetryable', {
+      get() {
+        throw new Error('getter boom');
+      },
+    });
+    return error;
+  };
+  evilRetryMock.generateResults.push(makeEvil(), makeEvil());
+  const handle = await DBOS.startWorkflow(evilRetryWorkflow, { workflowID: randomUUID() })();
+  await assert.rejects(handle.getResult(), (error: Error) => {
+    // Before the fix the classifier's own error was recorded as the step outcome.
+    assert.ok(!error.message.includes('getter boom'), `classifier error leaked: ${error.message}`);
+    assert.match(error.message, /real failure/);
+    return true;
+  });
+  assert.equal(evilRetryMock.generateCalls, 2); // classified retryable → retried to maxAttempts
 });
 
 // Keep this test last: it shuts down and relaunches DBOS mid-suite.

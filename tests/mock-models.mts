@@ -102,6 +102,8 @@ export class MockLanguageModel implements LanguageModelV4 {
 
   // Queue an Error here to make doStream itself reject (after a tick) instead of returning a stream.
   streamCallErrors: Error[] = [];
+  // Counts model-stream cancellations (the middleware tearing down the provider connection).
+  streamCancellations = 0;
 
   async doStream(_options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
     this.streamCalls++;
@@ -118,17 +120,24 @@ export class MockLanguageModel implements LanguageModelV4 {
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
         async start(controller) {
-          for (const part of parts) {
-            if (part instanceof Error) {
-              // Stream-level failure: reads reject, unlike an 'error' part.
-              controller.error(part);
-              return;
+          try {
+            for (const part of parts) {
+              if (part instanceof Error) {
+                // Stream-level failure: reads reject, unlike an 'error' part.
+                controller.error(part);
+                return;
+              }
+              controller.enqueue(part);
+              // Yield to the event loop so parts arrive asynchronously, as from a network.
+              await new Promise((resolve) => setImmediate(resolve));
             }
-            controller.enqueue(part);
-            // Yield to the event loop so parts arrive asynchronously, as from a network.
-            await new Promise((resolve) => setImmediate(resolve));
+            controller.close();
+          } catch {
+            // Cancelled mid-emission: enqueue/close throw once the stream is torn down.
           }
-          controller.close();
+        },
+        cancel: () => {
+          this.streamCancellations++;
         },
       }),
       request: { body: 'mock-request' },
@@ -167,16 +176,25 @@ export class MockImageModel implements ImageModelV4 {
   readonly specificationVersion = 'v4';
   readonly provider = 'mock';
   readonly modelId = 'mock-image';
-  readonly maxImagesPerCall = 1; // forces generateImage to split n>1 into parallel batches
+  readonly maxImagesPerCall: number;
 
   generateCalls = 0;
+  // Queue an images array to override the default bytes (e.g. a spec-violating mixed string/bytes batch).
+  imageOverrides: (string | Uint8Array)[][] = [];
+
+  // The default of 1 forces generateImage to split n>1 into parallel batches.
+  constructor(maxImagesPerCall = 1) {
+    this.maxImagesPerCall = maxImagesPerCall;
+  }
 
   async doGenerate(options: ImageModelV4CallOptions): Promise<ImageModelV4Result> {
     this.generateCalls++;
     // Tag each generated image with this call's ordinal so a reordering on replay is detectable.
-    const images = Array.from({ length: options.n }, () => new Uint8Array([...IMAGE_BYTES, this.generateCalls]));
+    const images =
+      this.imageOverrides.shift() ??
+      Array.from({ length: options.n }, () => new Uint8Array([...IMAGE_BYTES, this.generateCalls]));
     return {
-      images,
+      images: images as ImageModelV4Result['images'],
       warnings: [],
       response: { timestamp: new Date('2026-07-02T12:00:00Z'), modelId: 'mock-image', headers: {} },
     };
