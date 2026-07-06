@@ -1539,8 +1539,7 @@ test('a timed-out (abandoned) stream attempt stops emitting and cannot interleav
   let releaseRetry!: () => void;
   const retryGate = new Promise<void>((resolve) => (releaseRetry = resolve));
 
-  // Attempt 1 stalls before emitting anything (its timeout fires and DBOS abandons it, then retries);
-  // its stream later wakes up while attempt 2 is still mid-stream and the consumer is listening.
+  // Attempt 1 stalls pre-emission (timeout fires, DBOS abandons it and retries); its stream later wakes up while attempt 2 is mid-stream and the consumer is listening.
   timeoutStreamMock.streamPartLists.push(
     [
       () => stalled,
@@ -1594,8 +1593,7 @@ test('aborting mid-stream checkpoints the partial output as a success and replay
   assert.ok(recordedText.length >= 2 && recordedText.length < 5, `expected a partial checkpoint, got "${recordedText}"`);
   assert.ok('abcde'.startsWith(recordedText));
 
-  // Fork past the stream step: before the fix the checkpoint was an AbortError, and replay threw where
-  // the live run completed (the replayed execution's abortSignal is not aborted, so ai treats it as a hard error).
+  // Fork past the stream step: before the fix the checkpoint was an AbortError and replay threw where the live run completed (the replayed execution's signal isn't aborted, so ai treats it as a hard error).
   const forked = await DBOS.forkWorkflow<ReturnType<typeof abortStreamWorkflow>>(workflowID, 1);
   const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof abortStreamWorkflow>>;
   // Replay delivers the checkpointed partial content as one delta per block; no abort fires.
@@ -1682,8 +1680,7 @@ test('later recoveries past a checkpointed abort refusal are not wrongly refused
   );
   assert.equal(await forked1.getResult(), 'recovered fork1');
 
-  // Recovery #2 replays BOTH the marked tool step and the checkpointed refusal; the catch path's live model
-  // call past the old frontier has a marker-free prompt and must run, not be refused.
+  // Recovery #2 replays both the marked tool step and the checkpointed refusal; the catch path's live model call past the old frontier has a marker-free prompt and must run, not be refused.
   const fork1Steps = await DBOS.listWorkflowSteps(forked1.workflowID);
   const fork1Models = fork1Steps!.filter((s) => s.name === 'mock.mock-model.generate');
   abortRecoverMock.generateResults.push(textResponse('recovered fork2'));

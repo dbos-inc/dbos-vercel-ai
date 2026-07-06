@@ -51,9 +51,7 @@ function exitDurableModelCall(workflowID: string): void {
   }
 }
 
-// The prompt of an agent loop's continuation call carries the prior turn's tool errors, so a consumer-abort
-// marker there plus a fresh (un-aborted) signal identifies the one call a replayed abort would resurrect.
-// Live runs never make it: the live loop stops at the signal, and a live continuation's signal is still aborted.
+// A consumer-abort marker in the prompt's tool errors plus a fresh signal identifies the one call a replayed abort would resurrect (live runs never make it: their loop stops at the signal, and a live continuation's signal is still aborted).
 function isAbortReplayCall(params: LanguageModelV4CallOptions): boolean {
   if (params.abortSignal?.aborted) return false;
   for (const message of params.prompt) {
@@ -105,8 +103,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         return await doStream();
       }
       const workflowID = enterDurableModelCall('stream');
-      // An aborted consumer is done with this call, like a cancelled one: the AI SDK ends the stream gracefully on
-      // abort, so a post-abort failure must checkpoint as a (partial) success or replay would fail where the live run didn't.
+      // An aborted consumer is done with this call, like a cancelled one: post-abort failures must checkpoint as a (partial) success, or replay would fail where the live run ended gracefully.
       const aborted = () => params.abortSignal?.aborted === true;
 
       let executed = false;
@@ -167,8 +164,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
                   if (cancelled || aborted()) break;
                   throw toStepError(part.error);
                 }
-                // Stream deltas live, but withhold 'finish' until the checkpoint is durable: the AI SDK runs tool calls
-                // (and thus downstream durable steps) on 'finish', which must not checkpoint before this model step.
+                // Stream deltas live but withhold 'finish' until the checkpoint is durable: the AI SDK runs tool calls (and their durable steps) on 'finish', which must not checkpoint before this model step.
                 if (part.type === 'finish') sawFinish = true;
                 else emit(part);
                 accumulator.add(part);

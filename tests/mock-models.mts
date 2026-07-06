@@ -79,9 +79,7 @@ export class MockLanguageModel implements LanguageModelV4 {
   readonly modelId = 'mock-model';
   readonly supportedUrls: Record<string, RegExp[]> = {};
 
-  // Queue an Error to fail that doGenerate call; queue an 'error' stream part to fail that doStream partway,
-  // an Error in a part list to fail the stream itself (read() rejects) at that point, or a function to gate
-  // the stream (emission pauses until the returned promise resolves).
+  // Queue an Error to fail that doGenerate call; in a part list, an 'error' part fails the stream partway, an Error makes reads reject, and a function gates emission until its promise resolves.
   generateResults: (LanguageModelV4GenerateResult | Error)[] = [];
   streamPartLists: (LanguageModelV4StreamPart | Error | (() => Promise<void>))[][] = [];
   generateCalls = 0;

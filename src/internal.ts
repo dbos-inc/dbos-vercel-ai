@@ -44,10 +44,7 @@ export function withErrorClassification(options: StepConfig): StepConfig {
   };
 }
 
-// A live run stops its agent loop when the consumer aborts, but that brake is the live abortSignal — not
-// checkpointable. Mark abort-born tool failures in the error MESSAGE: the AI SDK threads it (as error-text or
-// the error object itself) into the prompt of exactly the continuation call a replay would resurrect, so the
-// next model step can recognize the marker + a fresh signal and refuse — no side-channel state needed.
+// The live abort brake is the un-checkpointable abortSignal, so mark abort-born failures in the error message: the AI SDK threads it into the prompt of exactly the continuation call a replay would resurrect, where the next model step can refuse.
 export const consumerAbortMarker = '[dbos:consumer-abort]';
 
 /** Mark an abort-born failure so its checkpoint (and its prompt rendering) is distinguishable on replay. */
