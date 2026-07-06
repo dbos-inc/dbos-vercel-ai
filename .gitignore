@@ -5,6 +5,7 @@ CLAUDE.md
 tests/temp-dist/
 tests/temp-tests/
 .claude/
+audit.md
 reference/
 scratch/
 
