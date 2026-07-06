@@ -8,7 +8,6 @@ import type {
   ImageModelV4,
   ImageModelV4Result,
   LanguageModelV4,
-  LanguageModelV4CallOptions,
   LanguageModelV4Content,
   LanguageModelV4FinishReason,
   LanguageModelV4GenerateResult,
@@ -20,7 +19,7 @@ import type {
   SharedV4ProviderMetadata,
   SharedV4Warning,
 } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
-import { abortReplayRefusal, assertNotInTransaction, consumerAbortMarker, isInWorkflowFunction, withErrorClassification } from './internal';
+import { assertNotInTransaction, isInWorkflowFunction, withErrorClassification } from './internal';
 
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
@@ -51,47 +50,23 @@ function exitDurableModelCall(workflowID: string): void {
   }
 }
 
-// A consumer-abort marker in the prompt's tool errors plus a fresh signal identifies the one call a replayed abort would resurrect (live runs never make it: their loop stops at the signal, and a live continuation's signal is still aborted).
-function isAbortReplayCall(params: LanguageModelV4CallOptions): boolean {
-  if (params.abortSignal?.aborted) return false;
-  for (const message of params.prompt) {
-    if (message.role !== 'tool') continue;
-    for (const part of message.content) {
-      if (part.type !== 'tool-result') continue;
-      const output = part.output as { type?: string; value?: unknown };
-      const text =
-        output.type === 'error-text'
-          ? output.value
-          : (output.value as { message?: unknown } | null | undefined)?.message;
-      if (typeof text === 'string' && text.includes(consumerAbortMarker)) return true;
-    }
-  }
-  return false;
-}
-
 /** AI SDK language-model middleware that runs each model call as a durable, checkpointed DBOS step (replayed on recovery); outside a workflow it calls the model directly. */
 export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware {
   const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
 
-    wrapGenerate: async ({ doGenerate, params, model }) => {
+    wrapGenerate: async ({ doGenerate, model }) => {
       assertNotInTransaction('generate');
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
       const workflowID = enterDurableModelCall('generate');
       try {
-        return await DBOS.runStep(
-          async () => {
-            if (isAbortReplayCall(params)) throw abortReplayRefusal(workflowID);
-            return encodeBinaryContent(await doGenerate());
-          },
-          {
-            ...stepConfig,
-            name: stepConfig.name ?? stepName(model, 'generate'),
-          },
-        );
+        return await DBOS.runStep(async () => encodeBinaryContent(await doGenerate()), {
+          ...stepConfig,
+          name: stepConfig.name ?? stepName(model, 'generate'),
+        });
       } finally {
         exitDurableModelCall(workflowID);
       }
@@ -143,7 +118,6 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         step = DBOS.runStep(
           async () => {
             executed = true;
-            if (isAbortReplayCall(params)) throw abortReplayRefusal(workflowID);
             const accumulator = new StreamAccumulator();
             // A timed-out attempt is abandoned by DBOS (its outcome is discarded) but keeps running; stop it so it can't emit alongside a retry.
             const timeoutSignal = DBOS.stepStatus?.timeoutSignal;

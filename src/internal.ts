@@ -44,20 +44,3 @@ export function withErrorClassification(options: StepConfig): StepConfig {
   };
 }
 
-// The live abort brake is the un-checkpointable abortSignal, so mark abort-born failures in the error message: the AI SDK threads it into the prompt of exactly the continuation call a replay would resurrect, where the next model step can refuse.
-export const consumerAbortMarker = '[dbos:consumer-abort]';
-
-/** Mark an abort-born failure so its checkpoint (and its prompt rendering) is distinguishable on replay. */
-export function tagConsumerAbort(error: unknown): Error {
-  const result = error instanceof Error ? error : new Error(String(error));
-  if (!result.message.includes(consumerAbortMarker)) result.message += ` ${consumerAbortMarker}`;
-  return result;
-}
-
-/** The refusal a replayed-abort continuation gets instead of a model call the aborted run never made. */
-export function abortReplayRefusal(workflowID: string): Error {
-  return Object.assign(
-    new Error(`Workflow "${workflowID}" is replaying a run that was aborted here; refusing a model call the aborted run never made.`),
-    { name: 'AbortError' },
-  );
-}

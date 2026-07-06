@@ -1,6 +1,6 @@
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
-import { assertNotInTransaction, isInWorkflowFunction, tagConsumerAbort, withErrorClassification } from './internal';
+import { assertNotInTransaction, isInWorkflowFunction, withErrorClassification } from './internal';
 
 // Structural type for an MCP client (e.g. from @ai-sdk/mcp) — deliberately loose: the AI SDK ecosystem
 // exact-pins @ai-sdk/provider-utils, so precise Tool types fail to match across skewed copies.
@@ -69,9 +69,9 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
   const { toolOptions, ...stepOptions } = options;
   const stepConfig = withErrorClassification(stepOptions);
   const { asSchema, dynamicTool, jsonSchema } = await import('ai');
-  const run = <T>(name: string, fn: () => Promise<T>): Promise<T> => {
+  const run = <T>(name: string, fn: () => Promise<T>, config: StepConfig = stepConfig): Promise<T> => {
     assertNotInTransaction(name);
-    return isInWorkflowFunction() ? DBOS.runStep(fn, { ...stepConfig, name }) : fn();
+    return isInWorkflowFunction() ? DBOS.runStep(fn, { ...config, name }) : fn();
   };
 
   // Checkpoint the tool list as plain JSON schemas, so replay reconstructs tools without the live client.
@@ -105,8 +105,15 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
       // Re-fetch the live tool inside the step (its execute closure can't be checkpointed); replay returns the recorded result.
       execute: (input: unknown, execOptions) => {
         const signal = (execOptions as { abortSignal?: AbortSignal } | undefined)?.abortSignal;
-        return run(`mcp.tool.${name}`, async () => {
-          try {
+        // An aborted consumer is done with this call, whatever the failure looks like; a retry would re-run a cancelled side effect.
+        const callConfig: StepConfig = {
+          ...stepConfig,
+          shouldRetry: async (error: unknown) =>
+            !signal?.aborted && (stepConfig.shouldRetry ? await stepConfig.shouldRetry(error) : true),
+        };
+        return run(
+          `mcp.tool.${name}`,
+          async () => {
             const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
             if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
             const output = await tool.execute(input, execOptions);
@@ -117,11 +124,9 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
               return last;
             }
             return output;
-          } catch (error) {
-            // A consumer abort isn't a tool failure; mark its checkpoint so a replay can tell the two apart.
-            throw signal?.aborted ? tagConsumerAbort(error) : error;
-          }
-        });
+          },
+          callConfig,
+        );
       },
     });
     // @ai-sdk/mcp spreads the MCP _meta onto the tool object; preserve it for consumers that read it.
