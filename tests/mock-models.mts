@@ -47,6 +47,11 @@ export function textResponse(text: string): LanguageModelV4GenerateResult {
   return contentResponse([{ type: 'text', text }]);
 }
 
+// No `response` field: the AI SDK fills response.id/timestamp with generateId()/new Date() outside the durable step.
+export function textResponseNoMetadata(text: string): LanguageModelV4GenerateResult {
+  return { content: [{ type: 'text', text }], finishReason: finishReason(), usage: usage(), warnings: [] };
+}
+
 export function toolCallResponse(toolName: string, input: string): LanguageModelV4GenerateResult {
   return contentResponse(
     [{ type: 'tool-call', toolCallId: 'call-1', toolName, input }],
@@ -66,6 +71,17 @@ export function textStreamParts(deltas: string[]): LanguageModelV4StreamPart[] {
   return [
     { type: 'stream-start', warnings: [] },
     { type: 'response-metadata', id: 'resp-1', timestamp: new Date('2026-07-02T12:00:00Z'), modelId: 'mock-model' },
+    { type: 'text-start', id: 't1' },
+    ...deltas.map((delta): LanguageModelV4StreamPart => ({ type: 'text-delta', id: 't1', delta })),
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: finishReason(), usage: usage() },
+  ];
+}
+
+// No response-metadata part: the AI SDK fills response.id/timestamp with generateId()/new Date() outside the step.
+export function textStreamPartsNoMetadata(deltas: string[]): LanguageModelV4StreamPart[] {
+  return [
+    { type: 'stream-start', warnings: [] },
     { type: 'text-start', id: 't1' },
     ...deltas.map((delta): LanguageModelV4StreamPart => ({ type: 'text-delta', id: 't1', delta })),
     { type: 'text-end', id: 't1' },

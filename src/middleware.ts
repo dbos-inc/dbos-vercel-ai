@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 // Public signatures use ai's middleware aliases: ai is the single peer instance, so the types always
 // match the consumer's wrap* calls. @ai-sdk/provider (dev-only) never appears in the published types —
@@ -63,7 +64,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       }
       const workflowID = enterDurableModelCall('generate');
       try {
-        return await DBOS.runStep(async () => encodeBinaryContent(await doGenerate()), {
+        return await DBOS.runStep(async () => ensureResponseMetadata(encodeBinaryContent(await doGenerate())), {
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'generate'),
         });
@@ -174,6 +175,10 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
               // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
               void reader?.cancel().catch(() => {});
             }
+            // Give the response a durable id/timestamp when the provider sent none, and emit it live (before the
+            // withheld 'finish') so the SDK sees the same values live and on replay instead of a fresh fallback.
+            const responseMetadataPart = accumulator.fillResponseMetadata(randomUUID(), new Date());
+            if (responseMetadataPart) emit(responseMetadataPart);
             return encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
           },
           { ...streamStepConfig, name: stepConfig.name ?? stepName(model, 'stream') },
@@ -295,6 +300,19 @@ function toStepError(error: unknown): Error {
   return isRetryable === undefined ? result : Object.assign(result, { isRetryable });
 }
 
+// generateText fills response.id/timestamp with generateId()/new Date() OUTSIDE this step when the provider omits
+// them, so they'd differ on every replay. Populate them here (checkpointed once) so that fallback never runs.
+function ensureResponseMetadata(result: LanguageModelV4GenerateResult): LanguageModelV4GenerateResult {
+  const response = result.response;
+  if (response?.id !== undefined && response?.timestamp !== undefined) {
+    return result;
+  }
+  return {
+    ...result,
+    response: { ...response, id: response?.id ?? randomUUID(), timestamp: response?.timestamp ?? new Date() },
+  };
+}
+
 /** Convert generated-file bytes (Uint8Array) to base64 (spec-allowed) to keep checkpoints compact. */
 function encodeBinaryContent(result: LanguageModelV4GenerateResult): LanguageModelV4GenerateResult {
   const content = result.content.map(encodeBinaryPart);
@@ -401,6 +419,20 @@ class StreamAccumulator {
 
   get hasContent(): boolean {
     return this.content.length > 0;
+  }
+
+  // Fill any missing response id/timestamp so the checkpoint carries them; returns the response-metadata part to
+  // emit live (or undefined if the provider already supplied both). replayParts re-emits it from the checkpoint.
+  fillResponseMetadata(id: string, timestamp: Date): LanguageModelV4StreamPart | undefined {
+    if (this.responseMetadata?.id !== undefined && this.responseMetadata?.timestamp !== undefined) {
+      return undefined;
+    }
+    this.responseMetadata = {
+      id: this.responseMetadata?.id ?? id,
+      timestamp: this.responseMetadata?.timestamp ?? timestamp,
+      modelId: this.responseMetadata?.modelId,
+    };
+    return { type: 'response-metadata', ...this.responseMetadata };
   }
 
   // If a delta arrives with no preceding start, create the block in arrival position rather than dropping the text.

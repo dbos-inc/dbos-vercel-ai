@@ -34,7 +34,9 @@ import {
   MockMCPClient,
   RichMockMCPClient,
   textResponse,
+  textResponseNoMetadata,
   textStreamParts,
+  textStreamPartsNoMetadata,
   toolCallResponse,
   toolCallsResponse,
   usage,
@@ -215,6 +217,32 @@ const identityWorkflow = DBOS.registerWorkflow(
   // No maxRetries: 0 here, so the AI SDK's retry layer is active.
   async () => (await generateText({ model: identityModel, prompt: 'hi' })).text,
   { name: 'identityWorkflow' },
+);
+
+// Providers that omit response metadata: the middleware must give the response a durable id/timestamp so the AI
+// SDK's generateId()/new Date() fallback (which runs outside the step) doesn't produce a fresh value on replay.
+const idGenMock = new MockLanguageModel();
+const idGenModel = wrapLanguageModel({ model: idGenMock, middleware: durableCalls() });
+const idGenWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = await generateText({ model: idGenModel, prompt: 'hi', maxRetries: 0 });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' }); // so forkWorkflow can start after the model step
+    return { id: result.response.id, timestamp: result.response.timestamp.toISOString() };
+  },
+  { name: 'idGenWorkflow' },
+);
+
+const idStreamMock = new MockLanguageModel();
+const idStreamModel = wrapLanguageModel({ model: idStreamMock, middleware: durableCalls() });
+const idStreamWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = streamText({ model: idStreamModel, prompt: 'hi', maxRetries: 0 });
+    await result.consumeStream();
+    const response = await result.response;
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { id: response.id, timestamp: response.timestamp.toISOString() };
+  },
+  { name: 'idStreamWorkflow' },
 );
 
 const fileMock = new MockLanguageModel();
@@ -1733,6 +1761,38 @@ test('a retryable APICallError checkpointed under retriesAllowed:false keeps its
   const forked = await DBOS.forkWorkflow<ReturnType<typeof identityWorkflow>>(workflowID, 1);
   assert.equal(await forked.getResult(), 'recovered');
   assert.equal(identityMock.generateCalls, 3);
+});
+
+test('generateText response id/timestamp stay stable across replay when the provider omits them', async () => {
+  idGenMock.generateResults.push(textResponseNoMetadata('hi there'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(idGenWorkflow, { workflowID })();
+  const live = await handle.getResult();
+  assert.ok(live.id && live.timestamp, 'response id/timestamp were populated');
+  assert.equal(idGenMock.generateCalls, 1);
+
+  // Fork past the model step so it replays from the checkpoint. Before the fix, generateText re-ran
+  // generateId()/new Date() outside the step, so the replay produced a different id and timestamp.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof idGenWorkflow>>(workflowID, 1);
+  const replayed = await forked.getResult();
+  assert.equal(replayed.id, live.id);
+  assert.equal(replayed.timestamp, live.timestamp);
+  assert.equal(idGenMock.generateCalls, 1); // model not re-called on replay
+});
+
+test('streamText response id/timestamp stay stable across replay when the provider omits them', async () => {
+  idStreamMock.streamPartLists.push(textStreamPartsNoMetadata(['hi', ' there']));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(idStreamWorkflow, { workflowID })();
+  const live = await handle.getResult();
+  assert.ok(live.id && live.timestamp, 'response id/timestamp were populated');
+  assert.equal(idStreamMock.streamCalls, 1);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof idStreamWorkflow>>(workflowID, 1);
+  const replayed = await forked.getResult();
+  assert.equal(replayed.id, live.id);
+  assert.equal(replayed.timestamp, live.timestamp);
+  assert.equal(idStreamMock.streamCalls, 1); // model not re-called on replay
 });
 
 // Keep this test last: it shuts down and relaunches DBOS mid-suite.
