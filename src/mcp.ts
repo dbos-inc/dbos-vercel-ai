@@ -1,6 +1,6 @@
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
-import { assertNotInTransaction, isInWorkflowFunction, withErrorClassification } from './internal';
+import { assertNotInTransaction, isInWorkflowFunction, restoreAISDKErrorIdentity, withErrorClassification } from './internal';
 
 // Structural type for an MCP client (e.g. from @ai-sdk/mcp) — deliberately loose: the AI SDK ecosystem
 // exact-pins @ai-sdk/provider-utils, so precise Tool types fail to match across skewed copies.
@@ -71,7 +71,11 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
   const { asSchema, dynamicTool, jsonSchema } = await import('ai');
   const run = <T>(name: string, fn: () => Promise<T>, config: StepConfig = stepConfig): Promise<T> => {
     assertNotInTransaction(name);
-    return isInWorkflowFunction() ? DBOS.runStep(fn, { ...config, name }) : fn();
+    if (!isInWorkflowFunction()) return fn();
+    // Restore the AI SDK error identity a replay revival strips, so the SDK's retry/catch logic behaves the same.
+    return DBOS.runStep(fn, { ...config, name }).catch((error: unknown) => {
+      throw restoreAISDKErrorIdentity(error);
+    });
   };
 
   // Checkpoint the tool list as plain JSON schemas, so replay reconstructs tools without the live client.
@@ -96,7 +100,7 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
   const durable: ToolSet = {};
   for (const [name, def] of Object.entries(listed)) {
     const reconstructed = dynamicTool({
-      description: def.description ?? '',
+      description: def.description,
       title: def.title,
       metadata: def.metadata,
       inputSchema: jsonSchema(def.inputJsonSchema as Parameters<typeof jsonSchema>[0]),

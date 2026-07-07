@@ -2,9 +2,12 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { DBOS } from '@dbos-inc/dbos-sdk';
+import { APICallError } from '@ai-sdk/provider';
+import { GatewayRateLimitError } from '@ai-sdk/gateway';
 import { Client as PgClient } from 'pg';
 import {
   asSchema,
+  embed,
   embedMany,
   generateImage,
   generateText,
@@ -23,6 +26,7 @@ import {
   durableMCPTools,
   type MCPClientLike,
 } from '../src/index.js';
+import { restoreAISDKErrorIdentity } from '../src/internal.js';
 import {
   contentResponse,
   IMAGE_BYTES,
@@ -33,7 +37,10 @@ import {
   MockMCPClient,
   RichMockMCPClient,
   textResponse,
+  textResponseNoMetadata,
+  textResponseNullMetadata,
   textStreamParts,
+  textStreamPartsNoMetadata,
   toolCallResponse,
   toolCallsResponse,
   usage,
@@ -203,6 +210,67 @@ const errorWorkflow = DBOS.registerWorkflow(
     return result.text;
   },
   { name: 'errorWorkflow' },
+);
+
+// retriesAllowed: false delegates retries to the AI SDK, so a transient error checkpoints (rather than being
+// absorbed inside the step) and the AI SDK's own retry — which keys off APICallError.isInstance — runs across it.
+const identityMock = new MockLanguageModel();
+const identityModel = wrapLanguageModel({ model: identityMock, middleware: durableCalls({ retriesAllowed: false }) });
+
+const identityWorkflow = DBOS.registerWorkflow(
+  // No maxRetries: 0 here, so the AI SDK's retry layer is active.
+  async () => (await generateText({ model: identityModel, prompt: 'hi' })).text,
+  { name: 'identityWorkflow' },
+);
+
+// GatewayError (from the Vercel AI Gateway) is the OTHER half of the AI SDK's retry predicate; its markers use a
+// different namespace than APICallError, so restoreAISDKErrorIdentity must handle it too.
+const gatewayMock = new MockLanguageModel();
+const gatewayModel = wrapLanguageModel({ model: gatewayMock, middleware: durableCalls({ retriesAllowed: false }) });
+const gatewayWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: gatewayModel, prompt: 'hi' })).text,
+  { name: 'gatewayWorkflow' },
+);
+
+// Embed and image share generate's APICallError-keyed retry, so their restore wiring needs the same replay coverage.
+const embedIdentityMock = new MockEmbeddingModel();
+const embedIdentityModel = wrapEmbeddingModel({ model: embedIdentityMock, middleware: durableEmbeddingCalls({ retriesAllowed: false }) });
+const embedIdentityWorkflow = DBOS.registerWorkflow(
+  async () => (await embed({ model: embedIdentityModel, value: 'hi' })).embedding.length,
+  { name: 'embedIdentityWorkflow' },
+);
+
+const imageIdentityMock = new MockImageModel();
+const imageIdentityModel = wrapImageModel({ model: imageIdentityMock, middleware: durableImageCalls({ retriesAllowed: false }) });
+const imageIdentityWorkflow = DBOS.registerWorkflow(
+  async () => (await generateImage({ model: imageIdentityModel, prompt: 'draw' })).images.length,
+  { name: 'imageIdentityWorkflow' },
+);
+
+// Providers that omit response metadata: the middleware must give the response a durable id/timestamp so the AI
+// SDK's generateId()/new Date() fallback (which runs outside the step) doesn't produce a fresh value on replay.
+const idGenMock = new MockLanguageModel();
+const idGenModel = wrapLanguageModel({ model: idGenMock, middleware: durableCalls() });
+const idGenWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = await generateText({ model: idGenModel, prompt: 'hi', maxRetries: 0 });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' }); // so forkWorkflow can start after the model step
+    return { id: result.response.id, timestamp: result.response.timestamp.toISOString() };
+  },
+  { name: 'idGenWorkflow' },
+);
+
+const idStreamMock = new MockLanguageModel();
+const idStreamModel = wrapLanguageModel({ model: idStreamMock, middleware: durableCalls() });
+const idStreamWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = streamText({ model: idStreamModel, prompt: 'hi', maxRetries: 0 });
+    await result.consumeStream();
+    const response = await result.response;
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { id: response.id, timestamp: response.timestamp.toISOString() };
+  },
+  { name: 'idStreamWorkflow' },
 );
 
 const fileMock = new MockLanguageModel();
@@ -550,6 +618,24 @@ const structuredErrorWorkflow = DBOS.registerWorkflow(
     return 'unreachable';
   },
   { name: 'structuredErrorWorkflow' },
+);
+
+const abortPartMock = new MockLanguageModel();
+const abortPartModel = wrapLanguageModel({
+  model: abortPartMock,
+  middleware: durableCalls({ maxAttempts: 3, intervalSeconds: 0 }),
+});
+const abortPartWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const streamResult = await abortPartModel.doStream({ prompt: userPrompt });
+    const reader = streamResult.stream.getReader();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    return 'unreachable';
+  },
+  { name: 'abortPartWorkflow' },
 );
 
 // A stream ending with no finish part and no output must fail the attempt (retryably), not checkpoint an empty success.
@@ -1406,6 +1492,15 @@ test('tools without toModelOutput are not given one', async () => {
   assert.equal(tools.getWeather!.title, undefined);
 });
 
+test('a description-less MCP tool is reconstructed without an empty-string description', async () => {
+  const client: MCPClientLike = {
+    tools: async () => ({ ping: tool({ inputSchema: z.object({}), execute: async () => 'pong' }) }),
+  };
+  const tools = await durableMCPTools(client);
+  // Before the fix this was '' (an empty description sent to the model); upstream omits the field instead.
+  assert.equal(tools.ping!.description, undefined);
+});
+
 test('explicit shouldRetry: undefined falls back to the default classification', async () => {
   undefinedRetryMock.generateResults.push(Object.assign(new Error('bad request'), { isRetryable: false }));
   const handle = await DBOS.startWorkflow(undefinedRetryWorkflow, { workflowID: randomUUID() })();
@@ -1441,6 +1536,19 @@ test('a structured error-part payload keeps its JSON message and non-retryable c
   await assert.rejects(handle.getResult(), /quota exceeded[\s\S]*insufficient_quota/);
   // The payload's isRetryable: false is honored: no retry despite maxAttempts 3.
   assert.equal(structuredErrorMock.streamCalls, 1);
+});
+
+test('a named abort/timeout error-part is treated as terminal, not retried', async () => {
+  // Three identical attempts available; before the fix toStepError dropped the name, so it was classified retryable.
+  const part = { type: 'error' as const, error: { name: 'TimeoutError', message: 'upstream timeout' } };
+  abortPartMock.streamPartLists.push(
+    [{ type: 'stream-start', warnings: [] }, part],
+    [{ type: 'stream-start', warnings: [] }, part],
+    [{ type: 'stream-start', warnings: [] }, part],
+  );
+  const handle = await DBOS.startWorkflow(abortPartWorkflow, { workflowID: randomUUID() })();
+  await assert.rejects(handle.getResult(), /upstream timeout/);
+  assert.equal(abortPartMock.streamCalls, 1); // name preserved → isAbortError → terminal, no retry
 });
 
 test('a stream ending with no finish and no output is retried, not checkpointed as an empty success', async () => {
@@ -1696,6 +1804,139 @@ test('a throwing isRetryable accessor does not replace the step error or disable
     return true;
   });
   assert.equal(evilRetryMock.generateCalls, 2); // classified retryable → retried to maxAttempts
+});
+
+test('a retryable APICallError checkpointed under retriesAllowed:false keeps its AI SDK identity on replay', async () => {
+  const apiError = new APICallError({
+    message: 'service unavailable',
+    url: 'https://mock/api',
+    requestBodyValues: {},
+    statusCode: 503,
+    isRetryable: true,
+  });
+  // call 1 (live) fails and checkpoints an error; call 2 (live) and call 3 (fork replay) succeed.
+  identityMock.generateResults.push(apiError, textResponse('recovered'), textResponse('recovered'));
+
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(identityWorkflow, { workflowID })();
+  // Live: DBOS records the error at step 0 (no DBOS retry); the AI SDK's own retry re-runs the model call at step 1.
+  assert.equal(await handle.getResult(), 'recovered');
+  assert.equal(identityMock.generateCalls, 2);
+
+  // Fork past the errored step 0 so the error checkpoint is revived on replay. Before the fix, serialize-error
+  // strips the AI SDK Symbol marker → APICallError.isInstance() is false → the AI SDK does not retry → the
+  // workflow throws where the live run succeeded. With the marker restored, replay retries into the step-1 success.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof identityWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 'recovered');
+  assert.equal(identityMock.generateCalls, 3);
+});
+
+test('a retryable GatewayError checkpointed under retriesAllowed:false keeps its identity on replay', async () => {
+  // The gateway provider throws GatewayError (not APICallError) for retryable failures; its markers use a different
+  // namespace, so this only passes once restoreAISDKErrorIdentity handles the gateway family too.
+  const gatewayError = new GatewayRateLimitError({ message: 'rate limited', statusCode: 429 });
+  assert.equal(gatewayError.isRetryable, true);
+  gatewayMock.generateResults.push(gatewayError, textResponse('recovered'), textResponse('recovered'));
+
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(gatewayWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'recovered');
+  assert.equal(gatewayMock.generateCalls, 2);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof gatewayWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 'recovered');
+  assert.equal(gatewayMock.generateCalls, 3);
+});
+
+test('a retryable APICallError in embed keeps its identity on replay', async () => {
+  const apiError = new APICallError({ message: 'unavailable', url: 'https://mock/api', requestBodyValues: {}, statusCode: 503, isRetryable: true });
+  embedIdentityMock.errors.push(apiError); // call 1 fails; call 2 (live) and call 3 (fork) pass through to a normal embedding
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(embedIdentityWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 3); // embedding length
+  assert.equal(embedIdentityMock.embedCalls, 2);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof embedIdentityWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 3);
+  assert.equal(embedIdentityMock.embedCalls, 3);
+});
+
+test('a retryable APICallError in generateImage keeps its identity on replay', async () => {
+  const apiError = new APICallError({ message: 'unavailable', url: 'https://mock/api', requestBodyValues: {}, statusCode: 503, isRetryable: true });
+  imageIdentityMock.errors.push(apiError);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(imageIdentityWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 1); // one image
+  assert.equal(imageIdentityMock.generateCalls, 2);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof imageIdentityWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 1);
+  assert.equal(imageIdentityMock.generateCalls, 3);
+});
+
+test('restoreAISDKErrorIdentity does not let a failed marker assignment replace the error', () => {
+  // A frozen/non-extensible AI SDK error would throw on the symbol assignment under strict mode; a throwing set trap
+  // reproduces that deterministically (tsx runs the CJS source sloppily, where a frozen assignment silently no-ops).
+  const assignThrows = new Proxy(Object.assign(new Error('boom'), { name: 'AI_APICallError' }), {
+    set() {
+      throw new TypeError('read only');
+    },
+  });
+  assert.equal(restoreAISDKErrorIdentity(assignThrows), assignThrows); // returns the error, does not throw
+
+  // A throwing `name` getter must also not escape (the read happens before the symbol assignments).
+  const readThrows = new Error('boom');
+  Object.defineProperty(readThrows, 'name', {
+    get() {
+      throw new Error('name getter boom');
+    },
+  });
+  assert.equal(restoreAISDKErrorIdentity(readThrows), readThrows);
+});
+
+test('generateText response id/timestamp stay stable across replay when the provider omits them', async () => {
+  idGenMock.generateResults.push(textResponseNoMetadata('hi there'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(idGenWorkflow, { workflowID })();
+  const live = await handle.getResult();
+  assert.ok(live.id && live.timestamp, 'response id/timestamp were populated');
+  assert.equal(idGenMock.generateCalls, 1);
+
+  // Fork past the model step so it replays from the checkpoint. Before the fix, generateText re-ran
+  // generateId()/new Date() outside the step, so the replay produced a different id and timestamp.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof idGenWorkflow>>(workflowID, 1);
+  const replayed = await forked.getResult();
+  assert.equal(replayed.id, live.id);
+  assert.equal(replayed.timestamp, live.timestamp);
+  assert.equal(idGenMock.generateCalls, 1); // model not re-called on replay
+});
+
+test('streamText response id/timestamp stay stable across replay when the provider omits them', async () => {
+  idStreamMock.streamPartLists.push(textStreamPartsNoMetadata(['hi', ' there']));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(idStreamWorkflow, { workflowID })();
+  const live = await handle.getResult();
+  assert.ok(live.id && live.timestamp, 'response id/timestamp were populated');
+  assert.equal(idStreamMock.streamCalls, 1);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof idStreamWorkflow>>(workflowID, 1);
+  const replayed = await forked.getResult();
+  assert.equal(replayed.id, live.id);
+  assert.equal(replayed.timestamp, live.timestamp);
+  assert.equal(idStreamMock.streamCalls, 1); // model not re-called on replay
+});
+
+test('generateText response id/timestamp stay stable across replay when the provider returns null metadata', async () => {
+  idGenMock.generateResults.push(textResponseNullMetadata('hi'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(idGenWorkflow, { workflowID })();
+  const live = await handle.getResult();
+  assert.ok(live.id && live.timestamp, 'response id/timestamp were populated');
+  // Before the `!= null` guard, ensureResponseMetadata skipped a null id/timestamp, so the AI SDK regenerated on replay.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof idGenWorkflow>>(workflowID, 1);
+  const replayed = await forked.getResult();
+  assert.equal(replayed.id, live.id);
+  assert.equal(replayed.timestamp, live.timestamp);
 });
 
 // Keep this test last: it shuts down and relaunches DBOS mid-suite.

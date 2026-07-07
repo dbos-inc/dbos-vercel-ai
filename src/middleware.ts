@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 // Public signatures use ai's middleware aliases: ai is the single peer instance, so the types always
 // match the consumer's wrap* calls. @ai-sdk/provider (dev-only) never appears in the published types —
@@ -19,7 +20,7 @@ import type {
   SharedV4ProviderMetadata,
   SharedV4Warning,
 } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
-import { assertNotInTransaction, isInWorkflowFunction, withErrorClassification } from './internal';
+import { assertNotInTransaction, isInWorkflowFunction, restoreAISDKErrorIdentity, withErrorClassification } from './internal';
 
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
@@ -63,10 +64,13 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       }
       const workflowID = enterDurableModelCall('generate');
       try {
-        return await DBOS.runStep(async () => encodeBinaryContent(await doGenerate()), {
+        return await DBOS.runStep(async () => ensureResponseMetadata(encodeBinaryContent(await doGenerate())), {
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'generate'),
         });
+      } catch (error) {
+        // Restore the AI SDK error identity a replay revival strips, so the SDK's retry/catch logic behaves the same.
+        throw restoreAISDKErrorIdentity(error);
       } finally {
         exitDurableModelCall(workflowID);
       }
@@ -171,6 +175,11 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
               // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
               void reader?.cancel().catch(() => {});
             }
+            // Give the response a durable id/timestamp when the provider sent none, and emit it live (before the
+            // withheld 'finish') so the SDK sees the same values live and on replay instead of a fresh fallback.
+            // Skip the live emit for a timed-out (abandoned) attempt so it can't interleave with its retry.
+            const responseMetadataPart = accumulator.fillResponseMetadata(randomUUID(), new Date());
+            if (responseMetadataPart && !timeoutSignal?.aborted) emit(responseMetadataPart);
             return encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
           },
           { ...streamStepConfig, name: stepConfig.name ?? stepName(model, 'stream') },
@@ -201,7 +210,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             controller.close();
           },
           (error: unknown) => {
-            if (!cancelled) controller.error(error);
+            if (!cancelled) controller.error(restoreAISDKErrorIdentity(error));
           },
         )
         .finally(releaseGuard);
@@ -227,6 +236,8 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelM
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'embed'),
         });
+      } catch (error) {
+        throw restoreAISDKErrorIdentity(error);
       } finally {
         exitDurableModelCall(workflowID);
       }
@@ -248,10 +259,14 @@ export function durableImageCalls(options: StepConfig = {}): ImageModelMiddlewar
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
-      return await DBOS.runStep(async () => encodeImageResult(await doGenerate()), {
-        ...stepConfig,
-        name: stepConfig.name ?? stepName(model, 'image'),
-      });
+      try {
+        return await DBOS.runStep(async () => encodeImageResult(await doGenerate()), {
+          ...stepConfig,
+          name: stepConfig.name ?? stepName(model, 'image'),
+        });
+      } catch (error) {
+        throw restoreAISDKErrorIdentity(error);
+      }
     },
   };
 }
@@ -282,8 +297,25 @@ function toStepError(error: unknown): Error {
     message = String(error);
   }
   const result = new Error(message, { cause: error });
+  // Carry the payload's name so an abort/timeout error-part is classified terminal (isAbortError reads .name), not retried.
+  const name = (error as { name?: unknown } | null | undefined)?.name;
+  if (typeof name === 'string') result.name = name;
   const isRetryable = (error as { isRetryable?: unknown } | null | undefined)?.isRetryable;
   return isRetryable === undefined ? result : Object.assign(result, { isRetryable });
+}
+
+// generateText fills response.id/timestamp with generateId()/new Date() OUTSIDE this step when the provider omits
+// them, so they'd differ on every replay. Populate them here (checkpointed once) so that fallback never runs.
+function ensureResponseMetadata(result: LanguageModelV4GenerateResult): LanguageModelV4GenerateResult {
+  const response = result.response;
+  // Match the AI SDK's `?? generateId()` fallback (nullish, not just undefined): a null id would regenerate too.
+  if (response?.id != null && response?.timestamp != null) {
+    return result;
+  }
+  return {
+    ...result,
+    response: { ...response, id: response?.id ?? randomUUID(), timestamp: response?.timestamp ?? new Date() },
+  };
 }
 
 /** Convert generated-file bytes (Uint8Array) to base64 (spec-allowed) to keep checkpoints compact. */
@@ -392,6 +424,21 @@ class StreamAccumulator {
 
   get hasContent(): boolean {
     return this.content.length > 0;
+  }
+
+  // Fill any missing response id/timestamp so the checkpoint carries them; returns the response-metadata part to
+  // emit live (or undefined if the provider already supplied both). replayParts re-emits it from the checkpoint.
+  fillResponseMetadata(id: string, timestamp: Date): LanguageModelV4StreamPart | undefined {
+    // Nullish check to match the AI SDK's `?? generateId()` fallback (a null id/timestamp would regenerate too).
+    if (this.responseMetadata?.id != null && this.responseMetadata?.timestamp != null) {
+      return undefined;
+    }
+    this.responseMetadata = {
+      id: this.responseMetadata?.id ?? id,
+      timestamp: this.responseMetadata?.timestamp ?? timestamp,
+      modelId: this.responseMetadata?.modelId,
+    };
+    return { type: 'response-metadata', ...this.responseMetadata };
   }
 
   // If a delta arrives with no preceding start, create the block in arrival position rather than dropping the text.

@@ -48,6 +48,7 @@
     "ai": "^7.0.0"
   },
   "devDependencies": {
+    "@ai-sdk/gateway": "^4.0.0",
     "@ai-sdk/provider": "^4.0.0",
     "@arethetypeswrong/cli": "^0.18.0",
     "@dbos-inc/dbos-sdk": "^4.23.6",

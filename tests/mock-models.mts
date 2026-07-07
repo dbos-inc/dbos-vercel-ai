@@ -47,6 +47,22 @@ export function textResponse(text: string): LanguageModelV4GenerateResult {
   return contentResponse([{ type: 'text', text }]);
 }
 
+// No `response` field: the AI SDK fills response.id/timestamp with generateId()/new Date() outside the durable step.
+export function textResponseNoMetadata(text: string): LanguageModelV4GenerateResult {
+  return { content: [{ type: 'text', text }], finishReason: finishReason(), usage: usage(), warnings: [] };
+}
+
+// A non-conforming provider returning null (not undefined) id/timestamp; the AI SDK's `?? generateId()` treats null as missing.
+export function textResponseNullMetadata(text: string): LanguageModelV4GenerateResult {
+  return {
+    content: [{ type: 'text', text }],
+    finishReason: finishReason(),
+    usage: usage(),
+    warnings: [],
+    response: { id: null, timestamp: null, modelId: null } as unknown as LanguageModelV4GenerateResult['response'],
+  };
+}
+
 export function toolCallResponse(toolName: string, input: string): LanguageModelV4GenerateResult {
   return contentResponse(
     [{ type: 'tool-call', toolCallId: 'call-1', toolName, input }],
@@ -66,6 +82,17 @@ export function textStreamParts(deltas: string[]): LanguageModelV4StreamPart[] {
   return [
     { type: 'stream-start', warnings: [] },
     { type: 'response-metadata', id: 'resp-1', timestamp: new Date('2026-07-02T12:00:00Z'), modelId: 'mock-model' },
+    { type: 'text-start', id: 't1' },
+    ...deltas.map((delta): LanguageModelV4StreamPart => ({ type: 'text-delta', id: 't1', delta })),
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: finishReason(), usage: usage() },
+  ];
+}
+
+// No response-metadata part: the AI SDK fills response.id/timestamp with generateId()/new Date() outside the step.
+export function textStreamPartsNoMetadata(deltas: string[]): LanguageModelV4StreamPart[] {
+  return [
+    { type: 'stream-start', warnings: [] },
     { type: 'text-start', id: 't1' },
     ...deltas.map((delta): LanguageModelV4StreamPart => ({ type: 'text-delta', id: 't1', delta })),
     { type: 'text-end', id: 't1' },
@@ -211,6 +238,8 @@ export class MockEmbeddingModel implements EmbeddingModelV4 {
   readonly supportsParallelCalls = true;
 
   embedCalls = 0;
+  // Queue an Error to fail that doEmbed call (undefined entries pass through to a normal embedding).
+  errors: (Error | undefined)[] = [];
 
   // A finite maxEmbeddingsPerCall makes embedMany split large inputs into batches (parallel by default).
   constructor(maxEmbeddingsPerCall?: number) {
@@ -219,6 +248,8 @@ export class MockEmbeddingModel implements EmbeddingModelV4 {
 
   async doEmbed(options: EmbeddingModelV4CallOptions): Promise<EmbeddingModelV4Result> {
     this.embedCalls++;
+    const error = this.errors.shift();
+    if (error) throw error;
     return {
       embeddings: options.values.map((_, i) => [i, i + 0.5, i + 0.25]),
       usage: { tokens: options.values.length * 3 },
@@ -238,6 +269,8 @@ export class MockImageModel implements ImageModelV4 {
   generateCalls = 0;
   // Queue an images array to override the default bytes (e.g. a spec-violating mixed string/bytes batch).
   imageOverrides: (string | Uint8Array)[][] = [];
+  // Queue an Error to fail that doGenerate call (undefined entries pass through to a normal image).
+  errors: (Error | undefined)[] = [];
 
   // The default of 1 forces generateImage to split n>1 into parallel batches.
   constructor(maxImagesPerCall = 1) {
@@ -246,6 +279,8 @@ export class MockImageModel implements ImageModelV4 {
 
   async doGenerate(options: ImageModelV4CallOptions): Promise<ImageModelV4Result> {
     this.generateCalls++;
+    const error = this.errors.shift();
+    if (error) throw error;
     // Tag each generated image with this call's ordinal so a reordering on replay is detectable.
     const images =
       this.imageOverrides.shift() ??
