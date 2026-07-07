@@ -297,6 +297,9 @@ function toStepError(error: unknown): Error {
     message = String(error);
   }
   const result = new Error(message, { cause: error });
+  // Carry the payload's name so an abort/timeout error-part is classified terminal (isAbortError reads .name), not retried.
+  const name = (error as { name?: unknown } | null | undefined)?.name;
+  if (typeof name === 'string') result.name = name;
   const isRetryable = (error as { isRetryable?: unknown } | null | undefined)?.isRetryable;
   return isRetryable === undefined ? result : Object.assign(result, { isRetryable });
 }

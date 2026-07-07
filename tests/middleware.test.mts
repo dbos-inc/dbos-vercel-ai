@@ -619,6 +619,24 @@ const structuredErrorWorkflow = DBOS.registerWorkflow(
   { name: 'structuredErrorWorkflow' },
 );
 
+const abortPartMock = new MockLanguageModel();
+const abortPartModel = wrapLanguageModel({
+  model: abortPartMock,
+  middleware: durableCalls({ maxAttempts: 3, intervalSeconds: 0 }),
+});
+const abortPartWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const streamResult = await abortPartModel.doStream({ prompt: userPrompt });
+    const reader = streamResult.stream.getReader();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    return 'unreachable';
+  },
+  { name: 'abortPartWorkflow' },
+);
+
 // A stream ending with no finish part and no output must fail the attempt (retryably), not checkpoint an empty success.
 const emptyStreamMock = new MockLanguageModel();
 const emptyStreamModel = wrapLanguageModel({
@@ -1473,6 +1491,15 @@ test('tools without toModelOutput are not given one', async () => {
   assert.equal(tools.getWeather!.title, undefined);
 });
 
+test('a description-less MCP tool is reconstructed without an empty-string description', async () => {
+  const client: MCPClientLike = {
+    tools: async () => ({ ping: tool({ inputSchema: z.object({}), execute: async () => 'pong' }) }),
+  };
+  const tools = await durableMCPTools(client);
+  // Before the fix this was '' (an empty description sent to the model); upstream omits the field instead.
+  assert.equal(tools.ping!.description, undefined);
+});
+
 test('explicit shouldRetry: undefined falls back to the default classification', async () => {
   undefinedRetryMock.generateResults.push(Object.assign(new Error('bad request'), { isRetryable: false }));
   const handle = await DBOS.startWorkflow(undefinedRetryWorkflow, { workflowID: randomUUID() })();
@@ -1508,6 +1535,19 @@ test('a structured error-part payload keeps its JSON message and non-retryable c
   await assert.rejects(handle.getResult(), /quota exceeded[\s\S]*insufficient_quota/);
   // The payload's isRetryable: false is honored: no retry despite maxAttempts 3.
   assert.equal(structuredErrorMock.streamCalls, 1);
+});
+
+test('a named abort/timeout error-part is treated as terminal, not retried', async () => {
+  // Three identical attempts available; before the fix toStepError dropped the name, so it was classified retryable.
+  const part = { type: 'error' as const, error: { name: 'TimeoutError', message: 'upstream timeout' } };
+  abortPartMock.streamPartLists.push(
+    [{ type: 'stream-start', warnings: [] }, part],
+    [{ type: 'stream-start', warnings: [] }, part],
+    [{ type: 'stream-start', warnings: [] }, part],
+  );
+  const handle = await DBOS.startWorkflow(abortPartWorkflow, { workflowID: randomUUID() })();
+  await assert.rejects(handle.getResult(), /upstream timeout/);
+  assert.equal(abortPartMock.streamCalls, 1); // name preserved → isAbortError → terminal, no retry
 });
 
 test('a stream ending with no finish and no output is retried, not checkpointed as an empty success', async () => {

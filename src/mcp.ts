@@ -100,7 +100,7 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
   const durable: ToolSet = {};
   for (const [name, def] of Object.entries(listed)) {
     const reconstructed = dynamicTool({
-      description: def.description ?? '',
+      description: def.description,
       title: def.title,
       metadata: def.metadata,
       inputSchema: jsonSchema(def.inputJsonSchema as Parameters<typeof jsonSchema>[0]),
