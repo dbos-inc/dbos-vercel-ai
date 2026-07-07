@@ -72,12 +72,26 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       }
     },
 
-    wrapStream: async ({ doStream, model }) => {
+    wrapStream: async ({ doStream, params, model }) => {
       assertNotInTransaction('stream');
       if (!isInWorkflowFunction()) {
         return await doStream();
       }
       const workflowID = enterDurableModelCall('stream');
+      // An aborted consumer is done with this call, like a cancelled one: post-abort failures must checkpoint as a (partial) success, or replay would fail where the live run ended gracefully.
+      const aborted = () => params.abortSignal?.aborted === true;
+
+      // Free the concurrency guard as soon as the consumer detaches (abort/cancel), not only when the step
+      // settles: this call's step is already sequenced, so a sequential follow-up in the same workflow is
+      // deterministic on replay and must not be rejected as concurrent while this step drains in the background.
+      let guardReleased = false;
+      const releaseGuard = () => {
+        if (guardReleased) return;
+        guardReleased = true;
+        params.abortSignal?.removeEventListener('abort', releaseGuard);
+        exitDurableModelCall(workflowID);
+      };
+      params.abortSignal?.addEventListener('abort', releaseGuard, { once: true });
 
       let executed = false;
       let cancelled = false;
@@ -91,52 +105,81 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         // Await the step so an early cancel still blocks until the model result is checkpointed.
         async cancel() {
           cancelled = true;
-          await step.catch(() => {});
+          releaseGuard();
+          // Post-cancel failures normally checkpoint as a success; anything else (e.g. a failed checkpoint write) is only visible here.
+          await step.catch((error: unknown) =>
+            DBOS.logger.warn(`Durable model call step failed after consumer cancel: ${String(error)}`),
+          );
         },
       });
       const emit = (part: LanguageModelV4StreamPart) => {
         if (!cancelled) {
           controller.enqueue(part);
-          emittedLive = true;
+          // stream-start and response-metadata merge idempotently downstream, so they alone don't preclude a retry.
+          if (part.type !== 'stream-start' && part.type !== 'response-metadata') emittedLive = true;
         }
       };
 
-      // Once any part has streamed live, a retry would re-stream from scratch and duplicate output, so stop retrying.
+      // Once any output part has streamed live, a retry would re-stream from scratch and duplicate output, so stop retrying.
       const streamStepConfig: StepConfig = {
         ...stepConfig,
         shouldRetry: async (error: unknown) =>
           !emittedLive && (stepConfig.shouldRetry ? await stepConfig.shouldRetry(error) : true),
       };
 
-      step = DBOS.runStep(
-        async () => {
-          executed = true;
-          const accumulator = new StreamAccumulator();
-          let streamResult: Awaited<ReturnType<typeof doStream>> | undefined;
-          try {
-            streamResult = await doStream();
-            const reader = streamResult.stream.getReader();
-            for (;;) {
-              const { done, value: part } = await reader.read();
-              if (done) break;
-              if (part.type === 'error') {
-                // A cancelled consumer abandoned this call; don't let a post-cancel failure become the step outcome, or replay would fail where the live run succeeded.
-                if (cancelled) break;
-                throw part.error instanceof Error ? part.error : new Error(String(part.error));
+      try {
+        step = DBOS.runStep(
+          async () => {
+            executed = true;
+            const accumulator = new StreamAccumulator();
+            // A timed-out attempt is abandoned by DBOS (its outcome is discarded) but keeps running; stop it so it can't emit alongside a retry.
+            const timeoutSignal = DBOS.stepStatus?.timeoutSignal;
+            let streamResult: Awaited<ReturnType<typeof doStream>> | undefined;
+            let reader: ReadableStreamDefaultReader<LanguageModelV4StreamPart> | undefined;
+            let sawFinish = false;
+            const abandon = () => void reader?.cancel().catch(() => {});
+            timeoutSignal?.addEventListener('abort', abandon, { once: true });
+            // A consumer abort detaches this call; stop draining now so the checkpoint lands promptly and matches what streamed.
+            params.abortSignal?.addEventListener('abort', abandon, { once: true });
+            try {
+              streamResult = await doStream();
+              reader = streamResult.stream.getReader();
+              for (;;) {
+                const { done, value: part } = await reader.read();
+                if (timeoutSignal?.aborted) throw (timeoutSignal.reason ?? new Error('step attempt timed out'));
+                if (done) break;
+                if (part.type === 'error') {
+                  // A cancelled or aborted consumer abandoned this call; don't let a late failure become the step outcome, or replay would fail where the live run succeeded.
+                  if (cancelled || aborted()) break;
+                  throw toStepError(part.error);
+                }
+                // Stream deltas live but withhold 'finish' until the checkpoint is durable: the AI SDK runs tool calls (and their durable steps) on 'finish', which must not checkpoint before this model step.
+                if (part.type === 'finish') sawFinish = true;
+                else emit(part);
+                accumulator.add(part);
               }
-              // Stream deltas live, but withhold 'finish' until the checkpoint is durable: the AI SDK runs tool calls
-              // (and thus downstream durable steps) on 'finish', which must not checkpoint before this model step.
-              if (part.type !== 'finish') emit(part);
-              accumulator.add(part);
+              // No terminal part and no output: fail (retryably) like the AI SDK's NoOutputGeneratedError, instead of checkpointing a permanent empty success.
+              if (!sawFinish && !accumulator.hasContent && !cancelled && !aborted()) {
+                throw new Error('Model stream ended without a finish part or any output.');
+              }
+            } catch (error) {
+              // Same rule for stream-level failures (doStream or a read rejecting) after a cancel or abort.
+              if (!cancelled && !aborted()) throw error;
+            } finally {
+              timeoutSignal?.removeEventListener('abort', abandon);
+              params.abortSignal?.removeEventListener('abort', abandon);
+              // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
+              void reader?.cancel().catch(() => {});
             }
-          } catch (error) {
-            // Same rule for stream-level failures (doStream or a read rejecting) after a cancel.
-            if (!cancelled) throw error;
-          }
-          return encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
-        },
-        { ...streamStepConfig, name: stepConfig.name ?? stepName(model, 'stream') },
-      );
+            return encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
+          },
+          { ...streamStepConfig, name: stepConfig.name ?? stepName(model, 'stream') },
+        );
+      } catch (error) {
+        // runStep can throw synchronously (e.g. a shutdown race); don't leak the guard entry.
+        releaseGuard();
+        throw error;
+      }
 
       // Drive the returned stream from the settled step: a live run emits only the withheld 'finish' (deltas already
       // streamed); a recovered run synthesizes the whole stream from the checkpoint. Either way consumers finish
@@ -161,7 +204,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             if (!cancelled) controller.error(error);
           },
         )
-        .finally(() => exitDurableModelCall(workflowID));
+        .finally(releaseGuard);
 
       return { stream };
     },
@@ -215,14 +258,32 @@ export function durableImageCalls(options: StepConfig = {}): ImageModelMiddlewar
 
 /** Convert generated image bytes (Uint8Array) to base64 (spec-allowed) to keep checkpoints compact. */
 function encodeImageResult(result: ImageModelV4Result): ImageModelV4Result {
-  if (result.images.length === 0 || typeof result.images[0] === 'string') {
+  const images = result.images as (string | Uint8Array)[];
+  if (images.every((image) => typeof image === 'string')) {
     return result;
   }
-  return { ...result, images: (result.images as Uint8Array[]).map((image) => Buffer.from(image).toString('base64')) };
+  return {
+    ...result,
+    images: images.map((image) => (typeof image === 'string' ? image : Buffer.from(image).toString('base64'))),
+  };
 }
 
 function stepName(model: LanguageModelV4 | EmbeddingModelV4 | ImageModelV4, operation: string): string {
   return `${model.provider}.${model.modelId}.${operation}`;
+}
+
+/** Normalize an error-part payload to an Error, preserving the payload (JSON message, cause, isRetryable). */
+function toStepError(error: unknown): Error {
+  if (error instanceof Error) return error;
+  let message: string;
+  try {
+    message = typeof error === 'string' ? error : (JSON.stringify(error) ?? String(error));
+  } catch {
+    message = String(error);
+  }
+  const result = new Error(message, { cause: error });
+  const isRetryable = (error as { isRetryable?: unknown } | null | undefined)?.isRetryable;
+  return isRetryable === undefined ? result : Object.assign(result, { isRetryable });
 }
 
 /** Convert generated-file bytes (Uint8Array) to base64 (spec-allowed) to keep checkpoints compact. */
@@ -303,7 +364,12 @@ class StreamAccumulator {
         break;
       }
       case 'response-metadata':
-        this.responseMetadata = { id: part.id, timestamp: part.timestamp, modelId: part.modelId };
+        // Merge per-field like the AI SDK: later parts override only the fields they carry.
+        this.responseMetadata = {
+          id: part.id ?? this.responseMetadata?.id,
+          timestamp: part.timestamp ?? this.responseMetadata?.timestamp,
+          modelId: part.modelId ?? this.responseMetadata?.modelId,
+        };
         break;
       case 'finish':
         this.finishReason = part.finishReason;
@@ -322,6 +388,10 @@ class StreamAccumulator {
         this.content.push(part);
         break;
     }
+  }
+
+  get hasContent(): boolean {
+    return this.content.length > 0;
   }
 
   // If a delta arrives with no preceding start, create the block in arrival position rather than dropping the text.
@@ -376,13 +446,20 @@ function* replayParts(result: LanguageModelV4GenerateResult): Generator<Language
   for (const part of result.content) {
     const id = `replay-${blockIndex++}`;
     if (part.type === 'text') {
-      yield { type: 'text-start', id };
+      yield { type: 'text-start', id, providerMetadata: part.providerMetadata };
       if (part.text.length > 0) yield { type: 'text-delta', id, delta: part.text };
       yield { type: 'text-end', id, providerMetadata: part.providerMetadata };
     } else if (part.type === 'reasoning') {
-      yield { type: 'reasoning-start', id };
+      yield { type: 'reasoning-start', id, providerMetadata: part.providerMetadata };
       if (part.text.length > 0) yield { type: 'reasoning-delta', id, delta: part.text };
       yield { type: 'reasoning-end', id, providerMetadata: part.providerMetadata };
+    } else if (part.type === 'tool-call') {
+      // Re-synthesize the tool-input grammar: consumer tool callbacks (onInputStart/onInputAvailable) are keyed off tool-input-start.
+      const { toolCallId, toolName, providerExecuted, dynamic } = part;
+      yield { type: 'tool-input-start', id: toolCallId, toolName, providerExecuted, dynamic };
+      if (part.input.length > 0) yield { type: 'tool-input-delta', id: toolCallId, delta: part.input };
+      yield { type: 'tool-input-end', id: toolCallId };
+      yield part;
     } else {
       yield part;
     }

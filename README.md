@@ -79,7 +79,13 @@ Because DBOS owns retries by default, pass `maxRetries: 0` to the AI SDK call so
 
 ## Streaming
 
-`streamText` works inside workflows. On first execution, stream parts are passed through to your code live as the model produces them, and the assembled result is checkpointed when the stream completes. The terminal `finish` part is held back until that checkpoint is durable, so any tool calls the model requests (which the AI SDK runs on `finish`) and the durable steps they perform never checkpoint ahead of the model call itself. On recovery, the checkpointed result is replayed as a short synthetic stream (one delta per text block), so your workflow code runs identically either way.
+You can stream model responses in a workflow with `streamText`.
+When streaming model output in a workflow, only the final output is checkpointed, not individual deltas.
+As a consequence:
+
+- You can safely forward streamed deltas to a UI or print them to a terminal, but you should not perform durable actions on them. Run your own durable steps on the complete result, after the stream ends. Tool calls the AI SDK makes during the stream are already safe: they run only after the model call is checkpointed.
+- Do not break out of a stream before it is complete. To stop early, either drain the stream (`await result.consumeStream()`) or abort it.
+- To abort, pass an `abortSignal` to `streamText` and fire it. The output streamed so far is checkpointed as the call's durable result. After an abort, use the deltas you collected.
 
 ```ts
 const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
@@ -91,13 +97,10 @@ const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
 }, { name: 'streamingAgent' });
 ```
 
-**Retries and streaming.** Streaming stays live even with retries on. A failure that occurs before any part has streamed (e.g. a connection error when the request opens — the common transient case) is retried transparently. Once parts have streamed to your code, a later failure is *not* retried, because re-running the call would duplicate the output already delivered; it surfaces as a stream error instead, exactly as an un-wrapped `streamText` would.
-
-To stream tokens to another process (e.g. the workflow runs on a queue worker and an HTTP handler streams to a browser), write parts to a [DBOS workflow stream](https://docs.dbos.dev/typescript/tutorials/workflow-tutorial#workflow-streaming) from your own consumer loop and read them elsewhere with `DBOS.readStream`.
-
 ## Tools
 
-Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop. A tool's `execute` is your own code, though: wrap its side effects in a DBOS step so they're checkpointed too.
+Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop.
+You should wrap your tool's `execute` in a DBOS step so it is checkpointed too.
 
 ```ts
 import { tool, stepCountIs } from 'ai';
@@ -122,7 +125,8 @@ const agent = DBOS.registerWorkflow(async (question: string) => {
 
 ### MCP tools
 
-`durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (e.g. from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps. The tool list is checkpointed as JSON schemas, so a recovered workflow reconstructs the tools without the live connection, and each tool call is checkpointed so recovery replays results instead of re-invoking the tool:
+`durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (e.g. from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps.
+Each tool call is checkpointed so recovery replays results instead of re-invoking the tool:
 
 ```ts
 import { createMCPClient } from '@ai-sdk/mcp';
@@ -146,11 +150,12 @@ const tools = await durableMCPTools(mcpClient, {
 
 ## Concurrency
 
-Run **one durable model call at a time within a single workflow**. DBOS derives each step's replay identity from the order steps are reached, but the AI SDK issues concurrent model calls in a nondeterministic order — so on recovery a checkpoint could be bound to the wrong call, silently returning one call's result for another. To prevent this, the middleware throws if it detects a second durable model call starting while one is already in flight in the same workflow.
-
+Run **one durable model call at a time within a single workflow**.
+DBOS requires workflows to be deterministic, but the AI SDK issues concurrent model calls in nondeterministic order.
+To guard against nondeterminism, this integration throws an error if it detects concurrent durable model calls in the same workflow.
 Sequential calls (including a normal tool-calling loop, where each model call completes before the next begins) are unaffected.
 
-To fan out model calls in parallel, give each its own **child workflow**, which gets an independent, deterministic step-ID space:
+To fan out model calls in parallel, give each its own **child workflow**:
 
 ```ts
 const summarizeOne = DBOS.registerWorkflow(
@@ -168,7 +173,7 @@ const summarizeAll = DBOS.registerWorkflow(async (docs: string[]) => {
 
 ## Embeddings
 
-`durableEmbeddingCalls` does the same for embedding models:
+`durableEmbeddingCalls` enables durable calls to embedding models:
 
 ```ts
 import { embedMany, wrapEmbeddingModel } from 'ai';
@@ -186,7 +191,7 @@ Pass `maxParallelCalls: 1` when embedding more values than the model's per-call 
 
 ## Images
 
-`durableImageCalls` makes image generation durable. Generated image bytes are base64-encoded before checkpointing (the `.uint8Array`/`.base64` accessors on the result work either way):
+`durableImageCalls` makes image generation durable:
 
 ```ts
 import { generateImage, wrapImageModel } from 'ai';

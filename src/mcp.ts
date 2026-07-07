@@ -1,6 +1,6 @@
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
-import { isInWorkflowFunction, withErrorClassification } from './internal';
+import { assertNotInTransaction, isInWorkflowFunction, withErrorClassification } from './internal';
 
 // Structural type for an MCP client (e.g. from @ai-sdk/mcp) — deliberately loose: the AI SDK ecosystem
 // exact-pins @ai-sdk/provider-utils, so precise Tool types fail to match across skewed copies.
@@ -36,6 +36,10 @@ interface DurableToolDef {
 
 type ToolModelOutput = Awaited<ReturnType<NonNullable<ToolSet[string]['toModelOutput']>>>;
 
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return typeof (value as AsyncIterable<unknown> | null | undefined)?.[Symbol.asyncIterator] === 'function';
+}
+
 // Mirror of @ai-sdk/mcp's toModelOutput: MCP content becomes model content (text stays text, images become files).
 function mcpToolOutput(output: unknown): ToolModelOutput {
   const result = output as { content?: unknown };
@@ -65,8 +69,10 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
   const { toolOptions, ...stepOptions } = options;
   const stepConfig = withErrorClassification(stepOptions);
   const { asSchema, dynamicTool, jsonSchema } = await import('ai');
-  const run = <T>(name: string, fn: () => Promise<T>): Promise<T> =>
-    isInWorkflowFunction() ? DBOS.runStep(fn, { ...stepConfig, name }) : fn();
+  const run = <T>(name: string, fn: () => Promise<T>, config: StepConfig = stepConfig): Promise<T> => {
+    assertNotInTransaction(name);
+    return isInWorkflowFunction() ? DBOS.runStep(fn, { ...config, name }) : fn();
+  };
 
   // Checkpoint the tool list as plain JSON schemas, so replay reconstructs tools without the live client.
   const listed = await run('mcp.listTools', async () => {
@@ -97,12 +103,31 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
       // MCP clients convert results via a pure toModelOutput; reapply an equivalent so results reach the model as content, not raw JSON.
       toModelOutput: def.convertsOutput ? ({ output }) => mcpToolOutput(output) : undefined,
       // Re-fetch the live tool inside the step (its execute closure can't be checkpointed); replay returns the recorded result.
-      execute: (input: unknown, execOptions) =>
-        run(`mcp.tool.${name}`, async () => {
-          const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
-          if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
-          return tool.execute(input, execOptions);
-        }),
+      execute: (input: unknown, execOptions) => {
+        const signal = (execOptions as { abortSignal?: AbortSignal } | undefined)?.abortSignal;
+        // An aborted consumer is done with this call, whatever the failure looks like; a retry would re-run a cancelled side effect.
+        const callConfig: StepConfig = {
+          ...stepConfig,
+          shouldRetry: async (error: unknown) =>
+            !signal?.aborted && (stepConfig.shouldRetry ? await stepConfig.shouldRetry(error) : true),
+        };
+        return run(
+          `mcp.tool.${name}`,
+          async () => {
+            const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
+            if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
+            const output = await tool.execute(input, execOptions);
+            // A streaming execute can't checkpoint mid-flight; drain it and record the final value (the last yield).
+            if (isAsyncIterable(output)) {
+              let last: unknown;
+              for await (last of output);
+              return last;
+            }
+            return output;
+          },
+          callConfig,
+        );
+      },
     });
     // @ai-sdk/mcp spreads the MCP _meta onto the tool object; preserve it for consumers that read it.
     durable[name] = def.meta === undefined ? reconstructed : Object.assign(reconstructed, { _meta: def.meta });

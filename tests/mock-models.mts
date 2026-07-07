@@ -79,10 +79,9 @@ export class MockLanguageModel implements LanguageModelV4 {
   readonly modelId = 'mock-model';
   readonly supportedUrls: Record<string, RegExp[]> = {};
 
-  // Queue an Error to fail that doGenerate call; queue an 'error' stream part to fail that doStream partway,
-  // or an Error in a part list to fail the stream itself (read() rejects) at that point.
+  // Queue an Error to fail that doGenerate call; in a part list, an 'error' part fails the stream partway, an Error makes reads reject, and a function gates emission until its promise resolves.
   generateResults: (LanguageModelV4GenerateResult | Error)[] = [];
-  streamPartLists: (LanguageModelV4StreamPart | Error)[][] = [];
+  streamPartLists: (LanguageModelV4StreamPart | Error | (() => Promise<void>))[][] = [];
   generateCalls = 0;
   streamCalls = 0;
   generateOptions: LanguageModelV4CallOptions[] = [];
@@ -90,6 +89,10 @@ export class MockLanguageModel implements LanguageModelV4 {
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     this.generateCalls++;
     this.generateOptions.push(options);
+    if (options.abortSignal?.aborted) {
+      // Real providers reject once the call's abortSignal fires.
+      throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    }
     const result = this.generateResults.shift();
     if (result === undefined) {
       throw new Error('MockLanguageModel: no generate responses left');
@@ -102,8 +105,10 @@ export class MockLanguageModel implements LanguageModelV4 {
 
   // Queue an Error here to make doStream itself reject (after a tick) instead of returning a stream.
   streamCallErrors: Error[] = [];
+  // Counts model-stream cancellations (the middleware tearing down the provider connection).
+  streamCancellations = 0;
 
-  async doStream(_options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
+  async doStream(options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
     this.streamCalls++;
     const callError = this.streamCallErrors.shift();
     if (callError) {
@@ -118,22 +123,83 @@ export class MockLanguageModel implements LanguageModelV4 {
     return {
       stream: new ReadableStream<LanguageModelV4StreamPart>({
         async start(controller) {
-          for (const part of parts) {
-            if (part instanceof Error) {
-              // Stream-level failure: reads reject, unlike an 'error' part.
-              controller.error(part);
-              return;
+          try {
+            for (const part of parts) {
+              if (options.abortSignal?.aborted) {
+                // Real providers reject reads once the call's abortSignal fires.
+                controller.error(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+                return;
+              }
+              if (typeof part === 'function') {
+                await part();
+                continue;
+              }
+              if (part instanceof Error) {
+                // Stream-level failure: reads reject, unlike an 'error' part.
+                controller.error(part);
+                return;
+              }
+              controller.enqueue(part);
+              // Yield to the event loop so parts arrive asynchronously, as from a network.
+              await new Promise((resolve) => setImmediate(resolve));
             }
-            controller.enqueue(part);
-            // Yield to the event loop so parts arrive asynchronously, as from a network.
-            await new Promise((resolve) => setImmediate(resolve));
+            controller.close();
+          } catch {
+            // Cancelled mid-emission: enqueue/close throw once the stream is torn down.
           }
-          controller.close();
+        },
+        cancel: () => {
+          this.streamCancellations++;
         },
       }),
       request: { body: 'mock-request' },
       response: { headers: { 'x-mock': '1' } },
     };
+  }
+}
+
+// Streams deltas, then—once the consumer aborts—emits one more buffered part before tearing down after a
+// short latency. That late part unblocks streamText early, so the consumer detaches while the durable stream
+// step is still checkpointing: the setup for the sequential-follow-up race against the concurrency guard.
+export class MockLateAbortStreamModel implements LanguageModelV4 {
+  readonly specificationVersion = 'v4';
+  readonly provider = 'mock';
+  readonly modelId = 'mock-model';
+  readonly supportedUrls: Record<string, RegExp[]> = {};
+  generateResults: LanguageModelV4GenerateResult[] = [];
+  teardownMs = 20;
+
+  async doGenerate(): Promise<LanguageModelV4GenerateResult> {
+    const result = this.generateResults.shift();
+    if (result === undefined) throw new Error('MockLateAbortStreamModel: no generate responses left');
+    return result;
+  }
+
+  async doStream(options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
+    const teardownMs = this.teardownMs;
+    const stream = new ReadableStream<LanguageModelV4StreamPart>({
+      async start(controller) {
+        const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+        try {
+          controller.enqueue({ type: 'stream-start', warnings: [] });
+          controller.enqueue({ type: 'text-start', id: 't1' });
+          for (let i = 0; i < 100; i++) {
+            if (options.abortSignal?.aborted) {
+              controller.enqueue({ type: 'text-delta', id: 't1', delta: 'late' });
+              await sleep(teardownMs);
+              controller.error(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+              return;
+            }
+            controller.enqueue({ type: 'text-delta', id: 't1', delta: `d${i}` });
+            await sleep(2);
+          }
+          controller.close();
+        } catch {
+          // Torn down mid-emission.
+        }
+      },
+    });
+    return { stream };
   }
 }
 
@@ -167,16 +233,25 @@ export class MockImageModel implements ImageModelV4 {
   readonly specificationVersion = 'v4';
   readonly provider = 'mock';
   readonly modelId = 'mock-image';
-  readonly maxImagesPerCall = 1; // forces generateImage to split n>1 into parallel batches
+  readonly maxImagesPerCall: number;
 
   generateCalls = 0;
+  // Queue an images array to override the default bytes (e.g. a spec-violating mixed string/bytes batch).
+  imageOverrides: (string | Uint8Array)[][] = [];
+
+  // The default of 1 forces generateImage to split n>1 into parallel batches.
+  constructor(maxImagesPerCall = 1) {
+    this.maxImagesPerCall = maxImagesPerCall;
+  }
 
   async doGenerate(options: ImageModelV4CallOptions): Promise<ImageModelV4Result> {
     this.generateCalls++;
     // Tag each generated image with this call's ordinal so a reordering on replay is detectable.
-    const images = Array.from({ length: options.n }, () => new Uint8Array([...IMAGE_BYTES, this.generateCalls]));
+    const images =
+      this.imageOverrides.shift() ??
+      Array.from({ length: options.n }, () => new Uint8Array([...IMAGE_BYTES, this.generateCalls]));
     return {
-      images,
+      images: images as ImageModelV4Result['images'],
       warnings: [],
       response: { timestamp: new Date('2026-07-02T12:00:00Z'), modelId: 'mock-image', headers: {} },
     };

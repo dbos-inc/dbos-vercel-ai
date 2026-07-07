@@ -19,13 +19,18 @@ function isAbortError(error: unknown): boolean {
 
 // AI SDK errors (APICallError, GatewayError) expose an isRetryable flag; treat an explicit false, and any abort, as terminal.
 function isNonRetryable(error: unknown): boolean {
-  return (
-    isAbortError(error) ||
-    (typeof error === 'object' &&
-      error !== null &&
-      'isRetryable' in error &&
-      (error as { isRetryable?: unknown }).isRetryable === false)
-  );
+  try {
+    return (
+      isAbortError(error) ||
+      (typeof error === 'object' &&
+        error !== null &&
+        'isRetryable' in error &&
+        (error as { isRetryable?: unknown }).isRetryable === false)
+    );
+  } catch {
+    // A throwing accessor must not replace the step's real error; treat as retryable.
+    return false;
+  }
 }
 
 // Default to DBOS-owned retries so a transient provider error is absorbed inside one step (never checkpointed as an
@@ -38,3 +43,4 @@ export function withErrorClassification(options: StepConfig): StepConfig {
     shouldRetry: options.shouldRetry ?? ((error: unknown) => !isNonRetryable(error)),
   };
 }
+
