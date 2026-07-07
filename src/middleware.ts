@@ -139,6 +139,8 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             let sawFinish = false;
             const abandon = () => void reader?.cancel().catch(() => {});
             timeoutSignal?.addEventListener('abort', abandon, { once: true });
+            // A consumer abort detaches this call; stop draining now so the checkpoint lands promptly and matches what streamed.
+            params.abortSignal?.addEventListener('abort', abandon, { once: true });
             try {
               streamResult = await doStream();
               reader = streamResult.stream.getReader();
@@ -165,6 +167,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
               if (!cancelled && !aborted()) throw error;
             } finally {
               timeoutSignal?.removeEventListener('abort', abandon);
+              params.abortSignal?.removeEventListener('abort', abandon);
               // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
               void reader?.cancel().catch(() => {});
             }
