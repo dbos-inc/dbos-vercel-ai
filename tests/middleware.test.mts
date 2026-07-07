@@ -38,6 +38,7 @@ import {
   RichMockMCPClient,
   textResponse,
   textResponseNoMetadata,
+  textResponseNullMetadata,
   textStreamParts,
   textStreamPartsNoMetadata,
   toolCallResponse,
@@ -1876,12 +1877,21 @@ test('a retryable APICallError in generateImage keeps its identity on replay', a
 test('restoreAISDKErrorIdentity does not let a failed marker assignment replace the error', () => {
   // A frozen/non-extensible AI SDK error would throw on the symbol assignment under strict mode; a throwing set trap
   // reproduces that deterministically (tsx runs the CJS source sloppily, where a frozen assignment silently no-ops).
-  const trapped = new Proxy(Object.assign(new Error('boom'), { name: 'AI_APICallError' }), {
+  const assignThrows = new Proxy(Object.assign(new Error('boom'), { name: 'AI_APICallError' }), {
     set() {
       throw new TypeError('read only');
     },
   });
-  assert.equal(restoreAISDKErrorIdentity(trapped), trapped); // returns the error, does not throw
+  assert.equal(restoreAISDKErrorIdentity(assignThrows), assignThrows); // returns the error, does not throw
+
+  // A throwing `name` getter must also not escape (the read happens before the symbol assignments).
+  const readThrows = new Error('boom');
+  Object.defineProperty(readThrows, 'name', {
+    get() {
+      throw new Error('name getter boom');
+    },
+  });
+  assert.equal(restoreAISDKErrorIdentity(readThrows), readThrows);
 });
 
 test('generateText response id/timestamp stay stable across replay when the provider omits them', async () => {
@@ -1914,6 +1924,19 @@ test('streamText response id/timestamp stay stable across replay when the provid
   assert.equal(replayed.id, live.id);
   assert.equal(replayed.timestamp, live.timestamp);
   assert.equal(idStreamMock.streamCalls, 1); // model not re-called on replay
+});
+
+test('generateText response id/timestamp stay stable across replay when the provider returns null metadata', async () => {
+  idGenMock.generateResults.push(textResponseNullMetadata('hi'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(idGenWorkflow, { workflowID })();
+  const live = await handle.getResult();
+  assert.ok(live.id && live.timestamp, 'response id/timestamp were populated');
+  // Before the `!= null` guard, ensureResponseMetadata skipped a null id/timestamp, so the AI SDK regenerated on replay.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof idGenWorkflow>>(workflowID, 1);
+  const replayed = await forked.getResult();
+  assert.equal(replayed.id, live.id);
+  assert.equal(replayed.timestamp, live.timestamp);
 });
 
 // Keep this test last: it shuts down and relaunches DBOS mid-suite.

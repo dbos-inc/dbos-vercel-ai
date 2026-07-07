@@ -52,6 +52,17 @@ export function textResponseNoMetadata(text: string): LanguageModelV4GenerateRes
   return { content: [{ type: 'text', text }], finishReason: finishReason(), usage: usage(), warnings: [] };
 }
 
+// A non-conforming provider returning null (not undefined) id/timestamp; the AI SDK's `?? generateId()` treats null as missing.
+export function textResponseNullMetadata(text: string): LanguageModelV4GenerateResult {
+  return {
+    content: [{ type: 'text', text }],
+    finishReason: finishReason(),
+    usage: usage(),
+    warnings: [],
+    response: { id: null, timestamp: null, modelId: null } as unknown as LanguageModelV4GenerateResult['response'],
+  };
+}
+
 export function toolCallResponse(toolName: string, input: string): LanguageModelV4GenerateResult {
   return contentResponse(
     [{ type: 'tool-call', toolCallId: 'call-1', toolName, input }],

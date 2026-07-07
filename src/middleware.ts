@@ -308,7 +308,8 @@ function toStepError(error: unknown): Error {
 // them, so they'd differ on every replay. Populate them here (checkpointed once) so that fallback never runs.
 function ensureResponseMetadata(result: LanguageModelV4GenerateResult): LanguageModelV4GenerateResult {
   const response = result.response;
-  if (response?.id !== undefined && response?.timestamp !== undefined) {
+  // Match the AI SDK's `?? generateId()` fallback (nullish, not just undefined): a null id would regenerate too.
+  if (response?.id != null && response?.timestamp != null) {
     return result;
   }
   return {
@@ -428,7 +429,8 @@ class StreamAccumulator {
   // Fill any missing response id/timestamp so the checkpoint carries them; returns the response-metadata part to
   // emit live (or undefined if the provider already supplied both). replayParts re-emits it from the checkpoint.
   fillResponseMetadata(id: string, timestamp: Date): LanguageModelV4StreamPart | undefined {
-    if (this.responseMetadata?.id !== undefined && this.responseMetadata?.timestamp !== undefined) {
+    // Nullish check to match the AI SDK's `?? generateId()` fallback (a null id/timestamp would regenerate too).
+    if (this.responseMetadata?.id != null && this.responseMetadata?.timestamp != null) {
       return undefined;
     }
     this.responseMetadata = {

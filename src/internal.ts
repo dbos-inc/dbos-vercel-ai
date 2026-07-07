@@ -37,15 +37,18 @@ function isNonRetryable(error: unknown): boolean {
 // The markers derive from error.name (which survives), so re-attach them; no @ai-sdk/provider/@ai-sdk/gateway import.
 // AISDKError (APICallError, ...) and GatewayError use distinct marker namespaces — ai's retry predicate checks both.
 export function restoreAISDKErrorIdentity(error: unknown): unknown {
-  const name = (error as { name?: unknown } | null)?.name;
-  if (error === null || typeof error !== 'object' || typeof name !== 'string') return error;
-  const base = name.startsWith('AI_') ? 'vercel.ai.error' : name.startsWith('Gateway') ? 'vercel.ai.gateway.error' : undefined;
-  if (base === undefined) return error;
+  // Wrap the whole body: identity restoration must never replace or mask the real error (a frozen/non-extensible
+  // error throws on assignment, a throwing `name` getter throws on read) — on failure, return the error untouched.
   try {
-    (error as Record<symbol, unknown>)[Symbol.for(base)] = true;
-    (error as Record<symbol, unknown>)[Symbol.for(`${base}.${name}`)] = true;
+    const name = (error as { name?: unknown } | null)?.name;
+    if (error === null || typeof error !== 'object' || typeof name !== 'string') return error;
+    const base = name.startsWith('AI_') ? 'vercel.ai.error' : name.startsWith('Gateway') ? 'vercel.ai.gateway.error' : undefined;
+    if (base !== undefined) {
+      (error as Record<symbol, unknown>)[Symbol.for(base)] = true;
+      (error as Record<symbol, unknown>)[Symbol.for(`${base}.${name}`)] = true;
+    }
   } catch {
-    // A frozen/non-extensible error must not be replaced by the assignment's TypeError; leave it as-is.
+    // Fall through and return the error as-is.
   }
   return error;
 }
