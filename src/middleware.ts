@@ -19,7 +19,7 @@ import type {
   SharedV4ProviderMetadata,
   SharedV4Warning,
 } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
-import { assertNotInTransaction, isInWorkflowFunction, withErrorClassification } from './internal';
+import { assertNotInTransaction, isInWorkflowFunction, restoreAISDKErrorIdentity, withErrorClassification } from './internal';
 
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
@@ -67,6 +67,9 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'generate'),
         });
+      } catch (error) {
+        // Restore the AI SDK error identity a replay revival strips, so the SDK's retry/catch logic behaves the same.
+        throw restoreAISDKErrorIdentity(error);
       } finally {
         exitDurableModelCall(workflowID);
       }
@@ -201,7 +204,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             controller.close();
           },
           (error: unknown) => {
-            if (!cancelled) controller.error(error);
+            if (!cancelled) controller.error(restoreAISDKErrorIdentity(error));
           },
         )
         .finally(releaseGuard);
@@ -227,6 +230,8 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelM
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'embed'),
         });
+      } catch (error) {
+        throw restoreAISDKErrorIdentity(error);
       } finally {
         exitDurableModelCall(workflowID);
       }
@@ -248,10 +253,14 @@ export function durableImageCalls(options: StepConfig = {}): ImageModelMiddlewar
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
-      return await DBOS.runStep(async () => encodeImageResult(await doGenerate()), {
-        ...stepConfig,
-        name: stepConfig.name ?? stepName(model, 'image'),
-      });
+      try {
+        return await DBOS.runStep(async () => encodeImageResult(await doGenerate()), {
+          ...stepConfig,
+          name: stepConfig.name ?? stepName(model, 'image'),
+        });
+      } catch (error) {
+        throw restoreAISDKErrorIdentity(error);
+      }
     },
   };
 }

@@ -33,6 +33,17 @@ function isNonRetryable(error: unknown): boolean {
   }
 }
 
+// serialize-error drops the Symbol-keyed AI SDK error markers on replay, so APICallError.isInstance() fails on the
+// revived error. The markers derive from error.name (which survives), so re-attach them; no @ai-sdk/provider import.
+export function restoreAISDKErrorIdentity(error: unknown): unknown {
+  const name = (error as { name?: unknown } | null)?.name;
+  if (error !== null && typeof error === 'object' && typeof name === 'string' && name.startsWith('AI_')) {
+    (error as Record<symbol, unknown>)[Symbol.for('vercel.ai.error')] = true;
+    (error as Record<symbol, unknown>)[Symbol.for(`vercel.ai.error.${name}`)] = true;
+  }
+  return error;
+}
+
 // Default to DBOS-owned retries so a transient provider error is absorbed inside one step (never checkpointed as an
 // error that replay would re-run); the default shouldRetry skips provider-declared non-retryable errors and aborts.
 // A caller's retriesAllowed/shouldRetry wins, but an explicit `undefined` falls back to the default.

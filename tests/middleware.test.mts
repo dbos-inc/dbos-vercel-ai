@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { DBOS } from '@dbos-inc/dbos-sdk';
+import { APICallError } from '@ai-sdk/provider';
 import { Client as PgClient } from 'pg';
 import {
   asSchema,
@@ -203,6 +204,17 @@ const errorWorkflow = DBOS.registerWorkflow(
     return result.text;
   },
   { name: 'errorWorkflow' },
+);
+
+// retriesAllowed: false delegates retries to the AI SDK, so a transient error checkpoints (rather than being
+// absorbed inside the step) and the AI SDK's own retry — which keys off APICallError.isInstance — runs across it.
+const identityMock = new MockLanguageModel();
+const identityModel = wrapLanguageModel({ model: identityMock, middleware: durableCalls({ retriesAllowed: false }) });
+
+const identityWorkflow = DBOS.registerWorkflow(
+  // No maxRetries: 0 here, so the AI SDK's retry layer is active.
+  async () => (await generateText({ model: identityModel, prompt: 'hi' })).text,
+  { name: 'identityWorkflow' },
 );
 
 const fileMock = new MockLanguageModel();
@@ -1696,6 +1708,31 @@ test('a throwing isRetryable accessor does not replace the step error or disable
     return true;
   });
   assert.equal(evilRetryMock.generateCalls, 2); // classified retryable → retried to maxAttempts
+});
+
+test('a retryable APICallError checkpointed under retriesAllowed:false keeps its AI SDK identity on replay', async () => {
+  const apiError = new APICallError({
+    message: 'service unavailable',
+    url: 'https://mock/api',
+    requestBodyValues: {},
+    statusCode: 503,
+    isRetryable: true,
+  });
+  // call 1 (live) fails and checkpoints an error; call 2 (live) and call 3 (fork replay) succeed.
+  identityMock.generateResults.push(apiError, textResponse('recovered'), textResponse('recovered'));
+
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(identityWorkflow, { workflowID })();
+  // Live: DBOS records the error at step 0 (no DBOS retry); the AI SDK's own retry re-runs the model call at step 1.
+  assert.equal(await handle.getResult(), 'recovered');
+  assert.equal(identityMock.generateCalls, 2);
+
+  // Fork past the errored step 0 so the error checkpoint is revived on replay. Before the fix, serialize-error
+  // strips the AI SDK Symbol marker → APICallError.isInstance() is false → the AI SDK does not retry → the
+  // workflow throws where the live run succeeded. With the marker restored, replay retries into the step-1 success.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof identityWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 'recovered');
+  assert.equal(identityMock.generateCalls, 3);
 });
 
 // Keep this test last: it shuts down and relaunches DBOS mid-suite.
