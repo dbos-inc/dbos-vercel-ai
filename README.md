@@ -2,13 +2,13 @@
 
 [DBOS](https://docs.dbos.dev/) durable execution for the [Vercel AI SDK](https://ai-sdk.dev/).
 
-This package makes AI SDK **agents** durable.
+This package makes AI SDK **agents** durable, backed by your Postgres database.
 All you have to do is wrap your model with `durableCalls` and run your generation inside a DBOS workflow.
 Then, this integration automatically checkpoints every action your agents take in Postgres.
 If your process crashes mid-agent, DBOS replays the completed steps from their checkpoints and the agent resumes exactly where it left off.
 
-This integration works as standard AI SDK [middleware](https://ai-sdk.dev/docs/ai-sdk-core/middleware), so you keep your provider, your model configuration, and the familiar `generateText` / `streamText` API.
-The durability is transparent to your agent code.
+This package is implemented as standard AI SDK [middleware](https://ai-sdk.dev/docs/ai-sdk-core/middleware), so you keep your provider, your model configuration, and the familiar APIs like `generateText`, `streamText`, and `ToolLoopAgent`.
+Durability is transparent to your agent code.
 
 ```ts
 import { DBOS } from '@dbos-inc/dbos-sdk';
@@ -45,14 +45,14 @@ console.log(await researchAgent('Why did the agent cross the road?'));
 npm install @dbos-inc/vercel-ai @dbos-inc/dbos-sdk ai
 ```
 
-Requires `ai` v7+ and a Postgres database for DBOS.
+Requires AI SDK v7+ and a Postgres database for DBOS.
 
 ## How it works
 
-Running an agent inside a DBOS workflow makes three things durable:
+When an agent runs inside a DBOS workflow, DBOS makes three things durable:
 
-- **Every model call.** `durableCalls()` is AI SDK middleware that intercepts `doGenerate`/`doStream` and runs each call through [`DBOS.runStep`](https://docs.dbos.dev/typescript/tutorials/step-tutorial). The complete result (content, usage, finish reason, response metadata) is checkpointed in Postgres; on recovery, a completed call returns its recorded result without contacting the model.
-- **The agent loop.** Because the workflow re-executes deterministically on recovery and each model call replays from its checkpoint, a multi-step, tool-calling agent resumes from the first unfinished step instead of restarting from the beginning.
+- **Every model call.** `durableCalls()` is AI SDK middleware that intercepts `doGenerate`/`doStream` and runs each call through [`DBOS.runStep`](https://docs.dbos.dev/typescript/tutorials/step-tutorial). The complete result (content, usage, finish reason, response metadata) is checkpointed in Postgres. On recovery, completed calls replay from their checkpoints without contacting the model provider.
+- **The agent loop.** Because DBOS workflows replay deterministically on recovery and each model call replays from its checkpoint, a multi-step, tool-calling agent resumes from the first unfinished step instead of restarting from the beginning.
 - **Tool calls.** MCP tools (via [`durableMCPTools`](#mcp-tools)) are checkpointed automatically. Your own tools' side effects are durable when you wrap their `execute` in `DBOS.runStep` (see [Tools](#tools)).
 
 Outside a workflow (or inside another step) the wrapped model calls the provider directly with no checkpointing, so the same model works anywhere in your app.
@@ -79,15 +79,23 @@ Because DBOS owns retries by default, pass `maxRetries: 0` to the AI SDK call so
 
 ## Streaming
 
-You can stream model responses in a workflow with `streamText`.
-When streaming model output in a workflow, only the final output is checkpointed, not individual deltas.
+You can stream durable model responses inside a workflow with `streamText`.
+During streaming, DBOS checkpoints only the final completed output, not individual deltas.
 As a consequence:
 
-- You can safely forward streamed deltas to a UI or print them to a terminal, but you should not perform durable actions on them. Run your own durable steps on the complete result, after the stream ends. Tool calls the AI SDK makes during the stream are already safe: they run only after the model call is checkpointed.
-- Do not break out of a stream before it is complete. To stop early, either drain the stream (`await result.consumeStream()`) or abort it.
-- To abort, pass an `abortSignal` to `streamText` and fire it. The output streamed so far is checkpointed as the call's durable result. After an abort, use the deltas you collected.
+- You can safely forward streamed deltas to a UI or terminal, but you should not perform durable steps on them because model responses are not resumable. Instead, run your own durable steps on the complete result (`result.text`) after the stream ends. Tool calls performed by the AI SDK during streaming are already durable because they execute after the model call has been checkpointed.
+- Do not exit a stream before it completes. To stop reading early, either drain the stream (`await result.consumeStream()`) or abort it.
+- To abort early, pass an `abortSignal` to `streamText` and fire it. The output streamed so far becomes the durable result for that model call.
 
 ```ts
+import { streamText } from 'ai';
+import { durableCalls } from '@dbos-inc/vercel-ai';
+
+const model = wrapLanguageModel({
+  model: openai('gpt-5'),
+  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 5 }),
+});
+
 const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
   const result = streamText({ model, prompt });
   for await (const delta of result.textStream) {
