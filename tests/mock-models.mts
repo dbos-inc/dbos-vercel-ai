@@ -227,6 +227,8 @@ export class MockEmbeddingModel implements EmbeddingModelV4 {
   readonly supportsParallelCalls = true;
 
   embedCalls = 0;
+  // Queue an Error to fail that doEmbed call (undefined entries pass through to a normal embedding).
+  errors: (Error | undefined)[] = [];
 
   // A finite maxEmbeddingsPerCall makes embedMany split large inputs into batches (parallel by default).
   constructor(maxEmbeddingsPerCall?: number) {
@@ -235,6 +237,8 @@ export class MockEmbeddingModel implements EmbeddingModelV4 {
 
   async doEmbed(options: EmbeddingModelV4CallOptions): Promise<EmbeddingModelV4Result> {
     this.embedCalls++;
+    const error = this.errors.shift();
+    if (error) throw error;
     return {
       embeddings: options.values.map((_, i) => [i, i + 0.5, i + 0.25]),
       usage: { tokens: options.values.length * 3 },
@@ -254,6 +258,8 @@ export class MockImageModel implements ImageModelV4 {
   generateCalls = 0;
   // Queue an images array to override the default bytes (e.g. a spec-violating mixed string/bytes batch).
   imageOverrides: (string | Uint8Array)[][] = [];
+  // Queue an Error to fail that doGenerate call (undefined entries pass through to a normal image).
+  errors: (Error | undefined)[] = [];
 
   // The default of 1 forces generateImage to split n>1 into parallel batches.
   constructor(maxImagesPerCall = 1) {
@@ -262,6 +268,8 @@ export class MockImageModel implements ImageModelV4 {
 
   async doGenerate(options: ImageModelV4CallOptions): Promise<ImageModelV4Result> {
     this.generateCalls++;
+    const error = this.errors.shift();
+    if (error) throw error;
     // Tag each generated image with this call's ordinal so a reordering on replay is detectable.
     const images =
       this.imageOverrides.shift() ??

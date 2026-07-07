@@ -177,8 +177,9 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             }
             // Give the response a durable id/timestamp when the provider sent none, and emit it live (before the
             // withheld 'finish') so the SDK sees the same values live and on replay instead of a fresh fallback.
+            // Skip the live emit for a timed-out (abandoned) attempt so it can't interleave with its retry.
             const responseMetadataPart = accumulator.fillResponseMetadata(randomUUID(), new Date());
-            if (responseMetadataPart) emit(responseMetadataPart);
+            if (responseMetadataPart && !timeoutSignal?.aborted) emit(responseMetadataPart);
             return encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
           },
           { ...streamStepConfig, name: stepConfig.name ?? stepName(model, 'stream') },

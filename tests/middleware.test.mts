@@ -3,9 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { APICallError } from '@ai-sdk/provider';
+import { GatewayRateLimitError } from '@ai-sdk/gateway';
 import { Client as PgClient } from 'pg';
 import {
   asSchema,
+  embed,
   embedMany,
   generateImage,
   generateText,
@@ -24,6 +26,7 @@ import {
   durableMCPTools,
   type MCPClientLike,
 } from '../src/index.js';
+import { restoreAISDKErrorIdentity } from '../src/internal.js';
 import {
   contentResponse,
   IMAGE_BYTES,
@@ -217,6 +220,30 @@ const identityWorkflow = DBOS.registerWorkflow(
   // No maxRetries: 0 here, so the AI SDK's retry layer is active.
   async () => (await generateText({ model: identityModel, prompt: 'hi' })).text,
   { name: 'identityWorkflow' },
+);
+
+// GatewayError (from the Vercel AI Gateway) is the OTHER half of the AI SDK's retry predicate; its markers use a
+// different namespace than APICallError, so restoreAISDKErrorIdentity must handle it too.
+const gatewayMock = new MockLanguageModel();
+const gatewayModel = wrapLanguageModel({ model: gatewayMock, middleware: durableCalls({ retriesAllowed: false }) });
+const gatewayWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: gatewayModel, prompt: 'hi' })).text,
+  { name: 'gatewayWorkflow' },
+);
+
+// Embed and image share generate's APICallError-keyed retry, so their restore wiring needs the same replay coverage.
+const embedIdentityMock = new MockEmbeddingModel();
+const embedIdentityModel = wrapEmbeddingModel({ model: embedIdentityMock, middleware: durableEmbeddingCalls({ retriesAllowed: false }) });
+const embedIdentityWorkflow = DBOS.registerWorkflow(
+  async () => (await embed({ model: embedIdentityModel, value: 'hi' })).embedding.length,
+  { name: 'embedIdentityWorkflow' },
+);
+
+const imageIdentityMock = new MockImageModel();
+const imageIdentityModel = wrapImageModel({ model: imageIdentityMock, middleware: durableImageCalls({ retriesAllowed: false }) });
+const imageIdentityWorkflow = DBOS.registerWorkflow(
+  async () => (await generateImage({ model: imageIdentityModel, prompt: 'draw' })).images.length,
+  { name: 'imageIdentityWorkflow' },
 );
 
 // Providers that omit response metadata: the middleware must give the response a durable id/timestamp so the AI
@@ -1761,6 +1788,60 @@ test('a retryable APICallError checkpointed under retriesAllowed:false keeps its
   const forked = await DBOS.forkWorkflow<ReturnType<typeof identityWorkflow>>(workflowID, 1);
   assert.equal(await forked.getResult(), 'recovered');
   assert.equal(identityMock.generateCalls, 3);
+});
+
+test('a retryable GatewayError checkpointed under retriesAllowed:false keeps its identity on replay', async () => {
+  // The gateway provider throws GatewayError (not APICallError) for retryable failures; its markers use a different
+  // namespace, so this only passes once restoreAISDKErrorIdentity handles the gateway family too.
+  const gatewayError = new GatewayRateLimitError({ message: 'rate limited', statusCode: 429 });
+  assert.equal(gatewayError.isRetryable, true);
+  gatewayMock.generateResults.push(gatewayError, textResponse('recovered'), textResponse('recovered'));
+
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(gatewayWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'recovered');
+  assert.equal(gatewayMock.generateCalls, 2);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof gatewayWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 'recovered');
+  assert.equal(gatewayMock.generateCalls, 3);
+});
+
+test('a retryable APICallError in embed keeps its identity on replay', async () => {
+  const apiError = new APICallError({ message: 'unavailable', url: 'https://mock/api', requestBodyValues: {}, statusCode: 503, isRetryable: true });
+  embedIdentityMock.errors.push(apiError); // call 1 fails; call 2 (live) and call 3 (fork) pass through to a normal embedding
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(embedIdentityWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 3); // embedding length
+  assert.equal(embedIdentityMock.embedCalls, 2);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof embedIdentityWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 3);
+  assert.equal(embedIdentityMock.embedCalls, 3);
+});
+
+test('a retryable APICallError in generateImage keeps its identity on replay', async () => {
+  const apiError = new APICallError({ message: 'unavailable', url: 'https://mock/api', requestBodyValues: {}, statusCode: 503, isRetryable: true });
+  imageIdentityMock.errors.push(apiError);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(imageIdentityWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 1); // one image
+  assert.equal(imageIdentityMock.generateCalls, 2);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof imageIdentityWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 1);
+  assert.equal(imageIdentityMock.generateCalls, 3);
+});
+
+test('restoreAISDKErrorIdentity does not let a failed marker assignment replace the error', () => {
+  // A frozen/non-extensible AI SDK error would throw on the symbol assignment under strict mode; a throwing set trap
+  // reproduces that deterministically (tsx runs the CJS source sloppily, where a frozen assignment silently no-ops).
+  const trapped = new Proxy(Object.assign(new Error('boom'), { name: 'AI_APICallError' }), {
+    set() {
+      throw new TypeError('read only');
+    },
+  });
+  assert.equal(restoreAISDKErrorIdentity(trapped), trapped); // returns the error, does not throw
 });
 
 test('generateText response id/timestamp stay stable across replay when the provider omits them', async () => {
