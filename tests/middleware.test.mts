@@ -1741,27 +1741,28 @@ test('a timed-out (abandoned) stream attempt stops emitting and cannot interleav
   assert.equal(timeoutStreamMock.streamCalls, 2);
 });
 
-test('aborting mid-stream checkpoints the partial output as a success and replays gracefully', async () => {
+test('a provider that rejects reads once its signal fires never sees the abort, so the checkpoint is complete', async () => {
   abortStreamMock.streamPartLists.push(textStreamParts(['a', 'b', 'c', 'd', 'e']));
   const workflowID = randomUUID();
   const handle = await DBOS.startWorkflow(abortStreamWorkflow, { workflowID })();
   // The AI SDK ends an aborted stream gracefully, so the live workflow completes.
   const original = await handle.getResult();
-  assert.ok(original.length >= 2, `expected partial deltas, got ${original.length}`);
+  assert.ok(original.length >= 2, `expected at least the pre-abort deltas, got ${original.length}`);
   assert.equal(abortStreamMock.streamCalls, 1); // an abort is never retried
 
-  // The step must record the partial output as a success, not the post-abort AbortError.
+  // Before the fix the signal reached the provider, which failed the read, and that partial became the durable result.
+  for (let i = 0; i < 500 && !(await DBOS.listWorkflowSteps(workflowID))?.some((s) => s.name === 'mock.mock-model.stream'); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   const { step, output } = await recordedStreamStep(workflowID);
   assert.equal(step.error, null);
-  const recordedText = output.content[0]!.text!;
-  assert.ok(recordedText.length >= 2 && recordedText.length < 5, `expected a partial checkpoint, got "${recordedText}"`);
-  assert.ok('abcde'.startsWith(recordedText));
+  assert.equal(output.content[0]!.text, 'abcde');
+  assert.equal(output.finishReason.unified, 'stop');
 
-  // Fork past the stream step: before the fix the checkpoint was an AbortError and replay threw where the live run completed (the replayed execution's signal isn't aborted, so ai treats it as a hard error).
+  // Fork past the stream step: replay delivers the checkpointed content as one delta per block; no abort fires.
   const forked = await DBOS.forkWorkflow<ReturnType<typeof abortStreamWorkflow>>(workflowID, 1);
   const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof abortStreamWorkflow>>;
-  // Replay delivers the checkpointed partial content as one delta per block; no abort fires.
-  assert.equal(replayed.join(''), recordedText);
+  assert.equal(replayed.join(''), 'abcde');
   assert.equal(abortStreamMock.streamCalls, 1);
 });
 

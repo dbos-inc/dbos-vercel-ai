@@ -25,6 +25,9 @@ import { assertNotInTransaction, isInWorkflowFunction, restoreAISDKErrorIdentity
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
 
+// Consumer abort signals withheld from the provider inside a workflow, keyed by the transformed params wrapStream receives.
+const detachedAbortSignals = new WeakMap<object, AbortSignal>();
+
 function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed'): string {
   const workflowID = DBOS.workflowID!;
   const inflight = inflightModelCalls.get(workflowID) ?? 0;
@@ -57,6 +60,20 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
   return {
     specificationVersion: 'v4',
 
+    // A consumer abort (a stop button, an AI SDK timeout, a shutting-down worker) must not cut a durable stream short:
+    // the truncated output would be checkpointed as the step's permanent result and replayed on recovery as the whole
+    // answer. Withhold the signal from the provider so the call records a complete result; keep it here for the guard.
+    // Generate is left alone: an aborted doGenerate rejects (nothing partial to record), and the AI SDK's tool loop
+    // relies on that rejection to stop — stripping it there would let the loop keep calling the model after an abort.
+    transformParams: async ({ params, type }) => {
+      if (type !== 'stream' || !isInWorkflowFunction() || !params.abortSignal) {
+        return params;
+      }
+      const { abortSignal, ...rest } = params;
+      detachedAbortSignals.set(rest, abortSignal);
+      return rest;
+    },
+
     wrapGenerate: async ({ doGenerate, model }) => {
       assertNotInTransaction('generate');
       if (!isInWorkflowFunction()) {
@@ -82,8 +99,10 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         return await doStream();
       }
       const workflowID = enterDurableModelCall('stream');
+      // The consumer's signal, detached from the provider call by transformParams (undefined outside a workflow).
+      const abortSignal = detachedAbortSignals.get(params);
       // An aborted consumer is done with this call, like a cancelled one: post-abort failures must checkpoint as a (partial) success, or replay would fail where the live run ended gracefully.
-      const aborted = () => params.abortSignal?.aborted === true;
+      const aborted = () => abortSignal?.aborted === true;
 
       // Free the concurrency guard as soon as the consumer detaches (abort/cancel), not only when the step
       // settles: this call's step is already sequenced, so a sequential follow-up in the same workflow is
@@ -92,10 +111,10 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       const releaseGuard = () => {
         if (guardReleased) return;
         guardReleased = true;
-        params.abortSignal?.removeEventListener('abort', releaseGuard);
+        abortSignal?.removeEventListener('abort', releaseGuard);
         exitDurableModelCall(workflowID);
       };
-      params.abortSignal?.addEventListener('abort', releaseGuard, { once: true });
+      abortSignal?.addEventListener('abort', releaseGuard, { once: true });
 
       let executed = false;
       let cancelled = false;
@@ -143,8 +162,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             let sawFinish = false;
             const abandon = () => void reader?.cancel().catch(() => {});
             timeoutSignal?.addEventListener('abort', abandon, { once: true });
-            // A consumer abort detaches this call; stop draining now so the checkpoint lands promptly and matches what streamed.
-            params.abortSignal?.addEventListener('abort', abandon, { once: true });
+            // A consumer abort deliberately does not abandon the drain: the step keeps reading so the checkpoint is complete.
             try {
               streamResult = await doStream();
               reader = streamResult.stream.getReader();
@@ -171,7 +189,6 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
               if (!cancelled && !aborted()) throw error;
             } finally {
               timeoutSignal?.removeEventListener('abort', abandon);
-              params.abortSignal?.removeEventListener('abort', abandon);
               // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
               void reader?.cancel().catch(() => {});
             }
