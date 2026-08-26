@@ -85,7 +85,8 @@ As a consequence:
 
 - You can safely forward streamed deltas to a UI or terminal, but you should not perform durable steps on them because model responses are not resumable. Instead, run your own durable steps on the complete result (`result.text`) after the stream ends. Tool calls performed by the AI SDK during streaming are already durable because they execute after the model call has been checkpointed.
 - Do not exit a stream before it completes. To stop reading early, either drain the stream (`await result.consumeStream()`) or abort it.
-- To abort early, pass an `abortSignal` to `streamText` and fire it. The output streamed so far becomes the durable result for that model call.
+- To abort early, pass an `abortSignal` to `streamText` and fire it. The abort detaches your consumer, but inside a workflow it does not cut the model call short; the step keeps draining and checkpoints the complete response.
+- The AI SDK's own `timeout` option does not bound a durable model call, because its signal is an abort signal. Bound the call with the step's `timeoutMS` instead (`durableCalls({ timeoutMS })`), which DBOS tears down deterministically.
 
 ```ts
 import { streamText } from 'ai';
