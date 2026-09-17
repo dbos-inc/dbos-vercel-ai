@@ -176,8 +176,8 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
               // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
               void reader?.cancel().catch(() => {});
             }
-            // Record the abort as the step's failure, keeping the partial output so replay ends the stream where the live consumer saw it end.
-            if (aborted()) throw new AbortedStreamError(abortSignal!.reason, encodeBinaryContent(accumulator.result()).content);
+            // Record the abort as the step's failure; replay rethrows it, so the workflow must catch aborts it means to survive.
+            if (aborted()) throw toAbortError(abortSignal!.reason);
             // Give the response a durable id/timestamp when the provider sent none, and emit it live (before the
             // withheld 'finish') so the SDK sees the same values live and on replay instead of a fresh fallback.
             // Skip the live emit for a timed-out (abandoned) attempt so it can't interleave with its retry.
@@ -214,15 +214,8 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
           },
           (error: unknown) => {
             if (cancelled) return;
-            const partial = abortedStreamContent(error);
-            if (partial && !executed) {
-              // Replaying an aborted call: re-emit its partial output and end without a finish part, as the live consumer saw it.
-              for (const part of replayParts({ content: partial }, { finish: false })) emit(part);
-              controller.close();
-              return;
-            }
-            // Live: surface the real abort reason so the AI SDK takes its own abort path.
-            controller.error(partial ? (abortSignal?.reason ?? error) : restoreAISDKErrorIdentity(error));
+            // Live abort: surface the signal's own reason so the AI SDK takes its abort path; a replayed abort is an ordinary error.
+            controller.error(executed && aborted() ? (abortSignal?.reason ?? error) : restoreAISDKErrorIdentity(error));
           },
         )
         .finally(releaseGuard);
@@ -283,25 +276,10 @@ export function durableImageCalls(options: StepConfig = {}): ImageModelMiddlewar
   };
 }
 
-// Thrown by the stream step on a consumer abort: DBOS records it as the step's failure, and the partial content lets replay end the stream where the live consumer saw it end.
-class AbortedStreamError extends Error {
-  readonly abortedStream = true;
-  constructor(
-    reason: unknown,
-    readonly content: LanguageModelV4Content[],
-  ) {
-    const { name, message } = (reason ?? {}) as { name?: unknown; message?: unknown };
-    super(typeof message === 'string' ? message : String(reason));
-    this.name = typeof name === 'string' ? name : 'AbortError';
-  }
-}
-
-// The partial content carried by a (possibly revived) AbortedStreamError, or undefined for any other error.
-function abortedStreamContent(error: unknown): LanguageModelV4Content[] | undefined {
-  const candidate = error as { abortedStream?: unknown; content?: unknown } | null | undefined;
-  return candidate?.abortedStream === true && Array.isArray(candidate.content)
-    ? (candidate.content as LanguageModelV4Content[])
-    : undefined;
+// The abort reason as a recordable Error (an AbortSignal's reason may be any value); the name is what the AI SDK's abort checks read.
+function toAbortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  return Object.assign(new Error(String(reason)), { name: 'AbortError' });
 }
 
 /** Convert generated image bytes (Uint8Array) to base64 (spec-allowed) to keep checkpoints compact. */
@@ -512,10 +490,7 @@ class StreamAccumulator {
 }
 
 /** Synthesizes a stream from a checkpointed result on recovery; text/reasoning come back as one delta per block. */
-function* replayParts(
-  result: Pick<LanguageModelV4GenerateResult, 'content'> & Partial<LanguageModelV4GenerateResult>,
-  options: { finish: boolean } = { finish: true },
-): Generator<LanguageModelV4StreamPart> {
+function* replayParts(result: LanguageModelV4GenerateResult): Generator<LanguageModelV4StreamPart> {
   yield { type: 'stream-start', warnings: result.warnings ?? [] };
   if (result.response?.id !== undefined || result.response?.timestamp !== undefined || result.response?.modelId !== undefined) {
     yield {
@@ -547,12 +522,10 @@ function* replayParts(
       yield part;
     }
   }
-  if (options.finish && result.finishReason && result.usage) {
-    yield {
-      type: 'finish',
-      finishReason: result.finishReason,
-      usage: result.usage,
-      providerMetadata: result.providerMetadata,
-    };
-  }
+  yield {
+    type: 'finish',
+    finishReason: result.finishReason,
+    usage: result.usage,
+    providerMetadata: result.providerMetadata,
+  };
 }

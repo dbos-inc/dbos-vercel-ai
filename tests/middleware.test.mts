@@ -767,9 +767,8 @@ const abortStreamWorkflow = DBOS.registerWorkflow(
   { name: 'abortStreamWorkflow' },
 );
 
-// An abort stops the model call and is recorded, with the partial output, as the step's failure, so recovery ends the
-// stream where the live consumer saw it end. The gate parks the provider mid-stream so the abort lands at a
-// deterministic split point (no timing race).
+// An abort stops the model call and is recorded as the step's failure, which recovery rethrows. The gate parks the
+// provider mid-stream so the abort lands at a deterministic split point (no timing race).
 const abortRecoveryMock = new MockLanguageModel();
 const abortRecoveryModel = wrapLanguageModel({ model: abortRecoveryMock, middleware: durableCalls() });
 const newGate = () => {
@@ -1952,7 +1951,7 @@ test('a timed-out (abandoned) stream attempt stops emitting and cannot interleav
   assert.equal(timeoutStreamMock.streamCalls, 2);
 });
 
-test('an abort stops the provider and is recorded as the step failure; replay ends the stream at the same point', async () => {
+test('an abort stops the provider and is recorded as the step failure, which replay rethrows', async () => {
   abortStreamMock.streamPartLists.push(textStreamParts(['a', 'b', 'c', 'd', 'e']));
   const workflowID = randomUUID();
   const handle = await DBOS.startWorkflow(abortStreamWorkflow, { workflowID })();
@@ -1968,15 +1967,13 @@ test('an abort stops the provider and is recorded as the step failure; replay en
   const { step } = await recordedStreamStep(workflowID);
   assert.match(String(step.error), /abort/i);
 
-  // Fork past the stream step: replay re-emits the partial output the live consumer saw and ends without a finish.
+  // Fork past the stream step: the recorded abort is rethrown from the stream, and the model is not called again.
   const forked = await DBOS.forkWorkflow<ReturnType<typeof abortStreamWorkflow>>(workflowID, 1);
-  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof abortStreamWorkflow>>;
-  assert.ok(replayed.join('').startsWith(original.join('')), `replay ${replayed.join('')} diverged from live ${original.join('')}`);
-  assert.ok(replayed.join('').length < 5, 'replay must not regenerate the full answer');
+  await assert.rejects(forked.getResult(), /abort/i);
   assert.equal(abortStreamMock.streamCalls, 1);
 });
 
-test('aborting mid-stream records the abort with the partial output, so recovery replays the partial, not a regenerated answer', async () => {
+test('aborting mid-stream records the abort as the step failure, so recovery rethrows it instead of regenerating', async () => {
   abortRecoveryMock.streamPartLists.push([
     { type: 'stream-start', warnings: [] },
     { type: 'text-start', id: 't1' },
@@ -1998,16 +1995,15 @@ test('aborting mid-stream records the abort with the partial output, so recovery
   for (let i = 0; i < 500 && !(await DBOS.listWorkflowSteps(workflowID))?.some((s) => s.name === 'mock.mock-model.stream'); i++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  // The step is a recorded failure (never a partial success), carrying the abort reason.
+  // The step is a recorded failure (never a partial success) whose error is the abort reason.
   const { step } = await recordedStreamStep(workflowID);
   assert.match(String(step.error), /abort/i);
 
-  // Recovery (fork past the model step) replays the partial the live consumer saw; the model is not called again.
+  // Recovery (fork past the model step) rethrows the abort; the model is not called again.
   abortRecoveryGate = newGate();
   abortRecoveryAborts = false;
   const forked = await DBOS.forkWorkflow<ReturnType<typeof abortRecoveryWorkflow>>(workflowID, 1);
-  const recovered = (await forked.getResult()) as Awaited<ReturnType<typeof abortRecoveryWorkflow>>;
-  assert.equal(recovered, 'HELLO');
+  await assert.rejects(forked.getResult(), /abort/i);
   assert.equal(abortRecoveryMock.streamCalls, 1);
 });
 
@@ -2423,7 +2419,7 @@ test('a step timeout is forwarded to the tool abort signal, so a timed-out tool 
   assert.ok(toolStep.error !== null, 'timed-out tool recorded as a step error');
 });
 
-test("the AI SDK's timeout bounds a durable stream: recorded as a TimeoutError, not retried, replayed as the partial", async () => {
+test("the AI SDK's timeout bounds a durable stream: recorded as a TimeoutError, not retried, rethrown on replay", async () => {
   sdkTimeoutMock.streamPartLists.push([
     { type: 'stream-start', warnings: [] },
     { type: 'text-start', id: 't1' },
@@ -2445,6 +2441,6 @@ test("the AI SDK's timeout bounds a durable stream: recorded as a TimeoutError, 
   assert.match(String(step.error), /TimeoutError|timeout/i);
 
   const forked = await DBOS.forkWorkflow<ReturnType<typeof sdkTimeoutWorkflow>>(workflowID, 1);
-  assert.equal(await forked.getResult(), 'HELLO');
+  await assert.rejects(forked.getResult(), /timeout/i);
   assert.equal(sdkTimeoutMock.streamCalls, 1);
 });

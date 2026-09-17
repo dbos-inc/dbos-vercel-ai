@@ -85,7 +85,7 @@ As a consequence:
 
 - You can safely forward streamed deltas to a UI or terminal, but you should not perform durable steps on them because model responses are not resumable. Instead, run your own durable steps on the complete result (`result.text`) after the stream ends. Tool calls performed by the AI SDK during streaming are already durable because they execute after the model call has been checkpointed.
 - Do not exit a stream before it completes. To stop reading early, either drain the stream (`await result.consumeStream()`) or abort it.
-- To abort early, pass an `abortSignal` to `streamText` and fire it
+- To abort early, pass an `abortSignal` to `streamText` and fire it. The abort stops the model call, and the step is checkpointed as failed with the signal's reason as its error (an `AbortError` unless you abort with your own reason).
 
 ```ts
 import { streamText } from 'ai';
