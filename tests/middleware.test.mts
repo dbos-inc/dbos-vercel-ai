@@ -1126,6 +1126,43 @@ const abortToolsWorkflow = DBOS.registerWorkflow(
   { name: 'abortToolsWorkflow' },
 );
 
+// A tool that only stops when its abortSignal fires; the step timeout must reach it.
+let hangToolExecutions = 0;
+let hangToolAbortReason: unknown;
+const timeoutToolsMock = new MockLanguageModel();
+const timeoutToolsModel = wrapLanguageModel({ model: timeoutToolsMock, middleware: durableCalls() });
+const timeoutTools = durableTools(
+  {
+    hang: tool({
+      description: 'Hangs until aborted',
+      inputSchema: z.object({}),
+      execute: (_input, options) =>
+        new Promise((_resolve, reject) => {
+          hangToolExecutions++;
+          options.abortSignal?.addEventListener('abort', () => {
+            hangToolAbortReason = options.abortSignal!.reason;
+            reject(options.abortSignal!.reason);
+          });
+        }),
+    }),
+  },
+  { tools: { hang: { timeoutMS: 100 } } },
+);
+const timeoutToolsWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = await generateText({
+      model: timeoutToolsModel,
+      prompt: 'hi',
+      tools: timeoutTools,
+      stopWhen: stepCountIs(5),
+      maxRetries: 0,
+    });
+    const errors = result.steps.flatMap((s) => s.content.filter((c) => c.type === 'tool-error'));
+    return { text: result.text, toolErrors: errors.map((e) => String((e as { error: unknown }).error)) };
+  },
+  { name: 'timeoutToolsWorkflow' },
+);
+
 before(async () => {
   DBOS.setConfig({ name: 'dbos-vercel-ai-test', systemDatabaseUrl });
   await DBOS.launch();
@@ -2354,4 +2391,21 @@ test('an aborted tool call records the abort and is not retried even with retrie
   const steps = await DBOS.listWorkflowSteps(workflowID);
   const toolStep = steps!.find((s) => s.name === 'slowTool.call-1')!;
   assert.match(String(toolStep.error), /abort/i);
+});
+
+test('a step timeout is forwarded to the tool abort signal, so a timed-out tool stops', async () => {
+  timeoutToolsMock.generateResults.push(toolCallResponse('hang', '{}'), textResponse('Timed out.'));
+  const workflowID = randomUUID();
+  const before = hangToolExecutions;
+  hangToolAbortReason = undefined;
+  const handle = await DBOS.startWorkflow(timeoutToolsWorkflow, { workflowID })();
+  const result = await handle.getResult();
+  assert.equal(result.text, 'Timed out.');
+  assert.equal(result.toolErrors.length, 1);
+  assert.equal(hangToolExecutions - before, 1);
+  // Without forwarding, the tool's promise would never settle and this stays undefined.
+  assert.ok(hangToolAbortReason !== undefined, 'tool never observed the step timeout');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'hang.call-1')!;
+  assert.ok(toolStep.error !== null, 'timed-out tool recorded as a step error');
 });
