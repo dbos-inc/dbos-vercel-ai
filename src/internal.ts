@@ -11,6 +11,20 @@ export function assertNotInTransaction(operation: string): void {
   }
 }
 
+// Run fn as a durable step named `name` inside a workflow; elsewhere call it directly.
+export function runDurableStep<T>(name: string, fn: () => Promise<T>, config: StepConfig): Promise<T> {
+  assertNotInTransaction(name);
+  if (!isInWorkflowFunction()) return fn();
+  // Restore the AI SDK error identity a replay revival strips, so the SDK's retry/catch logic behaves the same.
+  return DBOS.runStep(fn, { ...config, name }).catch((error: unknown) => {
+    throw restoreAISDKErrorIdentity(error);
+  });
+}
+
+export function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return typeof (value as AsyncIterable<unknown> | null | undefined)?.[Symbol.asyncIterator] === 'function';
+}
+
 // Aborts/timeouts are deliberate cancellations, never transient; retrying just re-runs an already-cancelled call.
 function isAbortError(error: unknown): boolean {
   const name = (error as { name?: unknown } | null)?.name;

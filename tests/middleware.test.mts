@@ -8,6 +8,7 @@ import { Client as PgClient } from 'pg';
 import {
   asSchema,
   embed,
+  type InferToolOutput,
   embedMany,
   generateImage,
   generateText,
@@ -24,6 +25,7 @@ import {
   durableEmbeddingCalls,
   durableImageCalls,
   durableMCPTools,
+  durableTools,
   type MCPClientLike,
 } from '../src/index.js';
 import { restoreAISDKErrorIdentity } from '../src/internal.js';
@@ -967,6 +969,161 @@ const evilRetryModel = wrapLanguageModel({
 const evilRetryWorkflow = DBOS.registerWorkflow(
   async () => (await generateText({ model: evilRetryModel, prompt: 'hi', maxRetries: 0 })).text,
   { name: 'evilRetryWorkflow' },
+);
+
+// durableTools: plain AI SDK tools wrapped as durable steps.
+let weatherToolExecutions = 0;
+let failToolExecutions = 0;
+let countdownYields = 0;
+const plainTools = {
+  getWeather: tool({
+    description: 'Get the weather for a city',
+    inputSchema: z.object({ city: z.string() }),
+    execute: async ({ city }) => {
+      weatherToolExecutions++;
+      return { city, forecast: `sunny in ${city}` };
+    },
+  }),
+  getTime: tool({
+    description: 'Get the time in a city',
+    inputSchema: z.object({ city: z.string() }),
+    execute: async ({ city }) => `noon in ${city}`,
+  }),
+  failTool: tool({
+    description: 'Always fails',
+    inputSchema: z.object({}),
+    execute: async (): Promise<string> => {
+      failToolExecutions++;
+      throw new Error('tool exploded');
+    },
+  }),
+  countdown: tool({
+    description: 'Streams a countdown',
+    inputSchema: z.object({ from: z.number() }),
+    execute: async function* ({ from }) {
+      for (let i = from; i >= 0; i--) {
+        countdownYields++;
+        yield i;
+      }
+    },
+  }),
+  clientOnly: tool({ description: 'Runs on the client', inputSchema: z.object({}) }),
+};
+const wrappedTools = durableTools(plainTools, { tools: { getTime: false } });
+// Compile-time: the wrapped set keeps the original tool types.
+const _typedOutput: InferToolOutput<typeof wrappedTools.getWeather> = { city: 'x', forecast: 'y' };
+void _typedOutput;
+const directExecOptions = { toolCallId: 'call-direct', messages: [] } as never;
+
+const durableToolsMock = new MockLanguageModel();
+const durableToolsModel = wrapLanguageModel({ model: durableToolsMock, middleware: durableCalls() });
+const durableToolsWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = await generateText({
+      model: durableToolsModel,
+      prompt,
+      tools: wrappedTools,
+      stopWhen: stepCountIs(5),
+      maxRetries: 0,
+    });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    const toolOutputs: Record<string, unknown> = {};
+    const toolErrors: string[] = [];
+    for (const step of result.steps) {
+      for (const part of step.content) {
+        if (part.type === 'tool-result') toolOutputs[part.toolCallId] = part.output;
+        if (part.type === 'tool-error') toolErrors.push((part.error as Error).message);
+      }
+    }
+    return { text: result.text, toolOutputs, toolErrors };
+  },
+  { name: 'durableToolsWorkflow' },
+);
+
+const streamDurableToolsMock = new MockLanguageModel();
+const streamDurableToolsModel = wrapLanguageModel({ model: streamDurableToolsMock, middleware: durableCalls() });
+const streamDurableToolsWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = streamText({
+      model: streamDurableToolsModel,
+      prompt,
+      tools: wrappedTools,
+      stopWhen: stepCountIs(5),
+      maxRetries: 0,
+    });
+    return await result.text;
+  },
+  { name: 'streamDurableToolsWorkflow' },
+);
+
+// Calling a wrapped tool from inside an existing step must not open a nested step.
+const nestedToolWorkflow = DBOS.registerWorkflow(
+  async () =>
+    DBOS.runStep(async () => wrappedTools.getWeather.execute!({ city: 'Rome' }, directExecOptions), { name: 'outer' }),
+  { name: 'nestedToolWorkflow' },
+);
+
+// A flaky tool that opts into retries succeeds within one step.
+let flakyToolExecutions = 0;
+const flakyToolsMock = new MockLanguageModel();
+const flakyToolsModel = wrapLanguageModel({ model: flakyToolsMock, middleware: durableCalls() });
+const flakyTools = durableTools(
+  {
+    flaky: tool({
+      description: 'Fails twice, then succeeds',
+      inputSchema: z.object({}),
+      execute: async () => {
+        flakyToolExecutions++;
+        if (flakyToolExecutions % 3 !== 0) throw new Error('flaky failure');
+        return 'ok';
+      },
+    }),
+  },
+  { tools: { flaky: { retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 } } },
+);
+const flakyToolsWorkflow = DBOS.registerWorkflow(
+  async () =>
+    (await generateText({ model: flakyToolsModel, prompt: 'hi', tools: flakyTools, stopWhen: stepCountIs(5), maxRetries: 0 })).text,
+  { name: 'flakyToolsWorkflow' },
+);
+
+// An aborted tool is not retried even with retries enabled.
+const abortToolsMock = new MockLanguageModel();
+const abortToolsModel = wrapLanguageModel({ model: abortToolsMock, middleware: durableCalls() });
+const abortTools = durableTools(
+  {
+    slowTool: tool({
+      description: 'Waits until aborted',
+      inputSchema: z.object({}),
+      execute: (_input, options) =>
+        new Promise((_resolve, reject) => {
+          slowToolExecutions++;
+          slowToolStarted?.();
+          options.abortSignal?.addEventListener('abort', () => reject(options.abortSignal!.reason));
+        }),
+    }),
+  },
+  { retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 },
+);
+const abortToolsWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    toolAbort = () => controller.abort();
+    try {
+      const result = await generateText({
+        model: abortToolsModel,
+        prompt: 'hi',
+        tools: abortTools,
+        abortSignal: controller.signal,
+        stopWhen: stepCountIs(5),
+        maxRetries: 0,
+      });
+      return result.text;
+    } catch (error) {
+      return `caught:${(error as Error).name}`;
+    }
+  },
+  { name: 'abortToolsWorkflow' },
 );
 
 before(async () => {
@@ -2041,4 +2198,160 @@ test('recovered workflows replay model calls and messages from checkpoints', asy
   assert.equal(recovered.text, 'durable answer');
   assert.equal(recovered.go, 'proceed');
   assert.equal(recoveryMock.generateCalls, 1);
+});
+
+test('durableTools runs a tool call as a step and replays it without re-executing', async () => {
+  durableToolsMock.generateResults.push(toolCallResponse('getWeather', '{"city":"Tokyo"}'), textResponse('Sunny in Tokyo.'));
+  const workflowID = randomUUID();
+  const before = weatherToolExecutions;
+  const handle = await DBOS.startWorkflow(durableToolsWorkflow, { workflowID })('weather in Tokyo?');
+  const result = await handle.getResult();
+  assert.equal(result.text, 'Sunny in Tokyo.');
+  assert.deepEqual(result.toolOutputs, { 'call-1': { city: 'Tokyo', forecast: 'sunny in Tokyo' } });
+  assert.equal(weatherToolExecutions - before, 1);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'getWeather.call-1')!;
+  assert.deepEqual(toolStep.output, { city: 'Tokyo', forecast: 'sunny in Tokyo' });
+
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof durableToolsWorkflow>>(workflowID, noopStep.functionID);
+  assert.deepEqual(await forked.getResult(), result);
+  assert.equal(weatherToolExecutions - before, 1);
+});
+
+test('parallel calls to the same tool checkpoint under distinct step names and replay with their own results', async () => {
+  durableToolsMock.generateResults.push(
+    toolCallsResponse([
+      { toolName: 'getWeather', input: '{"city":"Paris"}' },
+      { toolName: 'getWeather', input: '{"city":"Oslo"}' },
+      { toolName: 'getTime', input: '{"city":"Paris"}' },
+    ]),
+    textResponse('Done.'),
+  );
+  const workflowID = randomUUID();
+  const before = weatherToolExecutions;
+  const handle = await DBOS.startWorkflow(durableToolsWorkflow, { workflowID })('weather?');
+  const result = await handle.getResult();
+  assert.deepEqual(result.toolOutputs, {
+    'call-0': { city: 'Paris', forecast: 'sunny in Paris' },
+    'call-1': { city: 'Oslo', forecast: 'sunny in Oslo' },
+    'call-2': 'noon in Paris',
+  });
+  assert.equal(weatherToolExecutions - before, 2);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const names = steps!.map((s) => s.name);
+  assert.ok(names.includes('getWeather.call-0') && names.includes('getWeather.call-1'));
+  // getTime was excluded with `false`, so it ran without a step.
+  assert.ok(!names.some((n) => n.startsWith('getTime')));
+
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof durableToolsWorkflow>>(workflowID, noopStep.functionID);
+  assert.deepEqual((await forked.getResult()).toolOutputs, result.toolOutputs);
+  assert.equal(weatherToolExecutions - before, 2);
+});
+
+test('a failing tool checkpoints its error and replays it to the model without re-executing', async () => {
+  durableToolsMock.generateResults.push(toolCallResponse('failTool', '{}'), textResponse('Recovered.'));
+  const workflowID = randomUUID();
+  const before = failToolExecutions;
+  const handle = await DBOS.startWorkflow(durableToolsWorkflow, { workflowID })('fail');
+  const result = await handle.getResult();
+  assert.equal(result.text, 'Recovered.');
+  assert.deepEqual(result.toolErrors, ['tool exploded']);
+  // Retries are off by default, so the tool ran exactly once.
+  assert.equal(failToolExecutions - before, 1);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'failTool.call-1')!;
+  assert.match(String(toolStep.error), /tool exploded/);
+
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof durableToolsWorkflow>>(workflowID, noopStep.functionID);
+  assert.deepEqual((await forked.getResult()).toolErrors, ['tool exploded']);
+  assert.equal(failToolExecutions - before, 1);
+});
+
+test('a streaming tool execute checkpoints its final value inside a workflow and streams unchanged outside', async () => {
+  durableToolsMock.generateResults.push(toolCallResponse('countdown', '{"from":2}'), textResponse('Liftoff.'));
+  const workflowID = randomUUID();
+  const before = countdownYields;
+  const handle = await DBOS.startWorkflow(durableToolsWorkflow, { workflowID })('count');
+  const result = await handle.getResult();
+  assert.deepEqual(result.toolOutputs, { 'call-1': 0 });
+  assert.equal(countdownYields - before, 3);
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.equal(steps!.find((s) => s.name === 'countdown.call-1')!.output, 0);
+
+  const direct = wrappedTools.countdown.execute!({ from: 1 }, directExecOptions);
+  assert.equal(typeof (direct as AsyncIterable<number>)[Symbol.asyncIterator], 'function');
+  const yielded: number[] = [];
+  for await (const value of direct as AsyncIterable<number>) yielded.push(value);
+  assert.deepEqual(yielded, [1, 0]);
+});
+
+test('wrapped tools run directly outside a workflow, and tools without execute or opted out are untouched', async () => {
+  const before = weatherToolExecutions;
+  assert.deepEqual(await wrappedTools.getWeather.execute!({ city: 'Rome' }, directExecOptions), {
+    city: 'Rome',
+    forecast: 'sunny in Rome',
+  });
+  assert.equal(weatherToolExecutions - before, 1);
+  assert.equal(wrappedTools.clientOnly, plainTools.clientOnly);
+  assert.equal(wrappedTools.getTime, plainTools.getTime);
+  assert.notEqual(wrappedTools.getWeather, plainTools.getWeather);
+});
+
+test('a wrapped tool called inside an existing step does not open a nested step', async () => {
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(nestedToolWorkflow, { workflowID })();
+  assert.deepEqual(await handle.getResult(), { city: 'Rome', forecast: 'sunny in Rome' });
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.deepEqual(steps!.map((s) => s.name), ['outer']);
+});
+
+test('in streamText the tool step is ordered after the model step', async () => {
+  streamDurableToolsMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'tool-call', toolCallId: 'call-1', toolName: 'getWeather', input: '{"city":"Oslo"}' },
+      { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+    ],
+    textStreamParts(['Rainy in Oslo.']),
+  );
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(streamDurableToolsWorkflow, { workflowID })('weather in Oslo?');
+  assert.equal(await handle.getResult(), 'Rainy in Oslo.');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const modelStep = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
+  const toolStep = steps!.find((s) => s.name === 'getWeather.call-1')!;
+  assert.ok(modelStep.functionID < toolStep.functionID);
+});
+
+test('a tool that opts into retries is retried inside one step', async () => {
+  flakyToolsMock.generateResults.push(toolCallResponse('flaky', '{}'), textResponse('done'));
+  const workflowID = randomUUID();
+  const before = flakyToolExecutions;
+  const handle = await DBOS.startWorkflow(flakyToolsWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'done');
+  assert.equal(flakyToolExecutions - before, 3);
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'flaky.call-1')!;
+  assert.equal(toolStep.output, 'ok');
+});
+
+test('an aborted tool call records the abort and is not retried even with retries enabled', async () => {
+  abortToolsMock.generateResults.push(toolCallResponse('slowTool', '{}'));
+  const started = new Promise<void>((resolve) => (slowToolStarted = resolve));
+  const workflowID = randomUUID();
+  const before = slowToolExecutions;
+  const handle = await DBOS.startWorkflow(abortToolsWorkflow, { workflowID })();
+  await started;
+  toolAbort!();
+  assert.equal(await handle.getResult(), 'caught:AbortError');
+  assert.equal(slowToolExecutions - before, 1);
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'slowTool.call-1')!;
+  assert.match(String(toolStep.error), /abort/i);
 });

@@ -53,7 +53,7 @@ When an agent runs inside a DBOS workflow, DBOS makes three things durable:
 
 - **Every model call.** `durableCalls()` is AI SDK middleware that intercepts `doGenerate`/`doStream` and runs each call through [`DBOS.runStep`](https://docs.dbos.dev/typescript/tutorials/step-tutorial). The complete result (content, usage, finish reason, response metadata) is checkpointed in Postgres. On recovery, completed calls replay from their checkpoints without contacting the model provider.
 - **The agent loop.** Because DBOS workflows replay deterministically on recovery and each model call replays from its checkpoint, a multi-step, tool-calling agent resumes from the first unfinished step instead of restarting from the beginning.
-- **Tool calls.** MCP tools (via [`durableMCPTools`](#mcp-tools)) are checkpointed automatically. Your own tools' side effects are durable when you wrap their `execute` in `DBOS.runStep` (see [Tools](#tools)).
+- **Tool calls.** Your own tools are checkpointed when wrapped with [`durableTools`](#tools), and MCP tools via [`durableMCPTools`](#mcp-tools). On recovery, completed tool calls replay their recorded output instead of re-running.
 
 Outside a workflow (or inside another step) the wrapped model calls the provider directly with no checkpointing, so the same model works anywhere in your app.
 
@@ -109,27 +109,38 @@ const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
 ## Tools
 
 Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop.
-You should wrap your tool's `execute` in a DBOS step so it is checkpointed too.
+Wrap your tools with `durableTools` so each tool call is checkpointed too: on recovery, completed tool calls replay their recorded output (or error) instead of re-running.
 
 ```ts
 import { tool, stepCountIs } from 'ai';
+import { durableTools } from '@dbos-inc/vercel-ai';
 import { z } from 'zod';
 
+const tools = durableTools({
+  getWeather: tool({
+    description: 'Get the weather for a city',
+    inputSchema: z.object({ city: z.string() }),
+    execute: ({ city }) => fetchWeather(city),
+  }),
+});
+
 const agent = DBOS.registerWorkflow(async (question: string) => {
-  const result = await generateText({
-    model,
-    prompt: question,
-    tools: {
-      getWeather: tool({
-        description: 'Get the weather for a city',
-        inputSchema: z.object({ city: z.string() }),
-        execute: ({ city }) => DBOS.runStep(() => fetchWeather(city), { name: 'getWeather' }),
-      }),
-    },
-    stopWhen: stepCountIs(10),
-  });
+  const result = await generateText({ model, prompt: question, tools, stopWhen: stepCountIs(10) });
   return result.text;
 }, { name: 'weatherAgent' });
+```
+
+You can pass step configuration (such as timeouts or retries) to `durableTools`.
+You can set default for all tools or configure tools individually.
+Retries are off by default.
+
+```ts
+const tools = durableTools(myTools, {
+  timeoutMS: 30_000,
+  tools: {
+    getWeather: { retriesAllowed: true, maxAttempts: 3 },
+  },
+});
 ```
 
 ### MCP tools
