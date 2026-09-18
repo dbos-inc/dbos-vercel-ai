@@ -14,7 +14,8 @@ const outsideWorkflow = AsyncLocalStorage.snapshot();
 async function cancelChild(childID: string, settled: () => boolean): Promise<void> {
   for (let i = 0; i < 100 && !settled(); i++) {
     if (await DBOS.getWorkflowStatus(childID)) {
-      await DBOS.cancelWorkflow(childID);
+      // The child's own sub-agents are its children; without the cascade they would run on with nobody awaiting them.
+      await DBOS.cancelWorkflow(childID, { cancelChildren: true });
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 50));

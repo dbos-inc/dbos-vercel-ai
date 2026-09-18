@@ -1538,6 +1538,24 @@ const midAbortedAgentWorkflow = DBOS.registerWorkflow(
   },
   { name: 'midAbortedAgentWorkflow' },
 );
+// A nested sub-agent: the child agent's own tool is another agent tool, so a parent abort must reach the grandchild.
+const grandchild = agentTool({
+  name: 'grandchildResearch',
+  description: 'Research a detail',
+  inputSchema: z.object({ question: z.string() }),
+  agent: subAgent,
+  prompt: ({ question }) => question,
+});
+const nestedMock = new MockLanguageModel();
+const nestedModel = wrapLanguageModel({ model: nestedMock, middleware: durableCalls() });
+const nestedAgent = new ToolLoopAgent({ model: nestedModel, instructions: 'Delegate.', tools: durableTools({ grandchild }) });
+const nestedResearch = agentTool({
+  name: 'nestedResearchChild',
+  description: 'Research via a helper',
+  inputSchema: z.object({ question: z.string() }),
+  agent: nestedAgent,
+  prompt: ({ question }) => question,
+});
 const orchMock = new MockLanguageModel();
 const orchModel = wrapLanguageModel({ model: orchMock, middleware: durableCalls({ durableStream: 'ui' }) });
 const orchTools = durableTools(
@@ -1546,6 +1564,7 @@ const orchTools = durableTools(
     queuedResearch,
     summarize,
     slowResearch,
+    nestedResearch,
     getTime: tool({
       description: 'Get the time in a city',
       inputSchema: z.object({ city: z.string() }),
@@ -3604,4 +3623,42 @@ test('durable stream: generateText writes each call whole, so tool outputs follo
   );
   assert.equal(streamedText(chunks), 'Rainy in Oslo.');
   assert.deepEqual(chunks.at(-1), { type: 'finish', finishReason: 'stop' });
+});
+
+test('agentTool: aborting the parent cancels a child and the grandchild it started', async () => {
+  resetAgentMocks();
+  nestedMock.streamPartLists.length = 0;
+  orchMock.generateResults.push(toolCallResponse('nestedResearch', '{"question":"deep?"}'));
+  // The child agent delegates to the grandchild, whose model call parks at the gate.
+  nestedMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'tool-call', toolCallId: 'call-g', toolName: 'grandchild', input: '{"question":"detail?"}' },
+    { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+  ]);
+  subGate = newGate();
+  subMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'partial' },
+    () => subGate.promise,
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const childID = `${workflowID}-call-1`;
+  const grandchildID = `${childID}-call-g`;
+  const handle = await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research deeply');
+  for (let i = 0; i < 500 && (await DBOS.getWorkflowStatus(grandchildID)) === null; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(await DBOS.getWorkflowStatus(grandchildID), 'grandchild never started');
+  orchAbort!.abort();
+  const statuses: Record<string, string | undefined> = {};
+  for (let i = 0; i < 500; i++) {
+    statuses.child = (await DBOS.getWorkflowStatus(childID))?.status;
+    statuses.grandchild = (await DBOS.getWorkflowStatus(grandchildID))?.status;
+    if (statuses.child === 'CANCELLED' && statuses.grandchild === 'CANCELLED') break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  subGate.release();
+  await handle.getResult().catch(() => undefined);
+  assert.deepEqual(statuses, { child: 'CANCELLED', grandchild: 'CANCELLED' });
 });
