@@ -100,7 +100,6 @@ const chatTurn = DBOS.registerWorkflow(async (messages: ModelMessage[]) => {
   return await result.text;
 }, { name: 'chatTurn' });
 
-// POST: start the turn and stream it. GET: reconnect from the last offset the client saw.
 const handle = await DBOS.startWorkflow(chatTurn)(messages);
 return createUIMessageStreamResponse({
   stream: readDurableStream({ workflowID: handle.workflowID, key: 'ui', messageId }),
