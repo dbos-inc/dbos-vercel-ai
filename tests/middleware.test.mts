@@ -8,6 +8,7 @@ import { Client as PgClient } from 'pg';
 import {
   asSchema,
   embed,
+  type InferToolOutput,
   embedMany,
   generateImage,
   generateText,
@@ -24,6 +25,7 @@ import {
   durableEmbeddingCalls,
   durableImageCalls,
   durableMCPTools,
+  durableTools,
   type MCPClientLike,
 } from '../src/index.js';
 import { restoreAISDKErrorIdentity } from '../src/internal.js';
@@ -177,6 +179,11 @@ const parallelEmbedWorkflow = DBOS.registerWorkflow(
   async (values: string[]) => (await embedMany({ model: batchEmbedModel, values })).embeddings.length,
   { name: 'parallelEmbedWorkflow' },
 );
+
+// Reports the wrapped model's parallel-call support as seen from inside a workflow.
+const parallelCallsProbe = DBOS.registerWorkflow(async () => batchEmbedModel.supportsParallelCalls, {
+  name: 'parallelCallsProbe',
+});
 
 const serialEmbedWorkflow = DBOS.registerWorkflow(
   async (values: string[]) => {
@@ -765,9 +772,8 @@ const abortStreamWorkflow = DBOS.registerWorkflow(
   { name: 'abortStreamWorkflow' },
 );
 
-// Issue #5: an abort detaches the consumer, but the durable model call must still record the complete response —
-// otherwise recovery replays the truncated answer as if it were the whole one. The gate parks the provider
-// mid-stream so the abort lands at a deterministic split point (no timing race).
+// An abort stops the model call and is recorded as the step's failure, which recovery rethrows. The gate parks the
+// provider mid-stream so the abort lands at a deterministic split point (no timing race).
 const abortRecoveryMock = new MockLanguageModel();
 const abortRecoveryModel = wrapLanguageModel({ model: abortRecoveryMock, middleware: durableCalls() });
 const newGate = () => {
@@ -799,9 +805,8 @@ const abortRecoveryWorkflow = DBOS.registerWorkflow(
   { name: 'abortRecoveryWorkflow' },
 );
 
-// A follow-up durable call after aborting a stream must not be rejected as concurrent: the stream step is
-// already sequenced (its funcID is assigned), so the follow-up is deterministic on replay even while the
-// aborted stream step drains and checkpoints in the background.
+// A follow-up durable call after aborting a stream must not be rejected as concurrent; it waits for the aborted
+// step to settle, so the two steps are recorded in the order they were started.
 const guardRaceMock = new MockLateAbortStreamModel();
 const guardRaceModel = wrapLanguageModel({ model: guardRaceMock, middleware: durableCalls() });
 const guardRaceWorkflow = DBOS.registerWorkflow(
@@ -969,6 +974,261 @@ const evilRetryWorkflow = DBOS.registerWorkflow(
   { name: 'evilRetryWorkflow' },
 );
 
+// durableTools: plain AI SDK tools wrapped as durable steps.
+let weatherToolExecutions = 0;
+let failToolExecutions = 0;
+let countdownYields = 0;
+const plainTools = {
+  getWeather: tool({
+    description: 'Get the weather for a city',
+    inputSchema: z.object({ city: z.string() }),
+    execute: async ({ city }) => {
+      weatherToolExecutions++;
+      return { city, forecast: `sunny in ${city}` };
+    },
+  }),
+  getTime: tool({
+    description: 'Get the time in a city',
+    inputSchema: z.object({ city: z.string() }),
+    execute: async ({ city }) => `noon in ${city}`,
+  }),
+  failTool: tool({
+    description: 'Always fails',
+    inputSchema: z.object({}),
+    execute: async (): Promise<string> => {
+      failToolExecutions++;
+      throw new Error('tool exploded');
+    },
+  }),
+  countdown: tool({
+    description: 'Streams a countdown',
+    inputSchema: z.object({ from: z.number() }),
+    execute: async function* ({ from }) {
+      for (let i = from; i >= 0; i--) {
+        countdownYields++;
+        yield i;
+      }
+    },
+  }),
+  clientOnly: tool({ description: 'Runs on the client', inputSchema: z.object({}) }),
+};
+const wrappedTools = durableTools(plainTools, { tools: { getTime: false } });
+// Compile-time: the wrapped set keeps the original tool types.
+const _typedOutput: InferToolOutput<typeof wrappedTools.getWeather> = { city: 'x', forecast: 'y' };
+void _typedOutput;
+const directExecOptions = { toolCallId: 'call-direct', messages: [] } as never;
+
+const durableToolsMock = new MockLanguageModel();
+const durableToolsModel = wrapLanguageModel({ model: durableToolsMock, middleware: durableCalls() });
+const durableToolsWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = await generateText({
+      model: durableToolsModel,
+      prompt,
+      tools: wrappedTools,
+      stopWhen: stepCountIs(5),
+      maxRetries: 0,
+    });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    const toolOutputs: Record<string, unknown> = {};
+    const toolErrors: string[] = [];
+    for (const step of result.steps) {
+      for (const part of step.content) {
+        if (part.type === 'tool-result') toolOutputs[part.toolCallId] = part.output;
+        if (part.type === 'tool-error') toolErrors.push((part.error as Error).message);
+      }
+    }
+    return { text: result.text, toolOutputs, toolErrors };
+  },
+  { name: 'durableToolsWorkflow' },
+);
+
+const streamDurableToolsMock = new MockLanguageModel();
+const streamDurableToolsModel = wrapLanguageModel({ model: streamDurableToolsMock, middleware: durableCalls() });
+const streamDurableToolsWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = streamText({
+      model: streamDurableToolsModel,
+      prompt,
+      tools: wrappedTools,
+      stopWhen: stepCountIs(5),
+      maxRetries: 0,
+    });
+    return await result.text;
+  },
+  { name: 'streamDurableToolsWorkflow' },
+);
+
+// Calling a wrapped tool from inside an existing step must not open a nested step.
+const nestedToolWorkflow = DBOS.registerWorkflow(
+  async () =>
+    DBOS.runStep(async () => wrappedTools.getWeather.execute!({ city: 'Rome' }, directExecOptions), { name: 'outer' }),
+  { name: 'nestedToolWorkflow' },
+);
+
+// A flaky tool that opts into retries succeeds within one step.
+let flakyToolExecutions = 0;
+const flakyToolsMock = new MockLanguageModel();
+const flakyToolsModel = wrapLanguageModel({ model: flakyToolsMock, middleware: durableCalls() });
+const flakyTools = durableTools(
+  {
+    flaky: tool({
+      description: 'Fails twice, then succeeds',
+      inputSchema: z.object({}),
+      execute: async () => {
+        flakyToolExecutions++;
+        if (flakyToolExecutions % 3 !== 0) throw new Error('flaky failure');
+        return 'ok';
+      },
+    }),
+  },
+  { tools: { flaky: { retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 } } },
+);
+const flakyToolsWorkflow = DBOS.registerWorkflow(
+  async () =>
+    (await generateText({ model: flakyToolsModel, prompt: 'hi', tools: flakyTools, stopWhen: stepCountIs(5), maxRetries: 0 })).text,
+  { name: 'flakyToolsWorkflow' },
+);
+
+// An aborted tool is not retried even with retries enabled.
+const abortToolsMock = new MockLanguageModel();
+const abortToolsModel = wrapLanguageModel({ model: abortToolsMock, middleware: durableCalls() });
+const abortTools = durableTools(
+  {
+    slowTool: tool({
+      description: 'Waits until aborted',
+      inputSchema: z.object({}),
+      execute: (_input, options) =>
+        new Promise((_resolve, reject) => {
+          slowToolExecutions++;
+          slowToolStarted?.();
+          options.abortSignal?.addEventListener('abort', () => reject(options.abortSignal!.reason));
+        }),
+    }),
+  },
+  { retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 },
+);
+const abortToolsWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    toolAbort = () => controller.abort();
+    try {
+      const result = await generateText({
+        model: abortToolsModel,
+        prompt: 'hi',
+        tools: abortTools,
+        abortSignal: controller.signal,
+        stopWhen: stepCountIs(5),
+        maxRetries: 0,
+      });
+      return result.text;
+    } catch (error) {
+      return `caught:${(error as Error).name}`;
+    }
+  },
+  { name: 'abortToolsWorkflow' },
+);
+
+// A tool that only stops when its abortSignal fires; the step timeout must reach it.
+let hangToolExecutions = 0;
+let hangToolAbortReason: unknown;
+const timeoutToolsMock = new MockLanguageModel();
+const timeoutToolsModel = wrapLanguageModel({ model: timeoutToolsMock, middleware: durableCalls() });
+const timeoutTools = durableTools(
+  {
+    hang: tool({
+      description: 'Hangs until aborted',
+      inputSchema: z.object({}),
+      execute: (_input, options) =>
+        new Promise((_resolve, reject) => {
+          hangToolExecutions++;
+          options.abortSignal?.addEventListener('abort', () => {
+            hangToolAbortReason = options.abortSignal!.reason;
+            reject(options.abortSignal!.reason);
+          });
+        }),
+    }),
+  },
+  { tools: { hang: { timeoutMS: 100 } } },
+);
+const timeoutToolsWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = await generateText({
+      model: timeoutToolsModel,
+      prompt: 'hi',
+      tools: timeoutTools,
+      stopWhen: stepCountIs(5),
+      maxRetries: 0,
+    });
+    const errors = result.steps.flatMap((s) => s.content.filter((c) => c.type === 'tool-error'));
+    return { text: result.text, toolErrors: errors.map((e) => String((e as { error: unknown }).error)) };
+  },
+  { name: 'timeoutToolsWorkflow' },
+);
+
+// The AI SDK's timeout is an abort with a TimeoutError reason: it bounds a durable call and is recorded like any abort.
+const sdkTimeoutMock = new MockLanguageModel();
+const sdkTimeoutModel = wrapLanguageModel({
+  model: sdkTimeoutMock,
+  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 }),
+});
+const sdkTimeoutWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = streamText({ model: sdkTimeoutModel, prompt: 'hi', timeout: { totalMs: 100 }, maxRetries: 0 });
+    let text = '';
+    for await (const delta of result.textStream) text += delta;
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return text;
+  },
+  { name: 'sdkTimeoutWorkflow' },
+);
+
+// A generateText abort is recorded as the step error; replay must rethrow it without the AI SDK retrying (a retry would open an unexpected step).
+class AbortingGenerateModel extends MockLanguageModel {
+  controller = new AbortController();
+  override async doGenerate(options: Parameters<MockLanguageModel['doGenerate']>[0]) {
+    this.controller.abort();
+    return super.doGenerate(options);
+  }
+}
+const generateAbortMock = new AbortingGenerateModel();
+const generateAbortModel = wrapLanguageModel({ model: generateAbortMock, middleware: durableCalls() });
+const generateAbortWorkflow = DBOS.registerWorkflow(
+  async () => {
+    generateAbortMock.controller = new AbortController();
+    let outcome: string;
+    try {
+      outcome = (await generateText({ model: generateAbortModel, prompt: 'hi', abortSignal: generateAbortMock.controller.signal })).text;
+    } catch (error) {
+      outcome = `caught:${(error as Error).name}`;
+    }
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return outcome;
+  },
+  { name: 'generateAbortWorkflow' },
+);
+
+// A signal that is already aborted never fires its listener; the consumer stays blocked until the step records the abort, so a follow-up still sequences after it.
+const preAbortedMock = new MockLanguageModel();
+const preAbortedModel = wrapLanguageModel({ model: preAbortedMock, middleware: durableCalls() });
+const preAbortedWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const result = streamText({ model: preAbortedModel, prompt: 'hi', abortSignal: controller.signal, maxRetries: 0 });
+    try {
+      for await (const _delta of result.textStream) {
+        /* aborted */
+      }
+    } catch {
+      /* aborted */
+    }
+    const follow = await generateText({ model: preAbortedModel, prompt: 'summarize', maxRetries: 0 });
+    return follow.text;
+  },
+  { name: 'preAbortedWorkflow' },
+);
+
 before(async () => {
   DBOS.setConfig({ name: 'dbos-vercel-ai-test', systemDatabaseUrl });
   await DBOS.launch();
@@ -1112,12 +1372,34 @@ test('embedMany checkpoints as a durable step and replays from the checkpoint wi
   assert.equal(embedReplayMock.embedCalls, 1); // not re-called on replay
 });
 
-test('multi-batch embedMany (parallel batches) trips the guard with a remedy in the message', async () => {
-  const handle = await DBOS.startWorkflow(parallelEmbedWorkflow, { workflowID: randomUUID() })(['a', 'b', 'c', 'd']);
-  await assert.rejects(handle.getResult(), /Concurrent durable model calls.*maxParallelCalls: 1/s);
+test('multi-batch embedMany runs its batches sequentially as durable steps without maxParallelCalls', async () => {
+  const workflowID = randomUUID();
+  const callsBefore = batchEmbedMock.embedCalls;
+  const handle = await DBOS.startWorkflow(parallelEmbedWorkflow, { workflowID })(['a', 'b', 'c', 'd']);
+  // The wrapped model reports no parallel-call support, so the two batches never overlap and the guard never trips.
+  assert.equal(await handle.getResult(), 4);
+  assert.equal(batchEmbedMock.embedCalls - callsBefore, 2);
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const embedSteps = steps!.filter((s) => s.name === 'mock.mock-embed.embed');
+  assert.equal(embedSteps.length, 2);
+  assert.ok(embedSteps[0]!.completedAtEpochMs! <= embedSteps[1]!.startedAtEpochMs!, 'batches overlapped');
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof parallelEmbedWorkflow>>(workflowID, 2);
+  assert.equal(await forked.getResult(), 4);
+  assert.equal(batchEmbedMock.embedCalls - callsBefore, 2); // replayed from the checkpoints
 });
 
-test('multi-batch embedMany with maxParallelCalls: 1 is durable and correct', async () => {
+test('a wrapped embedding model allows parallel batches outside a workflow and refuses them inside one', async () => {
+  assert.equal(await batchEmbedModel.supportsParallelCalls, true);
+  assert.equal(await parallelCallsProbe(), false);
+  // Outside a workflow the batches run in parallel and nothing is checkpointed.
+  const callsBefore = batchEmbedMock.embedCalls;
+  const result = await embedMany({ model: batchEmbedModel, values: ['a', 'b', 'c', 'd'] });
+  assert.equal(result.embeddings.length, 4);
+  assert.equal(batchEmbedMock.embedCalls - callsBefore, 2);
+});
+
+test('multi-batch embedMany with an explicit maxParallelCalls: 1 still works', async () => {
   const handle = await DBOS.startWorkflow(serialEmbedWorkflow, { workflowID: randomUUID() })(['a', 'b', 'c', 'd']);
   const result = await handle.getResult();
   assert.equal(result.count, 4);
@@ -1430,7 +1712,7 @@ test('MCP tools list and execute as durable steps; replay does not re-execute th
 
   const steps = await DBOS.listWorkflowSteps(workflowID);
   assert.ok(steps?.some((s) => s.name === 'mcp.listTools'), 'tool listing recorded as a durable step');
-  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather'), 'tool call recorded as a durable step');
+  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather.call-1'), 'tool call recorded as a durable step');
   const generateCallsBefore = mcpToolMock.generateCalls;
 
   // Fork past every model/tool step: they all replay from checkpoints, so nothing is re-invoked.
@@ -1457,8 +1739,8 @@ test('parallel MCP tool calls each execute durably and replay without re-executi
   assert.equal(parallelMcpClient.timeCalls, 1);
 
   const steps = await DBOS.listWorkflowSteps(workflowID);
-  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather'), 'first parallel tool recorded as a step');
-  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getTime'), 'second parallel tool recorded as a step');
+  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather.call-0'), 'first parallel tool recorded as a step');
+  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getTime.call-1'), 'second parallel tool recorded as a step');
 
   // Fork past both parallel tool steps: they replay from checkpoints (would throw DBOSUnexpectedStepError if reordered).
   const noopStep = steps!.find((s) => s.name === 'noop')!;
@@ -1689,7 +1971,7 @@ test('a streaming MCP tool execute checkpoints its final value, not an empty obj
 
   // The checkpoint records the last yielded value; before the fix the generator serialized as {}.
   const steps = await DBOS.listWorkflowSteps(workflowID);
-  const toolStep = steps!.find((s) => s.name === 'mcp.tool.countdown')!;
+  const toolStep = steps!.find((s) => s.name === 'mcp.tool.countdown.call-1')!;
   assert.equal(toolStep.output, 'lift off');
 
   // The follow-up model call saw the final value, not {}.
@@ -1741,32 +2023,29 @@ test('a timed-out (abandoned) stream attempt stops emitting and cannot interleav
   assert.equal(timeoutStreamMock.streamCalls, 2);
 });
 
-test('a provider that rejects reads once its signal fires never sees the abort, so the checkpoint is complete', async () => {
+test('an abort stops the provider and is recorded as the step failure, which replay rethrows', async () => {
   abortStreamMock.streamPartLists.push(textStreamParts(['a', 'b', 'c', 'd', 'e']));
   const workflowID = randomUUID();
   const handle = await DBOS.startWorkflow(abortStreamWorkflow, { workflowID })();
-  // The AI SDK ends an aborted stream gracefully, so the live workflow completes.
+  // The AI SDK ends an aborted stream gracefully, so the live workflow completes with the pre-abort deltas.
   const original = await handle.getResult();
-  assert.ok(original.length >= 2, `expected at least the pre-abort deltas, got ${original.length}`);
+  assert.ok(original.length >= 2 && original.length < 5, `expected a partial stream, got ${original.length} deltas`);
   assert.equal(abortStreamMock.streamCalls, 1); // an abort is never retried
 
-  // Before the fix the signal reached the provider, which failed the read, and that partial became the durable result.
   for (let i = 0; i < 500 && !(await DBOS.listWorkflowSteps(workflowID))?.some((s) => s.name === 'mock.mock-model.stream'); i++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  const { step, output } = await recordedStreamStep(workflowID);
-  assert.equal(step.error, null);
-  assert.equal(output.content[0]!.text, 'abcde');
-  assert.equal(output.finishReason.unified, 'stop');
+  // The provider saw the abort and the step recorded it, not a complete or a silently truncated success.
+  const { step } = await recordedStreamStep(workflowID);
+  assert.match(String(step.error), /abort/i);
 
-  // Fork past the stream step: replay delivers the checkpointed content as one delta per block; no abort fires.
+  // Fork past the stream step: the recorded abort is rethrown from the stream, and the model is not called again.
   const forked = await DBOS.forkWorkflow<ReturnType<typeof abortStreamWorkflow>>(workflowID, 1);
-  const replayed = (await forked.getResult()) as Awaited<ReturnType<typeof abortStreamWorkflow>>;
-  assert.equal(replayed.join(''), 'abcde');
+  await assert.rejects(forked.getResult(), /abort/i);
   assert.equal(abortStreamMock.streamCalls, 1);
 });
 
-test('aborting mid-stream still checkpoints the complete model call, so recovery replays the whole answer', async () => {
+test('aborting mid-stream records the abort as the step failure, so recovery rethrows it instead of regenerating', async () => {
   abortRecoveryMock.streamPartLists.push([
     { type: 'stream-start', warnings: [] },
     { type: 'text-start', id: 't1' },
@@ -1785,31 +2064,37 @@ test('aborting mid-stream still checkpoints the complete model call, so recovery
   assert.equal(await handle.getResult(), 'HELLO');
   assert.equal(abortRecoveryMock.streamCalls, 1); // an abort is never retried
 
-  // The model call keeps draining after the consumer detaches, so wait for its checkpoint before reading it.
   for (let i = 0; i < 500 && !(await DBOS.listWorkflowSteps(workflowID))?.some((s) => s.name === 'mock.mock-model.stream'); i++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  // The consumer's abort must not truncate the durable record: a partial success here is permanent and silent.
-  const { step, output } = await recordedStreamStep(workflowID);
-  assert.equal(step.error, null);
-  assert.equal(output.content[0]!.text, 'HELLO WORLD');
-  assert.equal(output.finishReason.unified, 'stop');
+  // The step is a recorded failure (never a partial success) whose error is the abort reason.
+  const { step } = await recordedStreamStep(workflowID);
+  assert.match(String(step.error), /abort/i);
 
-  // Recovery (fork past the model step) must replay the whole answer, not the truncated live view.
+  // Recovery (fork past the model step) rethrows the abort; the model is not called again.
   abortRecoveryGate = newGate();
   abortRecoveryAborts = false;
   const forked = await DBOS.forkWorkflow<ReturnType<typeof abortRecoveryWorkflow>>(workflowID, 1);
-  const recovered = (await forked.getResult()) as Awaited<ReturnType<typeof abortRecoveryWorkflow>>;
-  assert.equal(recovered, 'HELLO WORLD');
-  assert.equal(abortRecoveryMock.streamCalls, 1); // replayed from the checkpoint, not re-generated
+  await assert.rejects(forked.getResult(), /abort/i);
+  assert.equal(abortRecoveryMock.streamCalls, 1);
 });
 
-test('a durable call after aborting a stream is not rejected as concurrent', async () => {
+test('a durable call after aborting a stream is not rejected as concurrent, and is recorded after the aborted step', async () => {
   guardRaceMock.generateResults.push(textResponse('summary'));
-  const handle = await DBOS.startWorkflow(guardRaceWorkflow, { workflowID: randomUUID() })();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(guardRaceWorkflow, { workflowID })();
   // Before the fix the guard stayed held until the aborted stream step settled, so this follow-up threw
   // "Concurrent durable model calls ..." and the workflow rejected.
   assert.equal(await handle.getResult(), 'summary');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const streamStep = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
+  const generateStep = steps!.find((s) => s.name === 'mock.mock-model.generate')!;
+  assert.match(String(streamStep.error), /abort/i);
+  // The follow-up started only after the aborted step was checkpointed, so a crash can't leave them recorded out of order.
+  assert.ok(
+    streamStep.completedAtEpochMs! <= generateStep.startedAtEpochMs!,
+    `follow-up started at ${generateStep.startedAtEpochMs} before the aborted step completed at ${streamStep.completedAtEpochMs}`,
+  );
 });
 
 test('an MCP tool aborted with a DOMException reason checkpoints the real error, not a TypeError', async () => {
@@ -1825,7 +2110,7 @@ test('an MCP tool aborted with a DOMException reason checkpoints the real error,
   assert.equal(slowToolExecutions - executionsBefore, 1); // aborted tool not retried
 
   const steps = await DBOS.listWorkflowSteps(workflowID);
-  const toolStep = steps!.find((s) => s.name === 'mcp.tool.slowTool')!;
+  const toolStep = steps!.find((s) => s.name === 'mcp.tool.slowTool.call-1')!;
   // The real abort reason is recorded — before the fix this was "Cannot set property message ... which has only a getter".
   assert.ok(toolStep.error !== null, 'aborted tool call recorded as a step error');
   assert.match(String(toolStep.error), /abort/i);
@@ -1845,7 +2130,7 @@ test('an aborted MCP tool call is not retried even when its error is not named A
   assert.equal(slowToolExecutions - executionsBefore, 1);
 
   const steps = await DBOS.listWorkflowSteps(workflowID);
-  const toolStep = steps!.find((s) => s.name === 'mcp.tool.slowTool')!;
+  const toolStep = steps!.find((s) => s.name === 'mcp.tool.slowTool.call-1')!;
   assert.match(String(toolStep.error), /connection reset by peer/);
 });
 
@@ -2041,4 +2326,259 @@ test('recovered workflows replay model calls and messages from checkpoints', asy
   assert.equal(recovered.text, 'durable answer');
   assert.equal(recovered.go, 'proceed');
   assert.equal(recoveryMock.generateCalls, 1);
+});
+
+test('durableTools runs a tool call as a step and replays it without re-executing', async () => {
+  durableToolsMock.generateResults.push(toolCallResponse('getWeather', '{"city":"Tokyo"}'), textResponse('Sunny in Tokyo.'));
+  const workflowID = randomUUID();
+  const before = weatherToolExecutions;
+  const handle = await DBOS.startWorkflow(durableToolsWorkflow, { workflowID })('weather in Tokyo?');
+  const result = await handle.getResult();
+  assert.equal(result.text, 'Sunny in Tokyo.');
+  assert.deepEqual(result.toolOutputs, { 'call-1': { city: 'Tokyo', forecast: 'sunny in Tokyo' } });
+  assert.equal(weatherToolExecutions - before, 1);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'getWeather.call-1')!;
+  assert.deepEqual(toolStep.output, { city: 'Tokyo', forecast: 'sunny in Tokyo' });
+
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof durableToolsWorkflow>>(workflowID, noopStep.functionID);
+  assert.deepEqual(await forked.getResult(), result);
+  assert.equal(weatherToolExecutions - before, 1);
+});
+
+test('parallel calls to the same tool checkpoint under distinct step names and replay with their own results', async () => {
+  durableToolsMock.generateResults.push(
+    toolCallsResponse([
+      { toolName: 'getWeather', input: '{"city":"Paris"}' },
+      { toolName: 'getWeather', input: '{"city":"Oslo"}' },
+      { toolName: 'getTime', input: '{"city":"Paris"}' },
+    ]),
+    textResponse('Done.'),
+  );
+  const workflowID = randomUUID();
+  const before = weatherToolExecutions;
+  const handle = await DBOS.startWorkflow(durableToolsWorkflow, { workflowID })('weather?');
+  const result = await handle.getResult();
+  assert.deepEqual(result.toolOutputs, {
+    'call-0': { city: 'Paris', forecast: 'sunny in Paris' },
+    'call-1': { city: 'Oslo', forecast: 'sunny in Oslo' },
+    'call-2': 'noon in Paris',
+  });
+  assert.equal(weatherToolExecutions - before, 2);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const names = steps!.map((s) => s.name);
+  assert.ok(names.includes('getWeather.call-0') && names.includes('getWeather.call-1'));
+  // getTime was excluded with `false`, so it ran without a step.
+  assert.ok(!names.some((n) => n.startsWith('getTime')));
+
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof durableToolsWorkflow>>(workflowID, noopStep.functionID);
+  assert.deepEqual((await forked.getResult()).toolOutputs, result.toolOutputs);
+  assert.equal(weatherToolExecutions - before, 2);
+});
+
+test('a failing tool checkpoints its error and replays it to the model without re-executing', async () => {
+  durableToolsMock.generateResults.push(toolCallResponse('failTool', '{}'), textResponse('Recovered.'));
+  const workflowID = randomUUID();
+  const before = failToolExecutions;
+  const handle = await DBOS.startWorkflow(durableToolsWorkflow, { workflowID })('fail');
+  const result = await handle.getResult();
+  assert.equal(result.text, 'Recovered.');
+  assert.deepEqual(result.toolErrors, ['tool exploded']);
+  // Retries are off by default, so the tool ran exactly once.
+  assert.equal(failToolExecutions - before, 1);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'failTool.call-1')!;
+  assert.match(String(toolStep.error), /tool exploded/);
+
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof durableToolsWorkflow>>(workflowID, noopStep.functionID);
+  assert.deepEqual((await forked.getResult()).toolErrors, ['tool exploded']);
+  assert.equal(failToolExecutions - before, 1);
+});
+
+test('a streaming tool execute checkpoints its final value inside a workflow and streams unchanged outside', async () => {
+  durableToolsMock.generateResults.push(toolCallResponse('countdown', '{"from":2}'), textResponse('Liftoff.'));
+  const workflowID = randomUUID();
+  const before = countdownYields;
+  const handle = await DBOS.startWorkflow(durableToolsWorkflow, { workflowID })('count');
+  const result = await handle.getResult();
+  assert.deepEqual(result.toolOutputs, { 'call-1': 0 });
+  assert.equal(countdownYields - before, 3);
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.equal(steps!.find((s) => s.name === 'countdown.call-1')!.output, 0);
+
+  const direct = wrappedTools.countdown.execute!({ from: 1 }, directExecOptions);
+  assert.equal(typeof (direct as AsyncIterable<number>)[Symbol.asyncIterator], 'function');
+  const yielded: number[] = [];
+  for await (const value of direct as AsyncIterable<number>) yielded.push(value);
+  assert.deepEqual(yielded, [1, 0]);
+});
+
+test('wrapped tools run directly outside a workflow, and tools without execute or opted out are untouched', async () => {
+  const before = weatherToolExecutions;
+  assert.deepEqual(await wrappedTools.getWeather.execute!({ city: 'Rome' }, directExecOptions), {
+    city: 'Rome',
+    forecast: 'sunny in Rome',
+  });
+  assert.equal(weatherToolExecutions - before, 1);
+  assert.equal(wrappedTools.clientOnly, plainTools.clientOnly);
+  assert.equal(wrappedTools.getTime, plainTools.getTime);
+  assert.notEqual(wrappedTools.getWeather, plainTools.getWeather);
+});
+
+test('a wrapped tool called inside an existing step does not open a nested step', async () => {
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(nestedToolWorkflow, { workflowID })();
+  assert.deepEqual(await handle.getResult(), { city: 'Rome', forecast: 'sunny in Rome' });
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.deepEqual(steps!.map((s) => s.name), ['outer']);
+});
+
+test('in streamText the tool step is ordered after the model step', async () => {
+  streamDurableToolsMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'tool-call', toolCallId: 'call-1', toolName: 'getWeather', input: '{"city":"Oslo"}' },
+      { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+    ],
+    textStreamParts(['Rainy in Oslo.']),
+  );
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(streamDurableToolsWorkflow, { workflowID })('weather in Oslo?');
+  assert.equal(await handle.getResult(), 'Rainy in Oslo.');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const modelStep = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
+  const toolStep = steps!.find((s) => s.name === 'getWeather.call-1')!;
+  assert.ok(modelStep.functionID < toolStep.functionID);
+});
+
+test('a tool that opts into retries is retried inside one step', async () => {
+  flakyToolsMock.generateResults.push(toolCallResponse('flaky', '{}'), textResponse('done'));
+  const workflowID = randomUUID();
+  const before = flakyToolExecutions;
+  const handle = await DBOS.startWorkflow(flakyToolsWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'done');
+  assert.equal(flakyToolExecutions - before, 3);
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'flaky.call-1')!;
+  assert.equal(toolStep.output, 'ok');
+});
+
+test('an aborted tool call records the abort and is not retried even with retries enabled', async () => {
+  abortToolsMock.generateResults.push(toolCallResponse('slowTool', '{}'));
+  const started = new Promise<void>((resolve) => (slowToolStarted = resolve));
+  const workflowID = randomUUID();
+  const before = slowToolExecutions;
+  const handle = await DBOS.startWorkflow(abortToolsWorkflow, { workflowID })();
+  await started;
+  toolAbort!();
+  assert.equal(await handle.getResult(), 'caught:AbortError');
+  assert.equal(slowToolExecutions - before, 1);
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'slowTool.call-1')!;
+  assert.match(String(toolStep.error), /abort/i);
+});
+
+test('a step timeout is forwarded to the tool abort signal, so a timed-out tool stops', async () => {
+  timeoutToolsMock.generateResults.push(toolCallResponse('hang', '{}'), textResponse('Timed out.'));
+  const workflowID = randomUUID();
+  const before = hangToolExecutions;
+  hangToolAbortReason = undefined;
+  const handle = await DBOS.startWorkflow(timeoutToolsWorkflow, { workflowID })();
+  const result = await handle.getResult();
+  assert.equal(result.text, 'Timed out.');
+  assert.equal(result.toolErrors.length, 1);
+  assert.equal(hangToolExecutions - before, 1);
+  // Without forwarding, the tool's promise would never settle and this stays undefined.
+  assert.ok(hangToolAbortReason !== undefined, 'tool never observed the step timeout');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const toolStep = steps!.find((s) => s.name === 'hang.call-1')!;
+  assert.ok(toolStep.error !== null, 'timed-out tool recorded as a step error');
+});
+
+test("the AI SDK's timeout bounds a durable stream: recorded as a TimeoutError, not retried, rethrown on replay", async () => {
+  sdkTimeoutMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'HELLO' },
+    () => new Promise((resolve) => setTimeout(resolve, 400)),
+    { type: 'text-delta', id: 't1', delta: ' WORLD' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(sdkTimeoutWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'HELLO');
+  assert.equal(sdkTimeoutMock.streamCalls, 1); // a timeout is an abort: terminal despite retriesAllowed
+
+  for (let i = 0; i < 500 && !(await DBOS.listWorkflowSteps(workflowID))?.some((s) => s.name === 'mock.mock-model.stream'); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const { step } = await recordedStreamStep(workflowID);
+  assert.match(String(step.error), /TimeoutError|timeout/i);
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof sdkTimeoutWorkflow>>(workflowID, 1);
+  await assert.rejects(forked.getResult(), /timeout/i);
+  assert.equal(sdkTimeoutMock.streamCalls, 1);
+});
+
+test('a generateText abort is recorded as the step error, and replay rethrows it without the AI SDK retrying', async () => {
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(generateAbortWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'caught:AbortError');
+  assert.equal(generateAbortMock.generateCalls, 1); // maxRetries defaults to 2, but an abort is never retried
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.deepEqual(steps!.map((s) => s.name), ['mock.mock-model.generate', 'noop']);
+  assert.match(String(steps![0]!.error), /abort/i);
+
+  // Fork past the model step: the revived error keeps its AbortError name, so the AI SDK rethrows instead of retrying into a new step.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof generateAbortWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 'caught:AbortError');
+  assert.equal(generateAbortMock.generateCalls, 1);
+  const forkedSteps = await DBOS.listWorkflowSteps(forked.workflowID);
+  assert.deepEqual(forkedSteps!.map((s) => s.name), ['mock.mock-model.generate', 'noop']);
+});
+
+test('a stream started with an already-aborted signal lets a follow-up call wait for its step instead of refusing it', async () => {
+  preAbortedMock.streamPartLists.push(textStreamParts(['never']));
+  preAbortedMock.generateResults.push(textResponse('summary'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(preAbortedWorkflow, { workflowID })();
+  // Nothing is emitted before the recorded abort, so the consumer cannot reach the follow-up until the step has settled.
+  assert.equal(await handle.getResult(), 'summary');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const streamStep = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
+  const generateStep = steps!.find((s) => s.name === 'mock.mock-model.generate')!;
+  assert.match(String(streamStep.error), /abort/i);
+  assert.ok(streamStep.completedAtEpochMs! <= generateStep.startedAtEpochMs!, 'follow-up started before the aborted step was recorded');
+});
+
+test('parallel calls to the same MCP tool checkpoint under distinct step names and replay with their own results', async () => {
+  parallelMcpMock.generateResults.push(
+    toolCallsResponse([
+      { toolName: 'getWeather', input: '{"city":"Paris"}' },
+      { toolName: 'getWeather', input: '{"city":"Oslo"}' },
+    ]),
+    textResponse('Both fetched.'),
+  );
+  const workflowID = randomUUID();
+  const before = parallelMcpClient.weatherCalls;
+  const handle = await DBOS.startWorkflow(parallelMcpWorkflow, { workflowID })('weather in Paris and Oslo?');
+  assert.equal(await handle.getResult(), 'Both fetched.');
+  assert.equal(parallelMcpClient.weatherCalls - before, 2);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  // A shared name would let a reordered replay hand each call the other's checkpoint; the call id keeps them apart.
+  assert.equal(steps!.find((s) => s.name === 'mcp.tool.getWeather.call-0')!.output, 'sunny in Paris');
+  assert.equal(steps!.find((s) => s.name === 'mcp.tool.getWeather.call-1')!.output, 'sunny in Oslo');
+
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof parallelMcpWorkflow>>(workflowID, noopStep.functionID);
+  assert.equal(await forked.getResult(), 'Both fetched.');
+  assert.equal(parallelMcpClient.weatherCalls - before, 2);
 });

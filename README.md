@@ -53,7 +53,7 @@ When an agent runs inside a DBOS workflow, DBOS makes three things durable:
 
 - **Every model call.** `durableCalls()` is AI SDK middleware that intercepts `doGenerate`/`doStream` and runs each call through [`DBOS.runStep`](https://docs.dbos.dev/typescript/tutorials/step-tutorial). The complete result (content, usage, finish reason, response metadata) is checkpointed in Postgres. On recovery, completed calls replay from their checkpoints without contacting the model provider.
 - **The agent loop.** Because DBOS workflows replay deterministically on recovery and each model call replays from its checkpoint, a multi-step, tool-calling agent resumes from the first unfinished step instead of restarting from the beginning.
-- **Tool calls.** MCP tools (via [`durableMCPTools`](#mcp-tools)) are checkpointed automatically. Your own tools' side effects are durable when you wrap their `execute` in `DBOS.runStep` (see [Tools](#tools)).
+- **Tool calls.** Your own tools are checkpointed when wrapped with [`durableTools`](#tools), and MCP tools via [`durableMCPTools`](#mcp-tools). On recovery, completed tool calls replay their recorded output instead of re-running.
 
 Outside a workflow (or inside another step) the wrapped model calls the provider directly with no checkpointing, so the same model works anywhere in your app.
 
@@ -85,8 +85,7 @@ As a consequence:
 
 - You can safely forward streamed deltas to a UI or terminal, but you should not perform durable steps on them because model responses are not resumable. Instead, run your own durable steps on the complete result (`result.text`) after the stream ends. Tool calls performed by the AI SDK during streaming are already durable because they execute after the model call has been checkpointed.
 - Do not exit a stream before it completes. To stop reading early, either drain the stream (`await result.consumeStream()`) or abort it.
-- To abort early, pass an `abortSignal` to `streamText` and fire it. The abort detaches your consumer, but inside a workflow it does not cut the model call short; the step keeps draining and checkpoints the complete response.
-- The AI SDK's own `timeout` option does not bound a durable model call, because its signal is an abort signal. Bound the call with the step's `timeoutMS` instead (`durableCalls({ timeoutMS })`), which DBOS tears down deterministically.
+- To abort early, pass an `abortSignal` to `streamText` and fire it. The abort stops the model call, and the step is checkpointed as failed with the signal's reason as its error (an `AbortError` unless you abort with your own reason).
 
 ```ts
 import { streamText } from 'ai';
@@ -109,33 +108,44 @@ const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
 ## Tools
 
 Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop.
-You should wrap your tool's `execute` in a DBOS step so it is checkpointed too.
+Wrap your tools with `durableTools` so each tool call is checkpointed too: on recovery, completed tool calls replay their recorded output (or error) instead of re-running.
 
 ```ts
 import { tool, stepCountIs } from 'ai';
+import { durableTools } from '@dbos-inc/vercel-ai';
 import { z } from 'zod';
 
+const tools = durableTools({
+  getWeather: tool({
+    description: 'Get the weather for a city',
+    inputSchema: z.object({ city: z.string() }),
+    execute: ({ city }) => fetchWeather(city),
+  }),
+});
+
 const agent = DBOS.registerWorkflow(async (question: string) => {
-  const result = await generateText({
-    model,
-    prompt: question,
-    tools: {
-      getWeather: tool({
-        description: 'Get the weather for a city',
-        inputSchema: z.object({ city: z.string() }),
-        execute: ({ city }) => DBOS.runStep(() => fetchWeather(city), { name: 'getWeather' }),
-      }),
-    },
-    stopWhen: stepCountIs(10),
-  });
+  const result = await generateText({ model, prompt: question, tools, stopWhen: stepCountIs(10) });
   return result.text;
 }, { name: 'weatherAgent' });
+```
+
+You can pass step configuration (such as timeouts or retries) to `durableTools`.
+You can set default for all tools or configure tools individually.
+Retries are off by default.
+
+```ts
+const tools = durableTools(myTools, {
+  timeoutMS: 30_000,
+  tools: {
+    getWeather: { retriesAllowed: true, maxAttempts: 3 },
+  },
+});
 ```
 
 ### MCP tools
 
 `durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (e.g. from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps.
-Each tool call is checkpointed so recovery replays results instead of re-invoking the tool:
+Each tool call is checkpointed as a step named `mcp.tool.<tool>.<toolCallId>`, so recovery replays results instead of re-invoking the tool:
 
 ```ts
 import { createMCPClient } from '@ai-sdk/mcp';
@@ -157,29 +167,6 @@ const tools = await durableMCPTools(mcpClient, {
 });
 ```
 
-## Concurrency
-
-Run **one durable model call at a time within a single workflow**.
-DBOS requires workflows to be deterministic, but the AI SDK issues concurrent model calls in nondeterministic order.
-To guard against nondeterminism, this integration throws an error if it detects concurrent durable model calls in the same workflow.
-Sequential calls (including a normal tool-calling loop, where each model call completes before the next begins) are unaffected.
-
-To fan out model calls in parallel, give each its own **child workflow**:
-
-```ts
-const summarizeOne = DBOS.registerWorkflow(
-  async (doc: string) => (await generateText({ model, prompt: `Summarize: ${doc}` })).text,
-  { name: 'summarizeOne' },
-);
-
-const summarizeAll = DBOS.registerWorkflow(async (docs: string[]) => {
-  const handles = await Promise.all(
-    docs.map((doc) => DBOS.startWorkflow(summarizeOne)(doc)),
-  );
-  return Promise.all(handles.map((h) => h.getResult()));
-}, { name: 'summarizeAll' });
-```
-
 ## Embeddings
 
 `durableEmbeddingCalls` enables durable calls to embedding models:
@@ -193,10 +180,8 @@ const embeddingModel = wrapEmbeddingModel({
   middleware: durableEmbeddingCalls({ retriesAllowed: true }),
 });
 
-const { embeddings } = await embedMany({ model: embeddingModel, values: chunks, maxParallelCalls: 1 });
+const { embeddings } = await embedMany({ model: embeddingModel, values: chunks });
 ```
-
-Pass `maxParallelCalls: 1` when embedding more values than the model's per-call limit. `embedMany` otherwise splits the input into batches and runs them concurrently, which the concurrency guard rejects (their step order would be nondeterministic on replay); `maxParallelCalls: 1` runs the batches sequentially, keeping them durable and replay-safe.
 
 ## Images
 

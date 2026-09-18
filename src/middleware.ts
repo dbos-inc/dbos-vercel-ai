@@ -24,21 +24,17 @@ import { assertNotInTransaction, isInWorkflowFunction, restoreAISDKErrorIdentity
 
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
+// A stream call whose consumer detached (abort/cancel) but whose step is still settling; the next call in that workflow waits for it.
+const settlingModelCalls = new Map<string, Promise<void>>();
 
-// Consumer abort signals withheld from the provider inside a workflow, keyed by the transformed params wrapStream receives.
-const detachedAbortSignals = new WeakMap<object, AbortSignal>();
-
-function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed'): string {
+async function enterDurableModelCall(): Promise<string> {
   const workflowID = DBOS.workflowID!;
+  // Sequence after a detached call's checkpoint, so steps are always recorded in the order they were started.
+  await settlingModelCalls.get(workflowID);
   const inflight = inflightModelCalls.get(workflowID) ?? 0;
   if (inflight > 0) {
-    // embedMany parallelizes its batches; maxParallelCalls: 1 serializes them deterministically. Other callers use child workflows.
-    const remedy =
-      operation === 'embed'
-        ? 'pass maxParallelCalls: 1 to embedMany, or run each call in its own child workflow with DBOS.startWorkflow'
-        : 'run each call in its own child workflow with DBOS.startWorkflow';
     throw new Error(
-      `Concurrent durable model calls in workflow "${workflowID}" are not supported because their step order is nondeterministic on replay; ${remedy}.`,
+      `Concurrent durable model calls in workflow "${workflowID}" are not supported because their step order is nondeterministic on replay; run each call in its own child workflow with DBOS.startWorkflow.`,
     );
   }
   inflightModelCalls.set(workflowID, inflight + 1);
@@ -60,30 +56,18 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
   return {
     specificationVersion: 'v4',
 
-    // A consumer abort (a stop button, an AI SDK timeout, a shutting-down worker) must not cut a durable stream short:
-    // the truncated output would be checkpointed as the step's permanent result and replayed on recovery as the whole
-    // answer. Withhold the signal from the provider so the call records a complete result; keep it here for the guard.
-    // Generate is left alone: an aborted doGenerate rejects (nothing partial to record), and the AI SDK's tool loop
-    // relies on that rejection to stop — stripping it there would let the loop keep calling the model after an abort.
-    transformParams: async ({ params, type }) => {
-      if (type !== 'stream' || !isInWorkflowFunction() || !params.abortSignal) {
-        return params;
-      }
-      const { abortSignal, ...rest } = params;
-      detachedAbortSignals.set(rest, abortSignal);
-      return rest;
-    },
-
-    wrapGenerate: async ({ doGenerate, model }) => {
+    wrapGenerate: async ({ doGenerate, params, model }) => {
       assertNotInTransaction('generate');
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
-      const workflowID = enterDurableModelCall('generate');
+      const workflowID = await enterDurableModelCall();
       try {
         return await DBOS.runStep(async () => ensureResponseMetadata(encodeBinaryContent(await doGenerate())), {
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'generate'),
+          // An aborted call is never retried, whatever the provider's rejection looks like.
+          shouldRetry: async (error: unknown) => params.abortSignal?.aborted !== true && (await stepConfig.shouldRetry!(error)),
         });
       } catch (error) {
         // Restore the AI SDK error identity a replay revival strips, so the SDK's retry/catch logic behaves the same.
@@ -98,29 +82,24 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       if (!isInWorkflowFunction()) {
         return await doStream();
       }
-      const workflowID = enterDurableModelCall('stream');
-      // The consumer's signal, detached from the provider call by transformParams (undefined outside a workflow).
-      const abortSignal = detachedAbortSignals.get(params);
-      // An aborted consumer is done with this call, like a cancelled one: post-abort failures must checkpoint as a (partial) success, or replay would fail where the live run ended gracefully.
+      const workflowID = await enterDurableModelCall();
+      // The caller's abortSignal merged with the AI SDK's timeouts; an abort stops the provider call and is recorded as the step's outcome.
+      const abortSignal = params.abortSignal;
       const aborted = () => abortSignal?.aborted === true;
-
-      // Free the concurrency guard as soon as the consumer detaches (abort/cancel), not only when the step
-      // settles: this call's step is already sequenced, so a sequential follow-up in the same workflow is
-      // deterministic on replay and must not be rejected as concurrent while this step drains in the background.
-      let guardReleased = false;
-      const releaseGuard = () => {
-        if (guardReleased) return;
-        guardReleased = true;
-        abortSignal?.removeEventListener('abort', releaseGuard);
-        exitDurableModelCall(workflowID);
-      };
-      abortSignal?.addEventListener('abort', releaseGuard, { once: true });
 
       let executed = false;
       let cancelled = false;
       let emittedLive = false;
+      let released = false;
       let controller!: ReadableStreamDefaultController<LanguageModelV4StreamPart>;
       let step!: Promise<LanguageModelV4GenerateResult>;
+      let settled!: Promise<void>;
+      // A detached consumer (abort/cancel) may issue a sequential follow-up while this step still settles: make that call wait for this checkpoint instead of refusing it as concurrent.
+      const detach = () => {
+        abortSignal?.removeEventListener('abort', detach);
+        if (!released) settlingModelCalls.set(workflowID, settled);
+      };
+      abortSignal?.addEventListener('abort', detach, { once: true });
       const stream = new ReadableStream<LanguageModelV4StreamPart>({
         start(c) {
           controller = c;
@@ -128,11 +107,11 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         // Await the step so an early cancel still blocks until the model result is checkpointed.
         async cancel() {
           cancelled = true;
-          releaseGuard();
+          detach();
           // Post-cancel failures normally checkpoint as a success; anything else (e.g. a failed checkpoint write) is only visible here.
-          await step.catch((error: unknown) =>
-            DBOS.logger.warn(`Durable model call step failed after consumer cancel: ${String(error)}`),
-          );
+          await step.catch((error: unknown) => {
+            if (!aborted()) DBOS.logger.warn(`Durable model call step failed after consumer cancel: ${String(error)}`);
+          });
         },
       });
       const emit = (part: LanguageModelV4StreamPart) => {
@@ -143,11 +122,11 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         }
       };
 
-      // Once any output part has streamed live, a retry would re-stream from scratch and duplicate output, so stop retrying.
+      // Once any output part has streamed live, a retry would re-stream from scratch and duplicate output; an aborted call is never retried.
       const streamStepConfig: StepConfig = {
         ...stepConfig,
         shouldRetry: async (error: unknown) =>
-          !emittedLive && (stepConfig.shouldRetry ? await stepConfig.shouldRetry(error) : true),
+          !emittedLive && !aborted() && (stepConfig.shouldRetry ? await stepConfig.shouldRetry(error) : true),
       };
 
       try {
@@ -162,17 +141,18 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             let sawFinish = false;
             const abandon = () => void reader?.cancel().catch(() => {});
             timeoutSignal?.addEventListener('abort', abandon, { once: true });
-            // A consumer abort deliberately does not abandon the drain: the step keeps reading so the checkpoint is complete.
+            // A consumer abort tears the provider call down too; the attempt is then recorded as aborted below.
+            abortSignal?.addEventListener('abort', abandon, { once: true });
             try {
               streamResult = await doStream();
               reader = streamResult.stream.getReader();
               for (;;) {
                 const { done, value: part } = await reader.read();
                 if (timeoutSignal?.aborted) throw (timeoutSignal.reason ?? new Error('step attempt timed out'));
-                if (done) break;
+                if (done || aborted()) break;
                 if (part.type === 'error') {
-                  // A cancelled or aborted consumer abandoned this call; don't let a late failure become the step outcome, or replay would fail where the live run succeeded.
-                  if (cancelled || aborted()) break;
+                  // A cancelled consumer abandoned this call; don't let a late failure become the step outcome, or replay would fail where the live run succeeded.
+                  if (cancelled) break;
                   throw toStepError(part.error);
                 }
                 // Stream deltas live but withhold 'finish' until the checkpoint is durable: the AI SDK runs tool calls (and their durable steps) on 'finish', which must not checkpoint before this model step.
@@ -185,13 +165,16 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
                 throw new Error('Model stream ended without a finish part or any output.');
               }
             } catch (error) {
-              // Same rule for stream-level failures (doStream or a read rejecting) after a cancel or abort.
+              // Same rule for stream-level failures (doStream or a read rejecting) after a cancel; after an abort, the abort is the outcome.
               if (!cancelled && !aborted()) throw error;
             } finally {
               timeoutSignal?.removeEventListener('abort', abandon);
+              abortSignal?.removeEventListener('abort', abandon);
               // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
               void reader?.cancel().catch(() => {});
             }
+            // Record the abort as the step's failure; replay rethrows it, so the workflow must catch aborts it means to survive.
+            if (aborted()) throw toAbortError(abortSignal!.reason);
             // Give the response a durable id/timestamp when the provider sent none, and emit it live (before the
             // withheld 'finish') so the SDK sees the same values live and on replay instead of a fresh fallback.
             // Skip the live emit for a timed-out (abandoned) attempt so it can't interleave with its retry.
@@ -203,15 +186,25 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         );
       } catch (error) {
         // runStep can throw synchronously (e.g. a shutdown race); don't leak the guard entry.
-        releaseGuard();
+        abortSignal?.removeEventListener('abort', detach);
+        exitDurableModelCall(workflowID);
         throw error;
       }
+      // Hold the guard until the step has settled, so the next call in this workflow always starts after this checkpoint.
+      settled = step.then(
+        () => undefined,
+        () => undefined,
+      ).then(() => {
+        released = true;
+        abortSignal?.removeEventListener('abort', detach);
+        exitDurableModelCall(workflowID);
+        if (settlingModelCalls.get(workflowID) === settled) settlingModelCalls.delete(workflowID);
+      });
 
       // Drive the returned stream from the settled step: a live run emits only the withheld 'finish' (deltas already
       // streamed); a recovered run synthesizes the whole stream from the checkpoint. Either way consumers finish
       // only after the result is durable.
-      void step
-        .then(
+      void step.then(
           (recorded) => {
             if (cancelled) return;
             if (executed) {
@@ -227,10 +220,11 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             controller.close();
           },
           (error: unknown) => {
-            if (!cancelled) controller.error(restoreAISDKErrorIdentity(error));
+            if (cancelled) return;
+            // Live abort: surface the signal's own reason so the AI SDK takes its abort path; a replayed abort is an ordinary error.
+            controller.error(executed && aborted() ? (abortSignal?.reason ?? error) : restoreAISDKErrorIdentity(error));
           },
-        )
-        .finally(releaseGuard);
+        );
 
       return { stream };
     },
@@ -242,12 +236,17 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelM
   const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
+    // embedMany awaits this per call: inside a workflow the batches run sequentially (deterministic step order on replay); elsewhere the model's own answer stands.
+    overrideSupportsParallelCalls: ({ model }) => ({
+      then: (onfulfilled, onrejected) =>
+        Promise.resolve(isInWorkflowFunction() ? false : model.supportsParallelCalls).then(onfulfilled, onrejected),
+    }),
     wrapEmbed: async ({ doEmbed, model }) => {
       assertNotInTransaction('embed');
       if (!isInWorkflowFunction()) {
         return await doEmbed();
       }
-      const workflowID = enterDurableModelCall('embed');
+      const workflowID = await enterDurableModelCall();
       try {
         return await DBOS.runStep(async () => doEmbed(), {
           ...stepConfig,
@@ -286,6 +285,12 @@ export function durableImageCalls(options: StepConfig = {}): ImageModelMiddlewar
       }
     },
   };
+}
+
+// The abort reason as a recordable Error (an AbortSignal's reason may be any value); the name is what the AI SDK's abort checks read.
+function toAbortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  return Object.assign(new Error(String(reason)), { name: 'AbortError' });
 }
 
 /** Convert generated image bytes (Uint8Array) to base64 (spec-allowed) to keep checkpoints compact. */
