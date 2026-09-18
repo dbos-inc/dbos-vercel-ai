@@ -1203,6 +1203,27 @@ const generateAbortWorkflow = DBOS.registerWorkflow(
   { name: 'generateAbortWorkflow' },
 );
 
+// A signal that is already aborted never fires its listener; the consumer stays blocked until the step records the abort, so a follow-up still sequences after it.
+const preAbortedMock = new MockLanguageModel();
+const preAbortedModel = wrapLanguageModel({ model: preAbortedMock, middleware: durableCalls() });
+const preAbortedWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const result = streamText({ model: preAbortedModel, prompt: 'hi', abortSignal: controller.signal, maxRetries: 0 });
+    try {
+      for await (const _delta of result.textStream) {
+        /* aborted */
+      }
+    } catch {
+      /* aborted */
+    }
+    const follow = await generateText({ model: preAbortedModel, prompt: 'summarize', maxRetries: 0 });
+    return follow.text;
+  },
+  { name: 'preAbortedWorkflow' },
+);
+
 before(async () => {
   DBOS.setConfig({ name: 'dbos-vercel-ai-test', systemDatabaseUrl });
   await DBOS.launch();
@@ -2494,4 +2515,18 @@ test('a generateText abort is recorded as the step error, and replay rethrows it
   assert.equal(generateAbortMock.generateCalls, 1);
   const forkedSteps = await DBOS.listWorkflowSteps(forked.workflowID);
   assert.deepEqual(forkedSteps!.map((s) => s.name), ['mock.mock-model.generate', 'noop']);
+});
+
+test('a stream started with an already-aborted signal lets a follow-up call wait for its step instead of refusing it', async () => {
+  preAbortedMock.streamPartLists.push(textStreamParts(['never']));
+  preAbortedMock.generateResults.push(textResponse('summary'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(preAbortedWorkflow, { workflowID })();
+  // Nothing is emitted before the recorded abort, so the consumer cannot reach the follow-up until the step has settled.
+  assert.equal(await handle.getResult(), 'summary');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const streamStep = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
+  const generateStep = steps!.find((s) => s.name === 'mock.mock-model.generate')!;
+  assert.match(String(streamStep.error), /abort/i);
+  assert.ok(streamStep.completedAtEpochMs! <= generateStep.startedAtEpochMs!, 'follow-up started before the aborted step was recorded');
 });
