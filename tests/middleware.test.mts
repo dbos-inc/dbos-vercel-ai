@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
-import { DBOS } from '@dbos-inc/dbos-sdk';
+import { DBOS, DBOSClient } from '@dbos-inc/dbos-sdk';
 import { APICallError } from '@ai-sdk/provider';
 import { GatewayRateLimitError } from '@ai-sdk/gateway';
 import { Client as PgClient } from 'pg';
@@ -15,18 +15,23 @@ import {
   stepCountIs,
   streamText,
   tool,
+  type UIMessageChunk,
   wrapEmbeddingModel,
   wrapImageModel,
   wrapLanguageModel,
 } from 'ai';
 import { z } from 'zod';
 import {
+  closeDurableStream,
   durableCalls,
   durableEmbeddingCalls,
   durableImageCalls,
   durableMCPTools,
+  type DurableStreamRecord,
   durableTools,
   type MCPClientLike,
+  readDurableStream,
+  writeDurableStream,
 } from '../src/index.js';
 import { restoreAISDKErrorIdentity } from '../src/internal.js';
 import {
@@ -1227,6 +1232,211 @@ const preAbortedWorkflow = DBOS.registerWorkflow(
     return follow.text;
   },
   { name: 'preAbortedWorkflow' },
+);
+
+// Durable stream: model parts from the model step, tool outputs from tool steps, user chunks from writeDurableStream.
+const dsMock = new MockLanguageModel();
+const dsModel = wrapLanguageModel({
+  model: dsMock,
+  middleware: durableCalls({ durableStream: { key: 'ui', maxBatchParts: 2, maxBatchDelayMs: 5 } }),
+});
+const dsTools = durableTools(
+  {
+    getWeather: tool({
+      description: 'Get the weather for a city',
+      inputSchema: z.object({ city: z.string() }),
+      execute: async ({ city }) => {
+        await writeDurableStream('ui', [{ type: 'data-progress', id: 'progress', data: { city } }]);
+        return `sunny in ${city}`;
+      },
+    }),
+  },
+  { durableStream: 'ui' },
+);
+const dsWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = streamText({ model: dsModel, prompt, tools: dsTools, stopWhen: stepCountIs(5), maxRetries: 0 });
+    const live: string[] = [];
+    for await (const chunk of result.toUIMessageStream()) live.push(chunk.type);
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { text: await result.text, live };
+  },
+  { name: 'dsWorkflow' },
+);
+
+// A slow provider so the delay-based flush (a timer callback) is what writes the first batch.
+const dsSlowMock = new MockLanguageModel();
+const dsSlowModel = wrapLanguageModel({
+  model: dsSlowMock,
+  middleware: durableCalls({ durableStream: { key: 'ui', maxBatchParts: 50, maxBatchDelayMs: 5 } }),
+});
+const dsSlowWorkflow = DBOS.registerWorkflow(
+  async () => (await streamText({ model: dsSlowModel, prompt: 'hi', maxRetries: 0 }).text),
+  { name: 'dsSlowWorkflow' },
+);
+
+const dsAbortMock = new MockLanguageModel();
+const dsAbortModel = wrapLanguageModel({ model: dsAbortMock, middleware: durableCalls({ durableStream: 'ui' }) });
+let dsAbortGate = newGate();
+const dsAbortWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    const result = streamText({ model: dsAbortModel, prompt: 'hi', abortSignal: controller.signal, maxRetries: 0 });
+    let text = '';
+    for await (const delta of result.textStream) {
+      text += delta;
+      controller.abort();
+      dsAbortGate.release();
+    }
+    return text;
+  },
+  { name: 'dsAbortWorkflow' },
+);
+
+const dsErrorMock = new MockLanguageModel();
+const dsErrorModel = wrapLanguageModel({ model: dsErrorMock, middleware: durableCalls({ durableStream: 'ui', retriesAllowed: false }) });
+const dsErrorWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const result = streamText({ model: dsErrorModel, prompt: 'hi', maxRetries: 0 });
+    return await result.text;
+  },
+  { name: 'dsErrorWorkflow' },
+);
+
+const dsRetryMock = new MockLanguageModel();
+const dsRetryModel = wrapLanguageModel({
+  model: dsRetryMock,
+  middleware: durableCalls({ durableStream: 'ui', retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 }),
+});
+const dsRetryWorkflow = DBOS.registerWorkflow(
+  async () => (await streamText({ model: dsRetryModel, prompt: 'hi', maxRetries: 0 }).text),
+  { name: 'dsRetryWorkflow' },
+);
+
+const dsManualWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await writeDurableStream('ui', [{ type: 'data-note', id: 'n1', data: { n: 1 } }]);
+    await closeDurableStream('ui', 'stop');
+    return 'done';
+  },
+  { name: 'dsManualWorkflow' },
+);
+
+async function readChunks(workflowID: string, key: string, offset?: number): Promise<UIMessageChunk[]> {
+  const chunks: UIMessageChunk[] = [];
+  for await (const chunk of readDurableStream({ workflowID, key, messageId: 'msg-1', offset })) chunks.push(chunk);
+  return chunks;
+}
+async function readRecords(workflowID: string, key: string): Promise<DurableStreamRecord[]> {
+  const records: DurableStreamRecord[] = [];
+  for await (const record of DBOS.readStream<DurableStreamRecord>(workflowID, key)) records.push(record);
+  return records;
+}
+const visible = (chunks: UIMessageChunk[]) => chunks.filter((c) => c.type !== 'data-dbos-offset');
+// Counts the records written so far without waiting for the stream to end.
+async function readRecordsSoFar(workflowID: string): Promise<number> {
+  let count = 0;
+  try {
+    await DBOS.readStreamOffset(workflowID, 'ui', 0, { timeoutSeconds: 1 });
+    count = 1;
+  } catch {
+    /* nothing yet */
+  }
+  return count;
+}
+const streamedText = (chunks: UIMessageChunk[]) =>
+  chunks.map((c) => (c.type === 'text-delta' ? c.delta : '')).join('');
+
+// Hand-written records exercise the reader's conversions the mock model cannot produce through the AI SDK.
+const dsSyntheticWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const record: DurableStreamRecord = {
+      kind: 'model',
+      step: 0,
+      attempt: 'attempt-a',
+      parts: [
+        { type: 'reasoning-start', id: 'r1' },
+        { type: 'reasoning-delta', id: 'r1', delta: 'thinking' },
+        { type: 'reasoning-end', id: 'r1' },
+        { type: 'source', sourceType: 'url', id: 's1', url: 'https://example.com', title: 'Example' },
+        { type: 'source', sourceType: 'document', id: 's2', mediaType: 'application/pdf', title: 'Spec', filename: 'spec.pdf' },
+        { type: 'file', mediaType: 'image/png', data: { type: 'data', data: 'AAAA' } },
+        { type: 'tool-call', toolCallId: 'p1', toolName: 'webSearch', input: '{"q":"dbos"}', providerExecuted: true },
+        { type: 'tool-result', toolCallId: 'p1', toolName: 'webSearch', result: { hits: 3 } },
+        { type: 'tool-result', toolCallId: 'p2', toolName: 'webSearch', result: { message: 'quota' }, isError: true },
+      ],
+    };
+    await DBOS.runStep(async () => DBOS.writeStream('ui', record), { name: 'write' });
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'dsSyntheticWorkflow' },
+);
+
+// A model call parked at a gate while the workflow is cancelled from outside.
+const dsCancelledMock = new MockLanguageModel();
+const dsCancelledModel = wrapLanguageModel({ model: dsCancelledMock, middleware: durableCalls({ durableStream: { key: 'ui', maxBatchParts: 2 } }) });
+let dsCancelledGate = newGate();
+const dsCancelledWorkflow = DBOS.registerWorkflow(
+  async () => (await streamText({ model: dsCancelledModel, prompt: 'hi', maxRetries: 0 }).text),
+  { name: 'dsCancelledWorkflow' },
+);
+
+// Simulates a crash mid-call: a partial attempt's records stay in the stream ahead of the re-executed call's.
+const staleParts = (text: string): DurableStreamRecord => ({
+  kind: 'model',
+  step: 0,
+  attempt: 'stale',
+  parts: [{ type: 'text-start', id: 't1' }, { type: 'text-delta', id: 't1', delta: text }],
+});
+const freshRecords = (text: string): DurableStreamRecord[] => [
+  { kind: 'model', step: 0, attempt: 'fresh', parts: [{ type: 'text-start', id: 't1' }, { type: 'text-delta', id: 't1', delta: text }, { type: 'text-end', id: 't1' }] },
+  { kind: 'model-end', step: 0, attempt: 'fresh', finishReason: { unified: 'stop', raw: undefined } },
+];
+const dsStaleHistoryWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await DBOS.runStep(
+      async () => {
+        await DBOS.writeStream('ui', staleParts('STALE'));
+        for (const record of freshRecords('fresh')) await DBOS.writeStream('ui', record);
+      },
+      { name: 'write' },
+    );
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'dsStaleHistoryWorkflow' },
+);
+let dsStaleLiveGate = newGate();
+const dsStaleLiveWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await DBOS.runStep(
+      async () => {
+        await DBOS.writeStream('ui', staleParts('STALE'));
+        await dsStaleLiveGate.promise;
+        for (const record of freshRecords('fresh')) await DBOS.writeStream('ui', record);
+      },
+      { name: 'write' },
+    );
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'dsStaleLiveWorkflow' },
+);
+// A long history followed by a gated live tail, to exercise the history-to-live handoff.
+let dsHandoffGate = newGate();
+const dsHandoffWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await DBOS.runStep(
+      async () => {
+        for (let i = 0; i < 30; i++) {
+          await DBOS.writeStream('ui', { kind: 'ui', chunks: [{ type: 'data-tick', id: `tick-${i}`, data: { i } }] } satisfies DurableStreamRecord);
+        }
+        await dsHandoffGate.promise;
+        for (const record of freshRecords('after the gate')) await DBOS.writeStream('ui', record);
+      },
+      { name: 'write' },
+    );
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'dsHandoffWorkflow' },
 );
 
 before(async () => {
@@ -2581,4 +2791,317 @@ test('parallel calls to the same MCP tool checkpoint under distinct step names a
   const forked = await DBOS.forkWorkflow<ReturnType<typeof parallelMcpWorkflow>>(workflowID, noopStep.functionID);
   assert.equal(await forked.getResult(), 'Both fetched.');
   assert.equal(parallelMcpClient.weatherCalls - before, 2);
+});
+
+test('durable stream: model parts, tool outputs and user chunks are recorded from steps and read back as UI chunks', async () => {
+  dsMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', delta: 'Checking' },
+      { type: 'text-end', id: 't1' },
+      { type: 'tool-input-start', id: 'call-1', toolName: 'getWeather' },
+      { type: 'tool-input-delta', id: 'call-1', delta: '{"city":"Oslo"}' },
+      { type: 'tool-input-end', id: 'call-1' },
+      { type: 'tool-call', toolCallId: 'call-1', toolName: 'getWeather', input: '{"city":"Oslo"}' },
+      { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+    ],
+    textStreamParts(['Rainy', ' in Oslo.']),
+  );
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsWorkflow, { workflowID })('weather in Oslo?');
+  const result = await handle.getResult();
+  assert.equal(result.text, 'Rainy in Oslo.');
+
+  // Stream writes from steps claim no function ids: only the model, tool and noop steps are recorded.
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.deepEqual(
+    steps!.map((s) => s.name),
+    ['mock.mock-model.stream', 'getWeather.call-1', 'mock.mock-model.stream', 'noop'],
+  );
+
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.equal(streamedText(chunks), 'CheckingRainy in Oslo.');
+  const types = chunks.map((c) => c.type);
+  // The same chunk sequence the AI SDK produced live, plus the data part the tool wrote before its output.
+  assert.deepEqual(types.filter((t) => t !== 'data-progress'), result.live);
+  assert.ok(types.indexOf('data-progress') < types.indexOf('tool-output-available'));
+  assert.deepEqual((chunks.find((c) => c.type === 'tool-input-available') as { input: unknown }).input, { city: 'Oslo' });
+  assert.equal((chunks.find((c) => c.type === 'tool-output-available') as { output: unknown }).output, 'sunny in Oslo');
+  assert.deepEqual(chunks.at(-1), { type: 'finish', finishReason: 'stop' });
+
+  // Replay writes nothing: a fork copies the stream rows of the steps it replays and adds none of its own.
+  const recordCount = (await readRecords(workflowID, 'ui')).length;
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof dsWorkflow>>(workflowID, noopStep.functionID);
+  assert.equal((await forked.getResult()).text, 'Rainy in Oslo.');
+  assert.equal((await readRecords(forked.workflowID, 'ui')).length, recordCount);
+
+  // Resume from a mid-stream offset: exactly the chunks after that record, with no second start.
+  const full = await readChunks(workflowID, 'ui');
+  const offsetIndex = full.findIndex((c, i) => c.type === 'data-dbos-offset' && i > 3);
+  const offset = (full[offsetIndex] as { data: { offset: number } }).data.offset;
+  assert.deepEqual(await readChunks(workflowID, 'ui', offset), full.slice(offsetIndex + 1));
+});
+
+test('durable stream: model parts are batched in order and the turn ends when the workflow does', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['a', 'b', 'c', 'd', 'e']));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsWorkflow, { workflowID })('spell');
+  assert.equal((await handle.getResult()).text, 'abcde');
+
+  const records = await readRecords(workflowID, 'ui');
+  // 7 content parts (text-start, 5 deltas, text-end) at 2 per batch, then the model-end record.
+  assert.deepEqual(
+    records.map((r) => r.kind),
+    ['model', 'model', 'model', 'model', 'model-end'],
+  );
+  const deltas = records.flatMap((r) => (r.kind === 'model' ? r.parts : [])).map((p) => (p.type === 'text-delta' ? p.delta : ''));
+  assert.equal(deltas.join(''), 'abcde');
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['finish-step', 'finish']);
+});
+
+test('durable stream: an aborted call records what streamed, and the workflow that caught it finishes the turn', async () => {
+  dsAbortMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'HELLO' },
+    () => dsAbortGate.promise,
+    { type: 'text-delta', id: 't1', delta: ' WORLD' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  dsAbortGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsAbortWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'HELLO');
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.equal(streamedText(chunks), 'HELLO');
+  // The abort ends the call, not the stream: the workflow continued and succeeded, so the turn finishes with 'other'.
+  assert.deepEqual(chunks.slice(-2), [{ type: 'finish-step' }, { type: 'finish', finishReason: 'other' }]);
+});
+
+test('durable stream: a failed workflow ends the stream with an error chunk from its status', async () => {
+  dsErrorMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'partial' },
+    { type: 'error', error: new Error('model exploded') },
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsErrorWorkflow, { workflowID })();
+  await assert.rejects(handle.getResult(), /model exploded/);
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.equal(streamedText(chunks), 'partial');
+  assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['error', 'finish']);
+  assert.match((chunks.at(-2) as { errorText: string }).errorText, /model exploded/);
+});
+
+test('durable stream: a reader that disconnects resumes from its last offset without gaps or repeats', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['one', ' two', ' three']));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsWorkflow, { workflowID })('count');
+  assert.equal((await handle.getResult()).text, 'one two three');
+
+  // Read a few chunks, then drop the connection.
+  const reader = readDurableStream({ workflowID, key: 'ui', messageId: 'msg-1' }).getReader();
+  const first: UIMessageChunk[] = [];
+  let offset = 0;
+  while (offset === 0) {
+    const { value } = await reader.read();
+    first.push(value!);
+    if (value!.type === 'data-dbos-offset') offset = (value as { data: { offset: number } }).data.offset;
+  }
+  await reader.cancel();
+
+  const rest = await readChunks(workflowID, 'ui', offset);
+  const full = await readChunks(workflowID, 'ui');
+  const lastOffsetIndex = full.findIndex((c) => c.type === 'data-dbos-offset' && (c as { data: { offset: number } }).data.offset === offset);
+  assert.deepEqual(rest, full.slice(lastOffsetIndex + 1));
+  assert.equal(streamedText(visible([...first, ...rest])), 'one two three');
+});
+
+test('durable stream: a retry before any output writes the response once, under the retried attempt', async () => {
+  dsRetryMock.streamCallErrors.push(new Error('transient upstream failure'));
+  dsRetryMock.streamPartLists.push(textStreamParts(['Recovered']));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsRetryWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'Recovered');
+  assert.equal(dsRetryMock.streamCalls, 2);
+  const records = await readRecords(workflowID, 'ui');
+  assert.deepEqual(records.map((r) => r.kind), ['model', 'model-end']);
+  const attempts = new Set(records.map((r) => ('attempt' in r ? r.attempt : undefined)));
+  assert.equal(attempts.size, 1);
+  assert.match(String([...attempts][0]), /^[0-9a-f-]{36}$/);
+  assert.equal(streamedText(visible(await readChunks(workflowID, 'ui'))), 'Recovered');
+});
+
+test('durable stream: workflow-scope writes and an explicit close are checkpointed and read back', async () => {
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsManualWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'done');
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(chunks, [
+    { type: 'start', messageId: 'msg-1' },
+    { type: 'data-note', id: 'n1', data: { n: 1 } },
+    { type: 'finish', finishReason: 'stop' },
+  ]);
+});
+
+test('durable stream: a DBOSClient in another process reads the same stream', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['from', ' afar']));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsWorkflow, { workflowID })('remote');
+  assert.equal((await handle.getResult()).text, 'from afar');
+
+  const client = await DBOSClient.create({ systemDatabaseUrl });
+  try {
+    const chunks: UIMessageChunk[] = [];
+    for await (const chunk of readDurableStream({ workflowID, key: 'ui', messageId: 'msg-1', client })) chunks.push(chunk);
+    assert.deepEqual(chunks, await readChunks(workflowID, 'ui'));
+    assert.equal(streamedText(visible(chunks)), 'from afar');
+  } finally {
+    await client.destroy();
+  }
+});
+
+test('durable stream: the delay-based flush writes from the timer callback with the step context intact', async () => {
+  dsSlowMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'slow' },
+    () => new Promise((resolve) => setTimeout(resolve, 60)),
+    { type: 'text-delta', id: 't1', delta: ' provider' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsSlowWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'slow provider');
+  const records = await readRecords(workflowID, 'ui');
+  // The 5ms timer fired during the provider's pause, so the first batch holds only what streamed before it.
+  assert.deepEqual(records.map((r) => r.kind), ['model', 'model', 'model-end']);
+  assert.deepEqual((records[0] as { parts: { type: string }[] }).parts.map((p) => p.type), ['text-start', 'text-delta']);
+  assert.equal(streamedText(visible(await readChunks(workflowID, 'ui'))), 'slow provider');
+});
+
+test('durable stream: reasoning, sources, files and provider-executed tool results convert to UI chunks, with the AI SDK defaults', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsSyntheticWorkflow, { workflowID })()).getResult();
+
+  const everything = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(
+    everything.map((c) => c.type),
+    ['start', 'start-step', 'reasoning-start', 'reasoning-delta', 'reasoning-end', 'file', 'tool-input-available', 'tool-output-available', 'tool-output-error', 'finish-step', 'finish'],
+  );
+  assert.deepEqual(everything.find((c) => c.type === 'file'), { type: 'file', url: 'data:image/png;base64,AAAA', mediaType: 'image/png', providerMetadata: undefined });
+  assert.deepEqual((everything.find((c) => c.type === 'tool-output-available') as { output: unknown; providerExecuted?: boolean }).output, { hits: 3 });
+  assert.equal((everything.find((c) => c.type === 'tool-output-available') as { providerExecuted?: boolean }).providerExecuted, true);
+  assert.match((everything.find((c) => c.type === 'tool-output-error') as { errorText: string }).errorText, /quota/);
+  // The terminal chunk is last: the offset chunk precedes it.
+  const all = await readChunks(workflowID, 'ui');
+  assert.equal(all.at(-1)!.type, 'finish');
+  assert.equal(all.at(-3)!.type, 'data-dbos-offset');
+
+  const withSources: UIMessageChunk[] = [];
+  for await (const chunk of readDurableStream({ workflowID, key: 'ui', sendSources: true, sendReasoning: false })) withSources.push(chunk);
+  const types = visible(withSources).map((c) => c.type);
+  assert.ok(types.includes('source-url') && types.includes('source-document'));
+  assert.ok(!types.some((t) => t.startsWith('reasoning')));
+  assert.deepEqual(withSources.find((c) => c.type === 'source-url'), {
+    type: 'source-url', sourceId: 's1', url: 'https://example.com', title: 'Example', providerMetadata: undefined,
+  });
+});
+
+test('durable stream: a cancelled workflow ends the stream with an abort chunk', async () => {
+  dsCancelledMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'HELLO' },
+    () => dsCancelledGate.promise,
+    { type: 'text-delta', id: 't1', delta: ' WORLD' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  dsCancelledGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsCancelledWorkflow, { workflowID })();
+  for (let i = 0; i < 500 && (await readRecordsSoFar(workflowID)) === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  await DBOS.cancelWorkflow(workflowID);
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.equal(streamedText(chunks), 'HELLO');
+  assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['finish-step', 'abort']);
+  dsCancelledGate.release();
+  await handle.getResult().catch(() => undefined);
+});
+
+test('durable stream: a superseded attempt in history is skipped, so a re-streamed call is read once', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsStaleHistoryWorkflow, { workflowID })()).getResult();
+  const chunks = await readChunks(workflowID, 'ui');
+  assert.equal(streamedText(visible(chunks)), 'fresh');
+  assert.ok(!chunks.some((c) => c.type === 'data-dbos-superseded'));
+  assert.deepEqual(visible(chunks).map((c) => c.type), ['start', 'start-step', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  // Skipped records still advance the offset, so a resume lands in the right place.
+  assert.deepEqual((chunks.find((c) => c.type === 'data-dbos-offset') as { data: { offset: number } }).data, { offset: 1 });
+});
+
+test('durable stream: a re-execution seen live ends the stale parts and names them in a superseded chunk', async () => {
+  dsStaleLiveGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsStaleLiveWorkflow, { workflowID })();
+  const reader = readDurableStream({ workflowID, key: 'ui', messageId: 'msg-1' }).getReader();
+  const chunks: UIMessageChunk[] = [];
+  while (!chunks.some((c) => c.type === 'text-delta')) chunks.push((await reader.read()).value!);
+  dsStaleLiveGate.release();
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  await handle.getResult();
+  const types = visible(chunks).map((c) => c.type);
+  assert.deepEqual(types, ['start', 'start-step', 'text-start', 'text-delta', 'text-end', 'data-dbos-superseded', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  assert.deepEqual((chunks.find((c) => c.type === 'data-dbos-superseded') as { data: unknown }).data, { attempt: 'stale', parts: ['stale:t1'] });
+  assert.equal((chunks.filter((c) => c.type === 'text-start')[1] as { id: string }).id, 'fresh:t1');
+});
+
+test('durable stream: records written while history is being read are delivered by the live phase', async () => {
+  dsHandoffGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsHandoffWorkflow, { workflowID })();
+  for (let i = 0; i < 500 && (await readRecordsSoFar(workflowID)) === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  const live = readChunks(workflowID, 'ui');
+  dsHandoffGate.release();
+  await handle.getResult();
+  assert.deepEqual(await live, await readChunks(workflowID, 'ui'));
+  assert.equal(streamedText(visible(await live)), 'after the gate');
+  assert.equal((await live).filter((c) => c.type === 'data-tick').length, 30);
+});
+
+test('durable stream: a resume from an offset inside a stale attempt skips the rest of it', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsStaleHistoryWorkflow, { workflowID })()).getResult();
+  // Offset 0 is the stale record, so a client that saw offset 0 resumes at the fresh attempt's first record.
+  const resumed = await readChunks(workflowID, 'ui', 0 + 0);
+  const fromStale = await readChunks(workflowID, 'ui', 1);
+  assert.equal(streamedText(visible(fromStale)), 'fresh');
+  assert.deepEqual(visible(fromStale).map((c) => c.type), ['text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  assert.equal(streamedText(visible(resumed)), 'fresh');
+});
+
+test('durable stream: a second execution of a model step gets its own attempt id', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['first']), textStreamParts(['second']));
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsWorkflow, { workflowID })('run')).getResult();
+  // Fork before the model step: the fork re-executes it, in its own stream, under a new writer.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof dsWorkflow>>(workflowID, 0);
+  assert.equal((await forked.getResult()).text, 'second');
+  const attempt = (records: DurableStreamRecord[]) => (records.find((r) => r.kind === 'model') as { attempt: string }).attempt;
+  const original = attempt(await readRecords(workflowID, 'ui'));
+  const rerun = attempt(await readRecords(forked.workflowID, 'ui'));
+  assert.match(original, /^[0-9a-f-]{36}$/);
+  assert.match(rerun, /^[0-9a-f-]{36}$/);
+  assert.notEqual(original, rerun);
 });

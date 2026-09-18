@@ -1,6 +1,7 @@
 import { StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
 import { isAsyncIterable, runDurableStep, withErrorClassification } from './internal';
+import { writeToolRecord } from './durable-stream';
 
 // Structural type for an MCP client (e.g. from @ai-sdk/mcp) — deliberately loose: the AI SDK ecosystem
 // exact-pins @ai-sdk/provider-utils, so precise Tool types fail to match across skewed copies.
@@ -23,6 +24,8 @@ interface MCPToolLike {
 export interface DurableMCPToolsOptions extends StepConfig {
   /** Forwarded to client.tools() on listing and on each call (e.g. { schemas } for subsetting and output schemas). */
   toolOptions?: unknown;
+  /** Write each tool call's output (or error) to this durable stream from inside its step. */
+  durableStream?: string;
 }
 
 interface DurableToolDef {
@@ -62,7 +65,7 @@ function mcpToolOutput(output: unknown): ToolModelOutput {
  * checkpointed so a recovered workflow replays results instead of re-invoking the tool.
  */
 export async function durableMCPTools(client: MCPClientLike, options: DurableMCPToolsOptions = {}): Promise<ToolSet> {
-  const { toolOptions, ...stepOptions } = options;
+  const { toolOptions, durableStream, ...stepOptions } = options;
   const stepConfig = withErrorClassification(stepOptions);
   const { asSchema, dynamicTool, jsonSchema } = await import('ai');
   const run = <T>(name: string, fn: () => Promise<T>, config: StepConfig = stepConfig): Promise<T> =>
@@ -109,15 +112,24 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
         return run(
           `mcp.tool.${name}.${toolCallId ?? 'call'}`,
           async () => {
-            const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
-            if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
-            const output = await tool.execute(input, execOptions);
-            // A streaming execute can't checkpoint mid-flight; drain it and record the final value (the last yield).
-            if (isAsyncIterable(output)) {
-              let last: unknown;
-              for await (last of output);
-              return last;
+            let output: unknown;
+            try {
+              const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
+              if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
+              output = await tool.execute(input, execOptions);
+              // A streaming execute can't checkpoint mid-flight; drain it and record the final value (the last yield).
+              if (isAsyncIterable(output)) {
+                let last: unknown;
+                for await (last of output);
+                output = last;
+              }
+            } catch (error) {
+              if (durableStream && toolCallId) {
+                await writeToolRecord(durableStream, toolCallId, { errorText: error instanceof Error ? error.message : String(error) });
+              }
+              throw error;
             }
+            if (durableStream && toolCallId) await writeToolRecord(durableStream, toolCallId, { output });
             return output;
           },
           callConfig,
