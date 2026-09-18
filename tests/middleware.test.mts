@@ -180,6 +180,11 @@ const parallelEmbedWorkflow = DBOS.registerWorkflow(
   { name: 'parallelEmbedWorkflow' },
 );
 
+// Reports the wrapped model's parallel-call support as seen from inside a workflow.
+const parallelCallsProbe = DBOS.registerWorkflow(async () => batchEmbedModel.supportsParallelCalls, {
+  name: 'parallelCallsProbe',
+});
+
 const serialEmbedWorkflow = DBOS.registerWorkflow(
   async (values: string[]) => {
     const result = await embedMany({ model: batchEmbedModel, values, maxParallelCalls: 1 });
@@ -1382,6 +1387,16 @@ test('multi-batch embedMany runs its batches sequentially as durable steps witho
   const forked = await DBOS.forkWorkflow<ReturnType<typeof parallelEmbedWorkflow>>(workflowID, 2);
   assert.equal(await forked.getResult(), 4);
   assert.equal(batchEmbedMock.embedCalls - callsBefore, 2); // replayed from the checkpoints
+});
+
+test('a wrapped embedding model allows parallel batches outside a workflow and refuses them inside one', async () => {
+  assert.equal(await batchEmbedModel.supportsParallelCalls, true);
+  assert.equal(await parallelCallsProbe(), false);
+  // Outside a workflow the batches run in parallel and nothing is checkpointed.
+  const callsBefore = batchEmbedMock.embedCalls;
+  const result = await embedMany({ model: batchEmbedModel, values: ['a', 'b', 'c', 'd'] });
+  assert.equal(result.embeddings.length, 4);
+  assert.equal(batchEmbedMock.embedCalls - callsBefore, 2);
 });
 
 test('multi-batch embedMany with an explicit maxParallelCalls: 1 still works', async () => {

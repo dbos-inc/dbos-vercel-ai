@@ -236,8 +236,11 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelM
   const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
-    // embedMany runs its batches in parallel only for models that support it; sequential batches keep their step order deterministic on replay.
-    overrideSupportsParallelCalls: () => false,
+    // embedMany awaits this per call: inside a workflow the batches run sequentially (deterministic step order on replay); elsewhere the model's own answer stands.
+    overrideSupportsParallelCalls: ({ model }) => ({
+      then: (onfulfilled, onrejected) =>
+        Promise.resolve(isInWorkflowFunction() ? false : model.supportsParallelCalls).then(onfulfilled, onrejected),
+    }),
     wrapEmbed: async ({ doEmbed, model }) => {
       assertNotInTransaction('embed');
       if (!isInWorkflowFunction()) {
