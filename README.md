@@ -134,6 +134,7 @@ return createUIMessageStreamResponse({
 Each model call writes its parts (text, reasoning, tool inputs, sources, files) from inside its own step, batched, so the writes are cheap and are never repeated on recovery.
 Each tool call writes its output or error from inside its step.
 `readDurableStream` turns the records into a stream of AI SDK `UIMessageChunk`s that any of the SDK's response helpers can serve.
+It reads through `DBOS` by default; pass `client: await DBOSClient.create({ systemDatabaseUrl })` to serve the stream from a process that has not launched DBOS.
 A transient `data-dbos-offset` chunk follows every record; pass its `offset` back to resume from there.
 
 The turn ends when a model call finishes without tool calls, on `closeDurableStream`, or when the workflow ends: a cancelled workflow yields `abort`, a failed one `error`.

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
-import { DBOS } from '@dbos-inc/dbos-sdk';
+import { DBOS, DBOSClient } from '@dbos-inc/dbos-sdk';
 import { APICallError } from '@ai-sdk/provider';
 import { GatewayRateLimitError } from '@ai-sdk/gateway';
 import { Client as PgClient } from 'pg';
@@ -2831,4 +2831,21 @@ test('durable stream: workflow-scope writes and an explicit close are checkpoint
     { type: 'data-note', id: 'n1', data: { n: 1 } },
     { type: 'finish', finishReason: 'stop' },
   ]);
+});
+
+test('durable stream: a DBOSClient in another process reads the same stream', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['from', ' afar']));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsWorkflow, { workflowID })('remote');
+  assert.equal((await handle.getResult()).text, 'from afar');
+
+  const client = await DBOSClient.create({ systemDatabaseUrl });
+  try {
+    const chunks: UIMessageChunk[] = [];
+    for await (const chunk of readDurableStream({ workflowID, key: 'ui', messageId: 'msg-1', client })) chunks.push(chunk);
+    assert.deepEqual(chunks, await readChunks(workflowID, 'ui'));
+    assert.equal(streamedText(visible(chunks)), 'from afar');
+  } finally {
+    await client.destroy();
+  }
 });

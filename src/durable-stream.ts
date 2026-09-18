@@ -117,6 +117,12 @@ export async function closeDurableStream(key: string, finishReason = 'stop'): Pr
   await DBOS.closeStream(key);
 }
 
+/** What the reader needs from DBOS: the `DBOS` class in a launched process, or a `DBOSClient` anywhere else. */
+export interface DurableStreamSource {
+  readStream<T>(workflowID: string, key: string, options?: { offset?: number }): AsyncGenerator<T, void, unknown>;
+  retrieveWorkflow(workflowID: string): { getStatus(): Promise<{ status: string; error?: unknown } | null> };
+}
+
 export interface ReadDurableStreamOptions {
   workflowID: string;
   key: string;
@@ -124,6 +130,8 @@ export interface ReadDurableStreamOptions {
   messageId?: string;
   /** Number of records already consumed, from the last `data-dbos-offset` chunk. */
   offset?: number;
+  /** Defaults to `DBOS`; pass a `DBOSClient` to read from a process that has not launched DBOS. */
+  client?: DurableStreamSource;
 }
 
 /** Reads a durable stream as AI SDK UI message chunks, live or after the fact, resuming from `offset`. */
@@ -143,6 +151,7 @@ export function readDurableStream(options: ReadDurableStreamOptions): ReadableSt
 
 async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMessageChunk> {
   const { workflowID, key } = options;
+  const client: DurableStreamSource = options.client ?? DBOS;
   let offset = options.offset ?? 0;
   if (offset === 0) yield { type: 'start', messageId: options.messageId };
   let openStep: number | undefined;
@@ -156,7 +165,7 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     openStep = undefined;
   };
 
-  for await (const record of DBOS.readStream<DurableStreamRecord>(workflowID, key, { offset })) {
+  for await (const record of client.readStream<DurableStreamRecord>(workflowID, key, { offset })) {
     offset += 1;
     let ended = false;
     switch (record.kind) {
@@ -213,7 +222,7 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
   }
 
   // No terminal record: the workflow reached a terminal status, which decides how the turn ended.
-  const status = await DBOS.getWorkflowStatus(workflowID);
+  const status = await client.retrieveWorkflow(workflowID).getStatus();
   yield* closeStep();
   if (status?.status === StatusString.CANCELLED) {
     yield { type: 'abort' };

@@ -5,6 +5,7 @@ export {
   closeDurableStream,
   DurableStreamOptions,
   DurableStreamRecord,
+  DurableStreamSource,
   ReadDurableStreamOptions,
   readDurableStream,
   writeDurableStream,
