@@ -1279,6 +1279,15 @@ const dsSlowWorkflow = DBOS.registerWorkflow(
   { name: 'dsSlowWorkflow' },
 );
 
+// generateText with durable tools: a non-streaming call must still put its calls and answer in the stream.
+const dsGenerateWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = await generateText({ model: dsModel, prompt, tools: dsTools, stopWhen: stepCountIs(5), maxRetries: 0 });
+    return result.text;
+  },
+  { name: 'dsGenerateWorkflow' },
+);
+
 const dsAbortMock = new MockLanguageModel();
 const dsAbortModel = wrapLanguageModel({ model: dsAbortMock, middleware: durableCalls({ durableStream: 'ui' }) });
 let dsAbortGate = newGate();
@@ -3582,4 +3591,17 @@ test('durable stream: a turn with no model call ends with a finish chunk that om
     { type: 'data-note', id: 'only', data: { n: 1 } },
     { type: 'finish' },
   ]);
+});
+
+test('durable stream: generateText writes each call whole, so tool outputs follow their calls and the answer is present', async () => {
+  dsMock.generateResults.push(toolCallResponse('getWeather', '{"city":"Oslo"}'), textResponse('Rainy in Oslo.'));
+  const workflowID = randomUUID();
+  assert.equal(await (await DBOS.startWorkflow(dsGenerateWorkflow, { workflowID })('weather?')).getResult(), 'Rainy in Oslo.');
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(
+    chunks.map((c) => c.type),
+    ['start', 'start-step', 'tool-input-start', 'tool-input-delta', 'tool-input-available', 'data-progress', 'tool-output-available', 'finish-step', 'start-step', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish'],
+  );
+  assert.equal(streamedText(chunks), 'Rainy in Oslo.');
+  assert.deepEqual(chunks.at(-1), { type: 'finish', finishReason: 'stop' });
 });
