@@ -44,7 +44,7 @@ npm install @dbos-inc/vercel-ai @dbos-inc/dbos-sdk ai
 
 Requires DBOS v4.21+ or v5, AI SDK v7+, and a Postgres database for DBOS.
 
-## Models
+## Durable Model Calls
 
 To durably checkpoint each call you make to a model, wrap your model in `durableCalls`.
 Then, call your model or agent from a workflow:
@@ -83,7 +83,7 @@ durableCalls({
 });
 ```
 
-## Durable streams
+## Durable Streams
 
 You can **durably stream** agent or model output so it can be read by an external client or UI.
 To do this, configure `durableCalls` or `durableTools`/`durableMCPTools` with a durable stream name:
@@ -118,15 +118,7 @@ It emits a stream of AI SDK `UIMessageChunk`s.
 After every record it emits a transient `data-dbos-offset` chunk; to reconnect an interrupted stream, pass the last `offset` a client saw back as `readDurableStream({ ..., offset })` and the stream resumes from there.
 You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
 
-Details:
-
-- Serve the first response from the durable stream too, as above: its part ids differ from the AI SDK's live stream, so a client must not mix the two.
-- `readDurableStream` accepts `sendReasoning` (default true) and `sendSources` (default false), like `toUIMessageStream`. Call it from route handlers, not from workflow code.
-- `durableStream` also accepts `{ key, maxBatchParts, maxBatchDelayMs }` to tune the model step's batched writes (default: 20 parts or 25 ms per write).
-- `writeDurableStream` from a step is cheap and at-least-once, so give `data-*` parts stable ids. From workflow code each call is a checkpointed step, so the number of calls must be deterministic: never write per token from workflow code.
-- Tool outputs reach the stream from inside the tool's step, so a tool left non-durable writes nothing.
-
-## Tools
+## Durable Tools
 
 Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop.
 Wrap your tools with `durableTools` so each tool call is checkpointed too: on recovery, completed tool calls replay their recorded output (or error) instead of re-running.
@@ -159,16 +151,11 @@ const tools = durableTools(myTools, {
   timeoutMS: 30_000,
   tools: {
     getWeather: { retriesAllowed: true, maxAttempts: 3 },
-    lookupCache: false, // leave this tool non-durable
   },
 });
 ```
 
-Each call runs as a step named `<tool>.<toolCallId>`, so a reordered parallel replay fails rather than swapping results.
-A tool that throws has its error checkpointed and replayed to the model without re-running.
-A `timeoutMS` is forwarded to the tool's `abortSignal`, and an `execute` that is an async generator is drained inside the step and records its last yield.
-
-### MCP tools
+### Durable MCP Tools
 
 `durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (e.g. from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps.
 Each tool call is checkpointed as a step named `mcp.tool.<tool>.<toolCallId>`, so recovery replays results instead of re-invoking the tool:
@@ -193,7 +180,7 @@ const tools = await durableMCPTools(mcpClient, {
 });
 ```
 
-## Embeddings
+## Durable Embedding MOdels
 
 `durableEmbeddingCalls` enables durable calls to embedding models:
 
@@ -209,7 +196,7 @@ const embeddingModel = wrapEmbeddingModel({
 const { embeddings } = await embedMany({ model: embeddingModel, values: chunks });
 ```
 
-## Images
+## Durable Image Models
 
 `durableImageCalls` makes image generation durable:
 
