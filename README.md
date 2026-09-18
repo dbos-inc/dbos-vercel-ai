@@ -103,7 +103,6 @@ const chatTurn = DBOS.registerWorkflow(async (messages: ModelMessage[]) => {
 const handle = await DBOS.startWorkflow(chatTurn)(messages);
 return createUIMessageStreamResponse({
   stream: readDurableStream({ workflowID: handle.workflowID, key: 'ui', messageId }),
-  headers: { 'x-dbos-workflow-id': handle.workflowID },
 });
 ```
 
