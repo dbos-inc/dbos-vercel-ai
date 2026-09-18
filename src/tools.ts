@@ -1,10 +1,13 @@
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
 import { assertNotInTransaction, isAsyncIterable, isInWorkflowFunction, runDurableStep, withErrorClassification } from './internal';
+import { writeToolRecord } from './durable-stream';
 
 export interface DurableToolsOptions extends StepConfig {
   /** Per-tool step config overriding the defaults; `false` leaves that tool non-durable. */
   tools?: Record<string, StepConfig | false>;
+  /** Write each tool call's output (or error) to this durable stream from inside its step. */
+  durableStream?: string;
 }
 
 // Loose view of a tool's execute; the AI SDK validates input and supplies the options.
@@ -16,7 +19,7 @@ type ToolExecute = (input: unknown, options: { toolCallId: string; abortSignal?:
  * Retries are off by default (the AI SDK never retries tools); opt in per tool with `retriesAllowed`.
  */
 export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: DurableToolsOptions = {}): TOOLS {
-  const { tools: perTool, ...defaults } = options;
+  const { tools: perTool, durableStream, ...defaults } = options;
   const durable: ToolSet = {};
   for (const [name, definition] of Object.entries(tools)) {
     const override = perTool?.[name];
@@ -47,13 +50,20 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
             // A timed-out attempt is abandoned by DBOS but keeps running; forward its signal so the tool stops too.
             const timeoutSignal = DBOS.stepStatus?.timeoutSignal;
             const abortSignal = timeoutSignal && signal ? AbortSignal.any([signal, timeoutSignal]) : (timeoutSignal ?? signal);
-            const output = await execute(input, abortSignal === signal ? execOptions : { ...execOptions, abortSignal });
-            // A streaming execute can't checkpoint mid-flight; drain it and record the final value (the last yield).
-            if (isAsyncIterable(output)) {
-              let last: unknown;
-              for await (last of output);
-              return last;
+            let output: unknown;
+            try {
+              output = await execute(input, abortSignal === signal ? execOptions : { ...execOptions, abortSignal });
+              // A streaming execute can't checkpoint mid-flight; drain it and record the final value (the last yield).
+              if (isAsyncIterable(output)) {
+                let last: unknown;
+                for await (last of output);
+                output = last;
+              }
+            } catch (error) {
+              if (durableStream) await writeToolRecord(durableStream, execOptions.toolCallId, { errorText: errorMessage(error) });
+              throw error;
             }
+            if (durableStream) await writeToolRecord(durableStream, execOptions.toolCallId, { output });
             return output;
           },
           callConfig,
@@ -62,4 +72,8 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
     } as ToolSet[string];
   }
   return durable as TOOLS;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

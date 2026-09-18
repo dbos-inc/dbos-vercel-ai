@@ -21,6 +21,12 @@ import type {
   SharedV4Warning,
 } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
 import { assertNotInTransaction, isInWorkflowFunction, restoreAISDKErrorIdentity, withErrorClassification } from './internal';
+import { type DurableStreamOptions, ModelStreamWriter, resolveDurableStream } from './durable-stream';
+
+export interface DurableCallsOptions extends StepConfig {
+  /** Write each streamed model call's parts to this durable stream from inside its step (see readDurableStream). */
+  durableStream?: DurableStreamOptions;
+}
 
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
@@ -51,8 +57,10 @@ function exitDurableModelCall(workflowID: string): void {
 }
 
 /** AI SDK language-model middleware that runs each model call as a durable, checkpointed DBOS step (replayed on recovery); outside a workflow it calls the model directly. */
-export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware {
-  const stepConfig = withErrorClassification(options);
+export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMiddleware {
+  const { durableStream, ...stepOptions } = options;
+  const stepConfig = withErrorClassification(stepOptions);
+  const streamConfig = resolveDurableStream(durableStream);
   return {
     specificationVersion: 'v4',
 
@@ -104,7 +112,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         start(c) {
           controller = c;
         },
-        // Await the step so an early cancel still blocks until the model result is checkpointed.
+        // Await the step so a direct cancel blocks until the checkpoint; through the AI SDK's pipeline a consumer's early exit returns sooner, hence the rule to drain or abort instead.
         async cancel() {
           cancelled = true;
           detach();
@@ -143,6 +151,8 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             timeoutSignal?.addEventListener('abort', abandon, { once: true });
             // A consumer abort tears the provider call down too; the attempt is then recorded as aborted below.
             abortSignal?.addEventListener('abort', abandon, { once: true });
+            // Step-scope stream writes: cheap, replay-safe, and never duplicated since a retry is refused once content has streamed.
+            const streamWriter = streamConfig ? new ModelStreamWriter(streamConfig) : undefined;
             try {
               streamResult = await doStream();
               reader = streamResult.stream.getReader();
@@ -158,6 +168,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
                 // Stream deltas live but withhold 'finish' until the checkpoint is durable: the AI SDK runs tool calls (and their durable steps) on 'finish', which must not checkpoint before this model step.
                 if (part.type === 'finish') sawFinish = true;
                 else emit(part);
+                streamWriter?.push(part);
                 accumulator.add(part);
               }
               // No terminal part and no output: fail (retryably) like the AI SDK's NoOutputGeneratedError, instead of checkpointing a permanent empty success.
@@ -166,7 +177,10 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
               }
             } catch (error) {
               // Same rule for stream-level failures (doStream or a read rejecting) after a cancel; after an abort, the abort is the outcome.
-              if (!cancelled && !aborted()) throw error;
+              if (!cancelled && !aborted()) {
+                await streamWriter?.abandon();
+                throw error;
+              }
             } finally {
               timeoutSignal?.removeEventListener('abort', abandon);
               abortSignal?.removeEventListener('abort', abandon);
@@ -174,13 +188,19 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
               void reader?.cancel().catch(() => {});
             }
             // Record the abort as the step's failure; replay rethrows it, so the workflow must catch aborts it means to survive.
-            if (aborted()) throw toAbortError(abortSignal!.reason);
+            if (aborted()) {
+              await streamWriter?.end({ aborted: true });
+              throw toAbortError(abortSignal!.reason);
+            }
             // Give the response a durable id/timestamp when the provider sent none, and emit it live (before the
             // withheld 'finish') so the SDK sees the same values live and on replay instead of a fresh fallback.
             // Skip the live emit for a timed-out (abandoned) attempt so it can't interleave with its retry.
             const responseMetadataPart = accumulator.fillResponseMetadata(randomUUID(), new Date());
             if (responseMetadataPart && !timeoutSignal?.aborted) emit(responseMetadataPart);
-            return encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
+            const recorded = encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
+            // Every stream write lands before the checkpoint, so a reader that sees the next step has seen all of this one.
+            await streamWriter?.end({ finishReason: recorded.finishReason });
+            return recorded;
           },
           { ...streamStepConfig, name: stepConfig.name ?? stepName(model, 'stream') },
         );

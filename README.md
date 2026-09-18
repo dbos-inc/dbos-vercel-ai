@@ -83,9 +83,10 @@ You can stream durable model responses inside a workflow with `streamText`.
 During streaming, DBOS checkpoints only the final completed output, not individual deltas.
 As a consequence:
 
-- You can safely forward streamed deltas to a UI or terminal, but you should not perform durable steps on them because model responses are not resumable. Instead, run your own durable steps on the complete result (`result.text`) after the stream ends. Tool calls performed by the AI SDK during streaming are already durable because they execute after the model call has been checkpointed.
+- You can forward streamed deltas to a UI or terminal, but do not write them to a DBOS stream from workflow code: each such write is a checkpointed step, and a replayed model call yields one delta per block, so the count differs on replay. Use a [durable stream](#durable-streams) instead.
 - Do not exit a stream before it completes. To stop reading early, either drain the stream (`await result.consumeStream()`) or abort it.
-- To abort early, pass an `abortSignal` to `streamText` and fire it. The abort stops the model call, and the step is checkpointed as failed with the signal's reason as its error (an `AbortError` unless you abort with your own reason).
+- To abort early, pass an `abortSignal` to `streamText` and fire it. The abort stops the model call, and the step is checkpointed as failed with the signal's reason as its error (an `AbortError` unless you abort with your own reason). On recovery the call replays as that error, thrown from the stream, so a workflow that continues after an abort must catch it, as it already must to await `result.text` after one.
+- The AI SDK's `timeout` option aborts with a `TimeoutError`, which is checkpointed the same way. The step's `timeoutMS` (`durableCalls({ timeoutMS })`) instead bounds a single attempt: a timed-out attempt is abandoned and, with retries enabled, retried within the same step.
 
 ```ts
 import { streamText } from 'ai';
@@ -104,6 +105,39 @@ const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
   return await result.text;
 }, { name: 'streamingAgent' });
 ```
+
+## Durable streams
+
+A durable stream records a turn's UI message stream in Postgres as it happens, so a browser can reconnect and resume mid-response and a recovered workflow never re-streams what was already sent.
+Name the stream on the model and on your tools; nothing else in the agent loop changes:
+
+```ts
+import { createUIMessageStreamResponse, streamText } from 'ai';
+import { durableCalls, durableTools, readDurableStream } from '@dbos-inc/vercel-ai';
+
+const model = wrapLanguageModel({ model: openai('gpt-5'), middleware: durableCalls({ durableStream: 'ui' }) });
+const tools = durableTools(myTools, { durableStream: 'ui' });
+
+const chatTurn = DBOS.registerWorkflow(async (messages: ModelMessage[]) => {
+  const result = streamText({ model, messages, tools, stopWhen: stepCountIs(10) });
+  return await result.text;
+}, { name: 'chatTurn' });
+
+// POST: start the turn and stream it. GET: reconnect from the last offset the client saw.
+const handle = await DBOS.startWorkflow(chatTurn)(messages);
+return createUIMessageStreamResponse({
+  stream: readDurableStream({ workflowID: handle.workflowID, key: 'ui', messageId }),
+  headers: { 'x-dbos-workflow-id': handle.workflowID },
+});
+```
+
+Each model call writes its parts (text, reasoning, tool inputs, sources, files) from inside its own step, batched, so the writes are cheap and are never repeated on recovery.
+Each tool call writes its output or error from inside its step.
+`readDurableStream` turns the records into a stream of AI SDK `UIMessageChunk`s that any of the SDK's response helpers can serve.
+A transient `data-dbos-offset` chunk follows every record; pass its `offset` back to resume from there.
+
+The turn ends when a model call finishes without tool calls, on `closeDurableStream`, or when the workflow ends: a cancelled workflow yields `abort`, a failed one `error`.
+To write your own chunks, call `writeDurableStream(key, chunks)`: from a step the write is cheap and at-least-once, so give `data-*` parts stable ids; from workflow code it is a checkpointed step and the number of calls must be deterministic.
 
 ## Tools
 
