@@ -106,7 +106,6 @@ return createUIMessageStreamResponse({
 });
 ```
 
-
 You can read from a durable stream using `readDurableStream`, for example to stream it to a UI.
 It emits a stream of AI SDK `UIMessageChunk`.
 You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
