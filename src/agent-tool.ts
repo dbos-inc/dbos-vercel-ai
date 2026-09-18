@@ -6,16 +6,10 @@ import { isInWorkflowFunction } from './internal';
 /** Marks a tool built by agentTool: durableTools leaves it unwrapped (it is a child workflow, not a step) and binds its durable stream. */
 export const AGENT_TOOL: unique symbol = Symbol.for('@dbos-inc/vercel-ai/agentTool');
 
-/** What agentTool needs from an agent's stream result. */
-export interface AgentStreamResult {
-  consumeStream(): PromiseLike<void>;
-  readonly text: PromiseLike<string>;
-}
-
-/** What agentTool needs from an agent: the AI SDK's Agent interface, structurally. */
-export interface StreamingAgent {
-  stream(options: { prompt: string } | { messages: ModelMessage[] }): PromiseLike<AgentStreamResult>;
-}
+// What agentTool needs from an agent: the AI SDK's Agent interface, structurally.
+type StreamingAgent = {
+  stream(options: { prompt: string } | { messages: ModelMessage[] }): PromiseLike<{ consumeStream(): PromiseLike<void>; readonly text: PromiseLike<string> }>;
+};
 
 export interface AgentToolOptions<INPUT, AGENT extends StreamingAgent, OUTPUT> {
   /** Name of the child workflow; must be unique. */
@@ -38,7 +32,6 @@ export interface AgentToolOptions<INPUT, AGENT extends StreamingAgent, OUTPUT> {
 export type AgentTool<INPUT, OUTPUT> = Tool<INPUT, OUTPUT> & {
   /** The registered child workflow; call it directly to run the sub-agent without a model in the loop. */
   workflow: (input: INPUT) => Promise<OUTPUT>;
-  [AGENT_TOOL]: (durableStream: string) => AgentTool<INPUT, OUTPUT>;
 };
 
 /**
