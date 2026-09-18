@@ -176,6 +176,33 @@ const tools = await durableMCPTools(mcpClient, {
 });
 ```
 
+## Durable Subagents
+
+You can delegate complex tasks to **subagents**, which act as tools for their "parent" agent.
+To create a durable subagent, wrap your agent in `agentTool`, then pass it into `durableTools` just like any other tool:
+
+```ts
+import { ToolLoopAgent } from 'ai';
+import { agentTool, durableTools } from '@dbos-inc/vercel-ai';
+
+const researcher = new ToolLoopAgent({ model, instructions: 'Research thoroughly.', tools: researchTools });
+
+const research = agentTool({
+  name: 'research',                          // subagent name
+  description: 'Research a question in depth',
+  inputSchema: z.object({ question: z.string() }),
+  agent: researcher,
+  prompt: ({ question }) => question,        // tool input → prompt (or ModelMessage[])
+});
+
+const tools = durableTools({ research, getWeather }, { durableStream: 'ui' });
+const orchestrator = new ToolLoopAgent({ model, tools });
+```
+
+Internally, subagents are implemented as child workflows of the parent agent workflow, so each call has its own checkpoints and parallel calls are safe.
+Call `agentTool` before `DBOS.launch()`, since it registers that workflow.
+By default, the tool returns the subagent's final text; you can configure this with the `output` parameter.
+
 ## Durable Embedding Models
 
 `durableEmbeddingCalls` enables durable calls to embedding models:

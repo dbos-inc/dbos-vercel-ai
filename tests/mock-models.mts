@@ -112,6 +112,7 @@ export class MockLanguageModel implements LanguageModelV4 {
   generateCalls = 0;
   streamCalls = 0;
   generateOptions: LanguageModelV4CallOptions[] = [];
+  streamOptions: LanguageModelV4CallOptions[] = [];
 
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {
     this.generateCalls++;
@@ -137,6 +138,7 @@ export class MockLanguageModel implements LanguageModelV4 {
 
   async doStream(options: LanguageModelV4CallOptions): Promise<LanguageModelV4StreamResult> {
     this.streamCalls++;
+    this.streamOptions.push(options);
     const callError = this.streamCallErrors.shift();
     if (callError) {
       // Reject after a tick so a consumer cancelling right away wins the race.

@@ -1,6 +1,7 @@
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
 import { assertNotInTransaction, isAsyncIterable, isInWorkflowFunction, runDurableStep, withErrorClassification } from './internal';
+import { AGENT_TOOL } from './agent-tool';
 import { writeToolRecord } from './durable-stream';
 
 export interface DurableToolsOptions extends StepConfig {
@@ -23,6 +24,12 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
   const durable: ToolSet = {};
   for (const [name, definition] of Object.entries(tools)) {
     const override = perTool?.[name];
+    // An agent tool is a child workflow, not a step: leave it unwrapped, binding this durable stream to it.
+    const bindAgentTool = (definition as { [AGENT_TOOL]?: (key: string) => ToolSet[string] })[AGENT_TOOL];
+    if (bindAgentTool) {
+      durable[name] = durableStream ? bindAgentTool(durableStream) : definition;
+      continue;
+    }
     if (typeof definition.execute !== 'function' || override === false) {
       durable[name] = definition;
       continue;
