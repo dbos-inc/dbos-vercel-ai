@@ -1264,6 +1264,17 @@ const dsWorkflow = DBOS.registerWorkflow(
   { name: 'dsWorkflow' },
 );
 
+// A slow provider so the delay-based flush (a timer callback) is what writes the first batch.
+const dsSlowMock = new MockLanguageModel();
+const dsSlowModel = wrapLanguageModel({
+  model: dsSlowMock,
+  middleware: durableCalls({ durableStream: { key: 'ui', maxBatchParts: 50, maxBatchDelayMs: 5 } }),
+});
+const dsSlowWorkflow = DBOS.registerWorkflow(
+  async () => (await streamText({ model: dsSlowModel, prompt: 'hi', maxRetries: 0 }).text),
+  { name: 'dsSlowWorkflow' },
+);
+
 const dsAbortMock = new MockLanguageModel();
 const dsAbortModel = wrapLanguageModel({ model: dsAbortMock, middleware: durableCalls({ durableStream: 'ui' }) });
 let dsAbortGate = newGate();
@@ -2730,7 +2741,7 @@ test('durable stream: model parts, tool outputs and user chunks are recorded fro
   assert.deepEqual(await readChunks(workflowID, 'ui', offset), full.slice(offsetIndex + 1));
 });
 
-test('durable stream: model parts are batched in order and a final text-only call ends the turn', async () => {
+test('durable stream: model parts are batched in order and the turn ends when the workflow does', async () => {
   dsMock.streamPartLists.push(textStreamParts(['a', 'b', 'c', 'd', 'e']));
   const workflowID = randomUUID();
   const handle = await DBOS.startWorkflow(dsWorkflow, { workflowID })('spell');
@@ -2748,7 +2759,7 @@ test('durable stream: model parts are batched in order and a final text-only cal
   assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['finish-step', 'finish']);
 });
 
-test('durable stream: an aborted call records what streamed and ends with an abort chunk', async () => {
+test('durable stream: an aborted call records what streamed, and the workflow that caught it finishes the turn', async () => {
   dsAbortMock.streamPartLists.push([
     { type: 'stream-start', warnings: [] },
     { type: 'text-start', id: 't1' },
@@ -2764,8 +2775,8 @@ test('durable stream: an aborted call records what streamed and ends with an abo
   assert.equal(await handle.getResult(), 'HELLO');
   const chunks = visible(await readChunks(workflowID, 'ui'));
   assert.equal(streamedText(chunks), 'HELLO');
-  assert.equal(chunks.at(-1)!.type, 'abort');
-  assert.ok(!chunks.some((c) => c.type === 'finish'));
+  // The abort ends the call, not the stream: the workflow continued and succeeded, so the turn finishes with 'other'.
+  assert.deepEqual(chunks.slice(-2), [{ type: 'finish-step' }, { type: 'finish', finishReason: 'other' }]);
 });
 
 test('durable stream: a failed workflow ends the stream with an error chunk from its status', async () => {
@@ -2848,4 +2859,24 @@ test('durable stream: a DBOSClient in another process reads the same stream', as
   } finally {
     await client.destroy();
   }
+});
+
+test('durable stream: the delay-based flush writes from the timer callback with the step context intact', async () => {
+  dsSlowMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'slow' },
+    () => new Promise((resolve) => setTimeout(resolve, 60)),
+    { type: 'text-delta', id: 't1', delta: ' provider' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsSlowWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'slow provider');
+  const records = await readRecords(workflowID, 'ui');
+  // The 5ms timer fired during the provider's pause, so the first batch holds only what streamed before it.
+  assert.deepEqual(records.map((r) => r.kind), ['model', 'model', 'model-end']);
+  assert.deepEqual((records[0] as { parts: { type: string }[] }).parts.map((p) => p.type), ['text-start', 'text-delta']);
+  assert.equal(streamedText(visible(await readChunks(workflowID, 'ui'))), 'slow provider');
 });

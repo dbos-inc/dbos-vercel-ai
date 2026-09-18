@@ -77,39 +77,10 @@ Pass your own `shouldRetry` to override it, or `retriesAllowed: false` to disabl
 
 Because DBOS owns retries by default, pass `maxRetries: 0` to the AI SDK call so retry behavior is governed in one place; otherwise the two compose multiplicatively and each AI SDK retry is a fresh step.
 
-## Streaming
-
-You can stream durable model responses inside a workflow with `streamText`.
-During streaming, DBOS checkpoints only the final completed output, not individual deltas.
-As a consequence:
-
-- You can forward streamed deltas to a UI or terminal, but do not write them to a DBOS stream from workflow code: each such write is a checkpointed step, and a replayed model call yields one delta per block, so the count differs on replay. Use a [durable stream](#durable-streams) instead.
-- Do not exit a stream before it completes. To stop reading early, either drain the stream (`await result.consumeStream()`) or abort it.
-- To abort early, pass an `abortSignal` to `streamText` and fire it. The abort stops the model call, and the step is checkpointed as failed with the signal's reason as its error (an `AbortError` unless you abort with your own reason). On recovery the call replays as that error, thrown from the stream, so a workflow that continues after an abort must catch it, as it already must to await `result.text` after one.
-- The AI SDK's `timeout` option aborts with a `TimeoutError`, which is checkpointed the same way. The step's `timeoutMS` (`durableCalls({ timeoutMS })`) instead bounds a single attempt: a timed-out attempt is abandoned and, with retries enabled, retried within the same step.
-
-```ts
-import { streamText } from 'ai';
-import { durableCalls } from '@dbos-inc/vercel-ai';
-
-const model = wrapLanguageModel({
-  model: openai('gpt-5'),
-  middleware: durableCalls({ retriesAllowed: true, maxAttempts: 5 }),
-});
-
-const streamingAgent = DBOS.registerWorkflow(async (prompt: string) => {
-  const result = streamText({ model, prompt });
-  for await (const delta of result.textStream) {
-    process.stdout.write(delta);
-  }
-  return await result.text;
-}, { name: 'streamingAgent' });
-```
-
 ## Durable streams
 
-A durable stream records a turn's UI message stream in Postgres as it happens, so a browser can reconnect and resume mid-response and a recovered workflow never re-streams what was already sent.
-Name the stream on the model and on your tools; nothing else in the agent loop changes:
+You can **durably stream** agent or model output so it can be read by an external client or UI.
+To do this, configure `durableCalls` or `durableTools` with a durable stream name:
 
 ```ts
 import { createUIMessageStreamResponse, streamText } from 'ai';
@@ -131,14 +102,12 @@ return createUIMessageStreamResponse({
 });
 ```
 
-Each model call writes its parts (text, reasoning, tool inputs, sources, files) from inside its own step, batched, so the writes are cheap and are never repeated on recovery.
-Each tool call writes its output or error from inside its step.
-`readDurableStream` turns the records into a stream of AI SDK `UIMessageChunk`s that any of the SDK's response helpers can serve.
-It reads through `DBOS` by default; pass `client: await DBOSClient.create({ systemDatabaseUrl })` to serve the stream from a process that has not launched DBOS.
-A transient `data-dbos-offset` chunk follows every record; pass its `offset` back to resume from there.
+You can also write your own data to a stream with `writeDurableStream(key, chunks)`.
+Your streams are closed when your workflow finishes; you can close a stream early using `closeDurableStream`.
 
-The turn ends when a model call finishes without tool calls, on `closeDurableStream`, or when the workflow ends: a cancelled workflow yields `abort`, a failed one `error`.
-To write your own chunks, call `writeDurableStream(key, chunks)`: from a step the write is cheap and at-least-once, so give `data-*` parts stable ids; from workflow code it is a checkpointed step and the number of calls must be deterministic.
+You can read from a durable stream using `readDurableStream`, for example to stream it to a UI.
+It emits a stream of AI SDK `UIMessageChunk`s.
+You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
 
 ## Tools
 

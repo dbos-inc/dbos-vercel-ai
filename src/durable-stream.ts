@@ -157,7 +157,6 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
   let openStep: number | undefined;
   // A resume usually lands mid-step, and the client already has that step open.
   let resumed = offset > 0;
-  let stepHadToolCalls = false;
   let finishReason: string | undefined;
   const attempts = new Map<number, number>();
   const closeStep = function* (): Generator<UIMessageChunk> {
@@ -178,31 +177,18 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
           if (!resumed) yield { type: 'start-step' };
           resumed = false;
           openStep = record.step;
-          stepHadToolCalls = false;
         }
         for (const part of record.parts) {
-          if (part.type === 'tool-call') stepHadToolCalls = true;
           const chunk = toUIChunk(part, record.step);
           if (chunk) yield chunk;
         }
         break;
       }
-      case 'model-end': {
+      case 'model-end':
+        // The stream outlives the call: the workflow may run more calls, so only its end (or closeDurableStream) ends the turn.
         if (record.attempt < (attempts.get(record.step) ?? 0)) break;
-        if (record.aborted) {
-          yield { type: 'abort' };
-          ended = true;
-          break;
-        }
-        finishReason = record.finishReason?.unified;
-        // Without tool calls the loop cannot continue, so the turn is over.
-        if (!stepHadToolCalls && finishReason !== 'tool-calls') {
-          yield* closeStep();
-          yield { type: 'finish', finishReason: finishReason as UIFinishReason };
-          ended = true;
-        }
+        finishReason = record.aborted ? 'other' : record.finishReason?.unified;
         break;
-      }
       case 'tool':
         yield record.errorText !== undefined
           ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: record.errorText }
@@ -221,15 +207,15 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     if (ended) return;
   }
 
-  // No terminal record: the workflow reached a terminal status, which decides how the turn ended.
-  const status = await client.retrieveWorkflow(workflowID).getStatus();
+  // No end record: the workflow's status decides how the turn ended (a stream closed while it still runs counts as finished).
+  const status = (await client.retrieveWorkflow(workflowID).getStatus())?.status;
   yield* closeStep();
-  if (status?.status === StatusString.CANCELLED) {
+  if (status === StatusString.CANCELLED) {
     yield { type: 'abort' };
-  } else if (status?.status === StatusString.SUCCESS) {
+  } else if (status === undefined || status === StatusString.SUCCESS || status === StatusString.PENDING || status === StatusString.ENQUEUED) {
     yield { type: 'finish', finishReason: (finishReason ?? 'unknown') as UIFinishReason };
   } else {
-    const error = status?.error;
+    const error = (await client.retrieveWorkflow(workflowID).getStatus())?.error;
     yield { type: 'error', errorText: error instanceof Error ? error.message : String(error ?? 'The workflow ended before the response completed.') };
     yield { type: 'finish', finishReason: 'error' };
   }
