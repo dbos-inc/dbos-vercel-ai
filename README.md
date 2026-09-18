@@ -2,7 +2,7 @@
 
 [DBOS](https://docs.dbos.dev/) durable execution for the [Vercel AI SDK](https://ai-sdk.dev/).
 
-This package makes AI SDK **agents** durable, backed by your Postgres database.
+This package makes AI SDK agents durable, backed by your Postgres database.
 All you have to do is wrap your model with `durableCalls` and your tools with `durableTools` and run your agents inside a DBOS workflow.
 Then, this integration automatically checkpoints every action your agents take in Postgres.
 If your process is interrupted, DBOS replays your agent from its checkpoints so it resumes from where it left off.
