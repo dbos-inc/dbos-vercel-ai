@@ -132,6 +132,10 @@ export interface ReadDurableStreamOptions {
   offset?: number;
   /** Defaults to `DBOS`; pass a `DBOSClient` to read from a process that has not launched DBOS. */
   client?: DurableStreamSource;
+  /** Emit reasoning parts (default true, as in the AI SDK). */
+  sendReasoning?: boolean;
+  /** Emit source parts (default false, as in the AI SDK). */
+  sendSources?: boolean;
 }
 
 /** Reads a durable stream as AI SDK UI message chunks, live or after the fact, resuming from `offset`. */
@@ -150,7 +154,7 @@ export function readDurableStream(options: ReadDurableStreamOptions): ReadableSt
 }
 
 async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMessageChunk> {
-  const { workflowID, key } = options;
+  const { workflowID, key, sendReasoning = true, sendSources = false } = options;
   const client: DurableStreamSource = options.client ?? DBOS;
   let offset = options.offset ?? 0;
   if (offset === 0) yield { type: 'start', messageId: options.messageId };
@@ -166,7 +170,6 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
 
   for await (const record of client.readStream<DurableStreamRecord>(workflowID, key, { offset })) {
     offset += 1;
-    let ended = false;
     switch (record.kind) {
       case 'model': {
         // A retried attempt supersedes an earlier one; content only streams live once, so this mostly guards reconnects.
@@ -179,6 +182,8 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
           openStep = record.step;
         }
         for (const part of record.parts) {
+          if (!sendReasoning && part.type.startsWith('reasoning-')) continue;
+          if (!sendSources && part.type === 'source') continue;
           const chunk = toUIChunk(part, record.step);
           if (chunk) yield chunk;
         }
@@ -198,13 +203,13 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
         yield* record.chunks;
         break;
       case 'end':
+        // The terminal chunk comes last, so the offset goes out first.
+        yield { type: 'data-dbos-offset', data: { offset }, transient: true } as UIMessageChunk;
         yield* closeStep();
         yield { type: 'finish', finishReason: record.finishReason as UIFinishReason };
-        ended = true;
-        break;
+        return;
     }
     yield { type: 'data-dbos-offset', data: { offset }, transient: true } as UIMessageChunk;
-    if (ended) return;
   }
 
   // No end record: the workflow's status decides how the turn ended (a stream closed while it still runs counts as finished).

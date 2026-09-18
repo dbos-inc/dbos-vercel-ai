@@ -1333,8 +1333,53 @@ async function readRecords(workflowID: string, key: string): Promise<DurableStre
   return records;
 }
 const visible = (chunks: UIMessageChunk[]) => chunks.filter((c) => c.type !== 'data-dbos-offset');
+// Counts the records written so far without waiting for the stream to end.
+async function readRecordsSoFar(workflowID: string): Promise<number> {
+  let count = 0;
+  try {
+    await DBOS.readStreamOffset(workflowID, 'ui', 0, { timeoutSeconds: 1 });
+    count = 1;
+  } catch {
+    /* nothing yet */
+  }
+  return count;
+}
 const streamedText = (chunks: UIMessageChunk[]) =>
   chunks.map((c) => (c.type === 'text-delta' ? c.delta : '')).join('');
+
+// Hand-written records exercise the reader's conversions the mock model cannot produce through the AI SDK.
+const dsSyntheticWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const record: DurableStreamRecord = {
+      kind: 'model',
+      step: 0,
+      attempt: 1,
+      parts: [
+        { type: 'reasoning-start', id: 'r1' },
+        { type: 'reasoning-delta', id: 'r1', delta: 'thinking' },
+        { type: 'reasoning-end', id: 'r1' },
+        { type: 'source', sourceType: 'url', id: 's1', url: 'https://example.com', title: 'Example' },
+        { type: 'source', sourceType: 'document', id: 's2', mediaType: 'application/pdf', title: 'Spec', filename: 'spec.pdf' },
+        { type: 'file', mediaType: 'image/png', data: { type: 'data', data: 'AAAA' } },
+        { type: 'tool-call', toolCallId: 'p1', toolName: 'webSearch', input: '{"q":"dbos"}', providerExecuted: true },
+        { type: 'tool-result', toolCallId: 'p1', toolName: 'webSearch', result: { hits: 3 } },
+        { type: 'tool-result', toolCallId: 'p2', toolName: 'webSearch', result: { message: 'quota' }, isError: true },
+      ],
+    };
+    await DBOS.runStep(async () => DBOS.writeStream('ui', record), { name: 'write' });
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'dsSyntheticWorkflow' },
+);
+
+// A model call parked at a gate while the workflow is cancelled from outside.
+const dsCancelledMock = new MockLanguageModel();
+const dsCancelledModel = wrapLanguageModel({ model: dsCancelledMock, middleware: durableCalls({ durableStream: { key: 'ui', maxBatchParts: 2 } }) });
+let dsCancelledGate = newGate();
+const dsCancelledWorkflow = DBOS.registerWorkflow(
+  async () => (await streamText({ model: dsCancelledModel, prompt: 'hi', maxRetries: 0 }).text),
+  { name: 'dsCancelledWorkflow' },
+);
 
 before(async () => {
   DBOS.setConfig({ name: 'dbos-vercel-ai-test', systemDatabaseUrl });
@@ -2879,4 +2924,54 @@ test('durable stream: the delay-based flush writes from the timer callback with 
   assert.deepEqual(records.map((r) => r.kind), ['model', 'model', 'model-end']);
   assert.deepEqual((records[0] as { parts: { type: string }[] }).parts.map((p) => p.type), ['text-start', 'text-delta']);
   assert.equal(streamedText(visible(await readChunks(workflowID, 'ui'))), 'slow provider');
+});
+
+test('durable stream: reasoning, sources, files and provider-executed tool results convert to UI chunks, with the AI SDK defaults', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsSyntheticWorkflow, { workflowID })()).getResult();
+
+  const everything = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(
+    everything.map((c) => c.type),
+    ['start', 'start-step', 'reasoning-start', 'reasoning-delta', 'reasoning-end', 'file', 'tool-input-available', 'tool-output-available', 'tool-output-error', 'finish-step', 'finish'],
+  );
+  assert.deepEqual(everything.find((c) => c.type === 'file'), { type: 'file', url: 'data:image/png;base64,AAAA', mediaType: 'image/png', providerMetadata: undefined });
+  assert.deepEqual((everything.find((c) => c.type === 'tool-output-available') as { output: unknown; providerExecuted?: boolean }).output, { hits: 3 });
+  assert.equal((everything.find((c) => c.type === 'tool-output-available') as { providerExecuted?: boolean }).providerExecuted, true);
+  assert.match((everything.find((c) => c.type === 'tool-output-error') as { errorText: string }).errorText, /quota/);
+  // The terminal chunk is last: the offset chunk precedes it.
+  const all = await readChunks(workflowID, 'ui');
+  assert.equal(all.at(-1)!.type, 'finish');
+  assert.equal(all.at(-3)!.type, 'data-dbos-offset');
+
+  const withSources: UIMessageChunk[] = [];
+  for await (const chunk of readDurableStream({ workflowID, key: 'ui', sendSources: true, sendReasoning: false })) withSources.push(chunk);
+  const types = visible(withSources).map((c) => c.type);
+  assert.ok(types.includes('source-url') && types.includes('source-document'));
+  assert.ok(!types.some((t) => t.startsWith('reasoning')));
+  assert.deepEqual(withSources.find((c) => c.type === 'source-url'), {
+    type: 'source-url', sourceId: 's1', url: 'https://example.com', title: 'Example', providerMetadata: undefined,
+  });
+});
+
+test('durable stream: a cancelled workflow ends the stream with an abort chunk', async () => {
+  dsCancelledMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'HELLO' },
+    () => dsCancelledGate.promise,
+    { type: 'text-delta', id: 't1', delta: ' WORLD' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  dsCancelledGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsCancelledWorkflow, { workflowID })();
+  for (let i = 0; i < 500 && (await readRecordsSoFar(workflowID)) === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  await DBOS.cancelWorkflow(workflowID);
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.equal(streamedText(chunks), 'HELLO');
+  assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['finish-step', 'abort']);
+  dsCancelledGate.release();
+  await handle.getResult().catch(() => undefined);
 });
