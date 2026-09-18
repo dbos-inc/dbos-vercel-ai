@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import type { FlexibleSchema, ModelMessage, Tool } from 'ai' with { 'resolution-mode': 'import' };
-import { writeDurableStream } from './durable-stream';
+import { writeDurableStream, writeToolRecord } from './durable-stream';
 import { isInWorkflowFunction } from './internal';
 
 /** Marks a tool built by agentTool: durableTools leaves it unwrapped (it is a child workflow, not a step) and binds its durable stream. */
@@ -101,13 +101,11 @@ function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
       }
       await started;
       const result = (await pending) as OUTPUT;
-      if (durableStream) await writeDurableStream(durableStream, [{ type: 'tool-output-available', toolCallId, output: result }]);
+      // A tool record, not a raw chunk, so the reader masks a sub-agent's error text like any other tool's.
+      if (durableStream) await writeToolRecord(durableStream, toolCallId, { output: result });
       return result;
     } catch (error) {
-      if (durableStream) {
-        const errorText = error instanceof Error ? error.message : String(error);
-        await writeDurableStream(durableStream, [{ type: 'tool-output-error', toolCallId, errorText }]);
-      }
+      if (durableStream) await writeToolRecord(durableStream, toolCallId, { errorText: error instanceof Error ? error.message : String(error) });
       throw error;
     } finally {
       settled = true;

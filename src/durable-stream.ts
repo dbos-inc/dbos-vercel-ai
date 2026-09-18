@@ -159,6 +159,8 @@ export interface ReadDurableStreamOptions {
   sendReasoning?: boolean;
   /** Emit source parts (default false, as in the AI SDK). */
   sendSources?: boolean;
+  /** Text sent to clients for a workflow or tool error; defaults to a generic message, as in the AI SDK, so server details stay private. */
+  onError?: (error: unknown) => string;
 }
 
 /** Reads a durable stream as AI SDK UI message chunks, live or after the fact, resuming from `offset`. */
@@ -177,7 +179,7 @@ export function readDurableStream(options: ReadDurableStreamOptions): ReadableSt
 }
 
 async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMessageChunk> {
-  const { workflowID, key, sendReasoning = true, sendSources = false } = options;
+  const { workflowID, key, sendReasoning = true, sendSources = false, onError = () => 'An error occurred.' } = options;
   const client: DurableStreamSource = options.client ?? DBOS;
   const state: ReaderState = {
     offset: options.offset ?? 0,
@@ -186,7 +188,7 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     ended: false,
   };
   if (state.offset === 0) yield { type: 'start', messageId: options.messageId };
-  const emit = (record: DurableStreamRecord) => emitRecord(state, record, { sendReasoning, sendSources });
+  const emit = (record: DurableStreamRecord) => emitRecord(state, record, { sendReasoning, sendSources, onError });
 
   // Phase 1: everything already stored, one value per query until an offset is empty; a superseded attempt is skipped whole.
   const history: DurableStreamRecord[] = [];
@@ -224,7 +226,7 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     yield state.finishReason === undefined ? { type: 'finish' } : { type: 'finish', finishReason: state.finishReason as UIFinishReason };
   } else {
     const error = (await client.retrieveWorkflow(workflowID).getStatus())?.error;
-    yield { type: 'error', errorText: error instanceof Error ? error.message : String(error ?? 'The workflow ended before the response completed.') };
+    yield { type: 'error', errorText: onError(error ?? new Error('The workflow ended before the response completed.')) };
     yield { type: 'finish', finishReason: 'error' };
   }
 }
@@ -271,7 +273,7 @@ function* supersede(state: ReaderState, attempt: string): Generator<UIMessageChu
 function* emitRecord(
   state: ReaderState,
   record: DurableStreamRecord,
-  filter: { sendReasoning: boolean; sendSources: boolean },
+  filter: { sendReasoning: boolean; sendSources: boolean; onError: (error: unknown) => string },
 ): Generator<UIMessageChunk> {
   state.offset += 1;
   switch (record.kind) {
@@ -301,8 +303,9 @@ function* emitRecord(
       if (record.attempt === state.openAttempt) state.finishReason = record.aborted ? 'other' : record.finishReason?.unified;
       break;
     case 'tool':
+      // Local tool errors are masked like the AI SDK does; provider-executed ones (in model records) pass through verbatim.
       yield record.errorText !== undefined
-        ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: record.errorText }
+        ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: filter.onError(new Error(record.errorText)) }
         : { type: 'tool-output-available', toolCallId: record.toolCallId, output: record.output };
       break;
     case 'ui':

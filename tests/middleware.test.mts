@@ -1254,6 +1254,13 @@ const dsTools = durableTools(
         return `sunny in ${city}`;
       },
     }),
+    leaky: tool({
+      description: 'Fails with a message a client must not see',
+      inputSchema: z.object({}),
+      execute: async (): Promise<string> => {
+        throw new Error('connection to db-internal.example refused');
+      },
+    }),
   },
   { durableStream: 'ui' },
 );
@@ -3063,7 +3070,11 @@ test('durable stream: a failed workflow ends the stream with an error chunk from
   const chunks = visible(await readChunks(workflowID, 'ui'));
   assert.equal(streamedText(chunks), 'partial');
   assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['error', 'finish']);
-  assert.match((chunks.at(-2) as { errorText: string }).errorText, /model exploded/);
+  // Like the AI SDK, the reader masks server error text by default; onError opts into the real message.
+  assert.equal((chunks.at(-2) as { errorText: string }).errorText, 'An error occurred.');
+  const revealed: UIMessageChunk[] = [];
+  for await (const chunk of readDurableStream({ workflowID, key: 'ui', onError: (e) => `masked:${(e as Error).message}` })) revealed.push(chunk);
+  assert.match((visible(revealed).at(-2) as { errorText: string }).errorText, /^masked:.*model exploded/);
 });
 
 test('durable stream: a reader that disconnects resumes from its last offset without gaps or repeats', async () => {
@@ -3661,4 +3672,15 @@ test('agentTool: aborting the parent cancels a child and the grandchild it start
   subGate.release();
   await handle.getResult().catch(() => undefined);
   assert.deepEqual(statuses, { child: 'CANCELLED', grandchild: 'CANCELLED' });
+});
+
+test('durable stream: a local tool error is masked for clients unless onError reveals it', async () => {
+  dsMock.generateResults.push(toolCallResponse('leaky', '{}'), textResponse('Recovered.'));
+  const workflowID = randomUUID();
+  assert.equal(await (await DBOS.startWorkflow(dsGenerateWorkflow, { workflowID })('leak?')).getResult(), 'Recovered.');
+  const masked = visible(await readChunks(workflowID, 'ui')).find((c) => c.type === 'tool-output-error') as { errorText: string };
+  assert.equal(masked.errorText, 'An error occurred.');
+  const revealed: UIMessageChunk[] = [];
+  for await (const chunk of readDurableStream({ workflowID, key: 'ui', onError: (e) => (e as Error).message })) revealed.push(chunk);
+  assert.equal((revealed.find((c) => c.type === 'tool-output-error') as { errorText: string }).errorText, 'connection to db-internal.example refused');
 });
