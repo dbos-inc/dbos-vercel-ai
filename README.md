@@ -113,7 +113,6 @@ Readers that connect afterwards see the model's output once; live readers receiv
 
 You can read from a durable stream using `readDurableStream`, for example to stream it to a UI.
 It emits a stream of AI SDK `UIMessageChunk`.
-After every record it emits a transient `data-dbos-offset` chunk; to reconnect an interrupted stream, pass the last `offset` a client saw back as `readDurableStream({ ..., offset })` and the stream resumes from there.
 You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
 
 ## Durable Tools
