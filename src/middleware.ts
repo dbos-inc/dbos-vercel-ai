@@ -57,7 +57,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
   return {
     specificationVersion: 'v4',
 
-    wrapGenerate: async ({ doGenerate, model }) => {
+    wrapGenerate: async ({ doGenerate, params, model }) => {
       assertNotInTransaction('generate');
       if (!isInWorkflowFunction()) {
         return await doGenerate();
@@ -67,6 +67,8 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         return await DBOS.runStep(async () => ensureResponseMetadata(encodeBinaryContent(await doGenerate())), {
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'generate'),
+          // An aborted call is never retried, whatever the provider's rejection looks like.
+          shouldRetry: async (error: unknown) => params.abortSignal?.aborted !== true && (await stepConfig.shouldRetry!(error)),
         });
       } catch (error) {
         // Restore the AI SDK error identity a replay revival strips, so the SDK's retry/catch logic behaves the same.
