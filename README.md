@@ -167,29 +167,6 @@ const tools = await durableMCPTools(mcpClient, {
 });
 ```
 
-## Concurrency
-
-Run **one durable model call at a time within a single workflow**.
-DBOS requires workflows to be deterministic, but the AI SDK issues concurrent model calls in nondeterministic order.
-To guard against nondeterminism, this integration throws an error if it detects concurrent durable model calls in the same workflow.
-Sequential calls (including a normal tool-calling loop, where each model call completes before the next begins) are unaffected.
-
-To fan out model calls in parallel, give each its own **child workflow**:
-
-```ts
-const summarizeOne = DBOS.registerWorkflow(
-  async (doc: string) => (await generateText({ model, prompt: `Summarize: ${doc}` })).text,
-  { name: 'summarizeOne' },
-);
-
-const summarizeAll = DBOS.registerWorkflow(async (docs: string[]) => {
-  const handles = await Promise.all(
-    docs.map((doc) => DBOS.startWorkflow(summarizeOne)(doc)),
-  );
-  return Promise.all(handles.map((h) => h.getResult()));
-}, { name: 'summarizeAll' });
-```
-
 ## Embeddings
 
 `durableEmbeddingCalls` enables durable calls to embedding models:
