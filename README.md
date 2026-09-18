@@ -178,7 +178,7 @@ const tools = await durableMCPTools(mcpClient, {
 });
 ```
 
-## Durable Embedding MOdels
+## Durable Embedding Models
 
 `durableEmbeddingCalls` enables durable calls to embedding models:
 
