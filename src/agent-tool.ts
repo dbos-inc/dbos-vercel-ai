@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import type { FlexibleSchema, ModelMessage, Tool } from 'ai' with { 'resolution-mode': 'import' };
 import { writeDurableStream } from './durable-stream';
@@ -5,6 +6,20 @@ import { isInWorkflowFunction } from './internal';
 
 /** Marks a tool built by agentTool: durableTools leaves it unwrapped (it is a child workflow, not a step) and binds its durable stream. */
 export const AGENT_TOOL: unique symbol = Symbol.for('@dbos-inc/vercel-ai/agentTool');
+
+// Captured at module load, outside any workflow: a cancellation triggered by an abort must not claim a function id in the parent's log.
+const outsideWorkflow = AsyncLocalStorage.snapshot();
+
+// The child's row appears shortly after the call starts and a cancel of a missing row is a no-op, so wait for it, giving up once the call has settled.
+async function cancelChild(childID: string, settled: () => boolean): Promise<void> {
+  for (let i = 0; i < 100 && !settled(); i++) {
+    if (await DBOS.getWorkflowStatus(childID)) {
+      await DBOS.cancelWorkflow(childID);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 
 // What agentTool needs from an agent: the AI SDK's Agent interface, structurally.
 type StreamingAgent = {
@@ -50,7 +65,9 @@ export function agentTool<INPUT, AGENT extends StreamingAgent, OUTPUT = string>(
     await result.consumeStream();
     return output ? await output(result as Awaited<ReturnType<AGENT['stream']>>) : ((await result.text) as OUTPUT);
   };
-  const workflow = DBOS.registerWorkflow(run, { name });
+  const registered = DBOS.registerWorkflow(run, { name });
+  // Unbound on purpose: DBOS's registered invoker reads `this`, and as a method `this` would be the tool object.
+  const workflow = (input: INPUT): Promise<OUTPUT> => registered(input);
   return build(options, workflow, options.durableStream);
 }
 
@@ -71,8 +88,10 @@ function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
     // Invoke first: the direct call reserves the child's function ids synchronously, so parallel calls replay in order.
     const pending = DBOS.withNextWorkflowID(childID, invoke);
     pending.catch(() => {});
-    const cancel = () => void DBOS.cancelWorkflow(childID).catch(() => {});
+    let settled = false;
+    const cancel = () => void outsideWorkflow(() => cancelChild(childID, () => settled)).catch(() => {});
     execOptions.abortSignal?.addEventListener('abort', cancel, { once: true });
+    if (execOptions.abortSignal?.aborted) cancel();
     try {
       if (durableStream) {
         await writeDurableStream(durableStream, [
@@ -89,6 +108,7 @@ function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
       }
       throw error;
     } finally {
+      settled = true;
       execOptions.abortSignal?.removeEventListener('abort', cancel);
     }
   };
