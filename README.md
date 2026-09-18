@@ -108,7 +108,7 @@ return createUIMessageStreamResponse({
 
 You can also write your own data to a stream with `writeDurableStream(key, chunks)`.
 Your streams are closed when your workflow finishes; you can also close a stream early using `closeDurableStream`.
-If a crash interrupts a model call, the recovered run streams that call again.
+If a model call is interrupted, the recovered run streams that call again.
 Readers that connect afterwards see the model's output once; live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
 
 You can read from a durable stream using `readDurableStream`, for example to stream it to a UI.
