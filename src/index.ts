@@ -10,3 +10,4 @@ export {
   readDurableStream,
   writeDurableStream,
 } from './durable-stream';
+export { AGENT_TOOL, agentTool, AgentStreamResult, AgentTool, AgentToolOptions, StreamingAgent } from './agent-tool';

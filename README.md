@@ -176,6 +176,38 @@ const tools = await durableMCPTools(mcpClient, {
 });
 ```
 
+## Sub-agents
+
+A sub-agent is best run as a **child workflow**: it gets its own checkpoints, its own retries, and its own concurrency guard, so parallel sub-agents are safe and a crash resumes each one where it left off.
+`agentTool` turns an agent into a tool that does exactly that:
+
+```ts
+import { ToolLoopAgent } from 'ai';
+import { agentTool, durableTools } from '@dbos-inc/vercel-ai';
+
+const researcher = new ToolLoopAgent({ model, instructions: 'Research thoroughly.', tools: researchTools });
+
+const research = agentTool({
+  name: 'research',                          // child workflow name
+  description: 'Research a question in depth',
+  inputSchema: z.object({ question: z.string() }),
+  agent: researcher,
+  prompt: ({ question }) => question,        // tool input → prompt (or ModelMessage[])
+});
+
+const tools = durableTools({ research, getWeather }, { durableStream: 'ui' });
+const orchestrator = new ToolLoopAgent({ model, tools });
+```
+
+Each call runs the agent in a child workflow whose id is the parent's id plus the tool call id, and returns the agent's final text (or `output(result)`, which must be serializable).
+Call `agentTool` at module load, before `DBOS.launch()`, since it registers the child workflow.
+`research.workflow(input)` runs the same child directly, without a model in the loop.
+Aborting the parent cancels the child; `queue` names a DBOS queue to run children on, for example to bound how many sub-agents run at once, and `timeoutMS` bounds each child.
+
+With a durable stream, each call appears in the parent's stream as a `data-dbos-subagent` part naming the child workflow, followed by its output like any other tool call; the child streams its own output under its own workflow id, which a UI can read with `readDurableStream`.
+
+An agent called from inside an ordinary durable tool runs as one opaque step with no inner checkpoints; called from an unwrapped tool, its model calls become the parent's steps but two such tools in parallel are rejected as concurrent.
+
 ## Durable Embedding Models
 
 `durableEmbeddingCalls` enables durable calls to embedding models:

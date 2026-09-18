@@ -15,6 +15,7 @@ import {
   stepCountIs,
   streamText,
   tool,
+  ToolLoopAgent,
   type UIMessageChunk,
   wrapEmbeddingModel,
   wrapImageModel,
@@ -22,6 +23,7 @@ import {
 } from 'ai';
 import { z } from 'zod';
 import {
+  agentTool,
   closeDurableStream,
   durableCalls,
   durableEmbeddingCalls,
@@ -1439,9 +1441,70 @@ const dsHandoffWorkflow = DBOS.registerWorkflow(
   { name: 'dsHandoffWorkflow' },
 );
 
+// Sub-agents as child workflows.
+const subMock = new MockLanguageModel();
+const subModel = wrapLanguageModel({ model: subMock, middleware: durableCalls({ durableStream: 'ui' }) });
+const subAgent = new ToolLoopAgent({ model: subModel, instructions: 'Research.' });
+let subGate = newGate();
+const research = agentTool({
+  name: 'researchChild',
+  description: 'Research a question',
+  inputSchema: z.object({ question: z.string() }),
+  agent: subAgent,
+  prompt: ({ question }) => question,
+});
+const queuedResearch = agentTool({
+  name: 'queuedResearchChild',
+  description: 'Research a question, one at a time',
+  inputSchema: z.object({ question: z.string() }),
+  agent: subAgent,
+  prompt: ({ question }) => question,
+  queue: 'subagents',
+});
+const orchMock = new MockLanguageModel();
+const orchModel = wrapLanguageModel({ model: orchMock, middleware: durableCalls({ durableStream: 'ui' }) });
+const orchTools = durableTools(
+  {
+    research,
+    queuedResearch,
+    getTime: tool({
+      description: 'Get the time in a city',
+      inputSchema: z.object({ city: z.string() }),
+      execute: async ({ city }) => `noon in ${city}`,
+    }),
+  },
+  { durableStream: 'ui' },
+);
+let orchAbort: AbortController | undefined;
+const orchestratorWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    orchAbort = new AbortController();
+    const result = await generateText({
+      model: orchModel,
+      prompt,
+      tools: orchTools,
+      abortSignal: orchAbort.signal,
+      stopWhen: stepCountIs(5),
+      maxRetries: 0,
+    });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    const toolOutputs: Record<string, unknown> = {};
+    const toolErrors: string[] = [];
+    for (const step of result.steps) {
+      for (const part of step.content) {
+        if (part.type === 'tool-result') toolOutputs[part.toolCallId] = part.output;
+        if (part.type === 'tool-error') toolErrors.push((part.error as Error).message);
+      }
+    }
+    return { text: result.text, toolOutputs, toolErrors };
+  },
+  { name: 'orchestratorWorkflow' },
+);
+
 before(async () => {
   DBOS.setConfig({ name: 'dbos-vercel-ai-test', systemDatabaseUrl });
   await DBOS.launch();
+  await DBOS.registerQueue('subagents', { concurrency: 1 });
 });
 
 after(async () => {
@@ -3104,4 +3167,123 @@ test('durable stream: a second execution of a model step gets its own attempt id
   assert.match(original, /^[0-9a-f-]{36}$/);
   assert.match(rerun, /^[0-9a-f-]{36}$/);
   assert.notEqual(original, rerun);
+});
+
+test('agentTool: parallel sub-agent calls run as child workflows and replay from their checkpoints', async () => {
+  orchMock.generateResults.push(
+    toolCallsResponse([
+      { toolName: 'research', input: '{"question":"A?"}' },
+      { toolName: 'research', input: '{"question":"B?"}' },
+    ]),
+    textResponse('Both done.'),
+  );
+  subMock.streamPartLists.push(textStreamParts(['Answer one']), textStreamParts(['Answer two']));
+  const workflowID = randomUUID();
+  const callsBefore = subMock.streamCalls;
+  const result = await (await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research A and B')).getResult();
+  assert.equal(result.text, 'Both done.');
+  assert.deepEqual(new Set(Object.values(result.toolOutputs)), new Set(['Answer one', 'Answer two']));
+  assert.equal(subMock.streamCalls - callsBefore, 2);
+  // Each call is its own child workflow, named after the parent and the tool call.
+  for (const call of ['call-0', 'call-1']) {
+    assert.equal((await DBOS.getWorkflowStatus(`${workflowID}-${call}`))?.status, 'SUCCESS');
+  }
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  // The parent records each child's start and result as steps that name the child.
+  assert.deepEqual(
+    [...new Set(steps!.map((s) => s.childWorkflowID).filter((id) => id !== null))].sort(),
+    [`${workflowID}-call-0`, `${workflowID}-call-1`],
+  );
+  // Fork past everything: the children are not re-run and each call keeps its own result.
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof orchestratorWorkflow>>(workflowID, noopStep.functionID);
+  assert.deepEqual((await forked.getResult()).toolOutputs, result.toolOutputs);
+  assert.equal(subMock.streamCalls - callsBefore, 2);
+});
+
+test('agentTool: the parent stream records a subagent marker and the tool output, and the child streams on its own', async () => {
+  orchMock.generateResults.push(toolCallResponse('research', '{"question":"C?"}'), textResponse('Done.'));
+  subMock.streamPartLists.push(textStreamParts(['Answer C']));
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research C')).getResult();
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  const types = chunks.map((c) => c.type);
+  const marker = chunks.find((c) => c.type === 'data-dbos-subagent') as { id: string; data: unknown };
+  assert.equal(marker.id, 'call-1');
+  assert.deepEqual(marker.data, { toolCallId: 'call-1', workflowID: `${workflowID}-call-1`, name: 'researchChild' });
+  assert.ok(types.indexOf('data-dbos-subagent') < types.indexOf('tool-output-available'));
+  assert.equal((chunks.find((c) => c.type === 'tool-output-available') as { output: unknown }).output, 'Answer C');
+  assert.equal(streamedText(visible(await readChunks(`${workflowID}-call-1`, 'ui'))), 'Answer C');
+});
+
+test('agentTool: a failed sub-agent reaches the model as a tool error and replays without re-running', async () => {
+  orchMock.generateResults.push(toolCallResponse('research', '{"question":"D?"}'), textResponse('Recovered.'));
+  subMock.streamCallErrors.push(Object.assign(new Error('child exploded'), { isRetryable: false }));
+  const workflowID = randomUUID();
+  const callsBefore = subMock.streamCalls;
+  const result = await (await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research D')).getResult();
+  assert.equal(result.text, 'Recovered.');
+  assert.deepEqual(result.toolErrors, ['child exploded']);
+  assert.equal((await DBOS.getWorkflowStatus(`${workflowID}-call-1`))?.status, 'ERROR');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof orchestratorWorkflow>>(workflowID, steps!.find((s) => s.name === 'noop')!.functionID);
+  assert.deepEqual((await forked.getResult()).toolErrors, ['child exploded']);
+  assert.equal(subMock.streamCalls - callsBefore, 1);
+});
+
+test('agentTool: durableTools leaves an agent tool unwrapped and binds its durable stream', () => {
+  assert.equal(durableTools({ research }).research, research);
+  const bound = durableTools({ research }, { durableStream: 'x' }).research as typeof research;
+  assert.notEqual(bound, research);
+  assert.equal(bound.workflow, research.workflow);
+});
+
+test('agentTool: aborting the parent cancels the running child workflow', async () => {
+  orchMock.generateResults.push(toolCallResponse('research', '{"question":"E?"}'));
+  subGate = newGate();
+  subMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'partial' },
+    () => subGate.promise,
+    { type: 'text-delta', id: 't1', delta: ' more' },
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const childID = `${workflowID}-call-1`;
+  const handle = await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research E');
+  for (let i = 0; i < 500 && (await DBOS.getWorkflowStatus(childID)) === null; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  orchAbort!.abort();
+  let status: string | undefined;
+  for (let i = 0; i < 500 && status !== 'CANCELLED'; i++) {
+    status = (await DBOS.getWorkflowStatus(childID))?.status;
+    if (status !== 'CANCELLED') await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  // The child is parked at the gate; let it finish so the parent, which awaits it, can settle.
+  subGate.release();
+  await handle.getResult().catch(() => undefined);
+  assert.equal(status, 'CANCELLED');
+});
+
+test('agentTool: a queue with concurrency 1 runs parallel sub-agent calls one at a time', async () => {
+  orchMock.generateResults.push(
+    toolCallsResponse([
+      { toolName: 'queuedResearch', input: '{"question":"F?"}' },
+      { toolName: 'queuedResearch', input: '{"question":"G?"}' },
+      { toolName: 'queuedResearch', input: '{"question":"H?"}' },
+    ]),
+    textResponse('Queued done.'),
+  );
+  subMock.streamPartLists.push(textStreamParts(['F']), textStreamParts(['G']), textStreamParts(['H']));
+  const workflowID = randomUUID();
+  const result = await (await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research F G H')).getResult();
+  assert.equal(result.text, 'Queued done.');
+  const windows: { start: number; end: number }[] = [];
+  for (const call of ['call-0', 'call-1', 'call-2']) {
+    const step = (await DBOS.listWorkflowSteps(`${workflowID}-${call}`))!.find((s) => s.name === 'mock.mock-model.stream')!;
+    windows.push({ start: step.startedAtEpochMs!, end: step.completedAtEpochMs! });
+  }
+  windows.sort((a, b) => a.start - b.start);
+  for (let i = 1; i < windows.length; i++) assert.ok(windows[i]!.start >= windows[i - 1]!.end, 'children overlapped');
 });
