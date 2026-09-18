@@ -142,7 +142,6 @@ const agent = DBOS.registerWorkflow(async (question: string) => {
 You can pass step configuration (such as timeouts or retries) to `durableTools`.
 You can set defaults for all tools or configure tools individually.
 Retries are off by default.
-To ensure the ordering of parallel tool calls is consistent during recovery, do not await I/O in callbacks that run before a tool executes, such as `onToolExecutionStart`.
 
 ```ts
 const tools = durableTools(myTools, {
@@ -152,6 +151,8 @@ const tools = durableTools(myTools, {
   },
 });
 ```
+
+When using durable tools, to ensure the ordering of parallel tool calls is consistent during recovery, do not await I/O in callbacks that run before a tool executes, such as `onToolExecutionStart`.
 
 ### Durable MCP Tools
 
