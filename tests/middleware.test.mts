@@ -3079,3 +3079,29 @@ test('durable stream: records written while history is being read are delivered 
   assert.equal(streamedText(visible(await live)), 'after the gate');
   assert.equal((await live).filter((c) => c.type === 'data-tick').length, 30);
 });
+
+test('durable stream: a resume from an offset inside a stale attempt skips the rest of it', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsStaleHistoryWorkflow, { workflowID })()).getResult();
+  // Offset 0 is the stale record, so a client that saw offset 0 resumes at the fresh attempt's first record.
+  const resumed = await readChunks(workflowID, 'ui', 0 + 0);
+  const fromStale = await readChunks(workflowID, 'ui', 1);
+  assert.equal(streamedText(visible(fromStale)), 'fresh');
+  assert.deepEqual(visible(fromStale).map((c) => c.type), ['text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  assert.equal(streamedText(visible(resumed)), 'fresh');
+});
+
+test('durable stream: a second execution of a model step gets its own attempt id', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['first']), textStreamParts(['second']));
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsWorkflow, { workflowID })('run')).getResult();
+  // Fork before the model step: the fork re-executes it, in its own stream, under a new writer.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof dsWorkflow>>(workflowID, 0);
+  assert.equal((await forked.getResult()).text, 'second');
+  const attempt = (records: DurableStreamRecord[]) => (records.find((r) => r.kind === 'model') as { attempt: string }).attempt;
+  const original = attempt(await readRecords(workflowID, 'ui'));
+  const rerun = attempt(await readRecords(forked.workflowID, 'ui'));
+  assert.match(original, /^[0-9a-f-]{36}$/);
+  assert.match(rerun, /^[0-9a-f-]{36}$/);
+  assert.notEqual(original, rerun);
+});
