@@ -24,9 +24,13 @@ import { assertNotInTransaction, isInWorkflowFunction, restoreAISDKErrorIdentity
 
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
 const inflightModelCalls = new Map<string, number>();
+// A stream call whose consumer detached (abort/cancel) but whose step is still settling; the next call in that workflow waits for it.
+const settlingModelCalls = new Map<string, Promise<void>>();
 
-function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed'): string {
+async function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed'): Promise<string> {
   const workflowID = DBOS.workflowID!;
+  // Sequence after a detached call's checkpoint, so steps are always recorded in the order they were started.
+  await settlingModelCalls.get(workflowID);
   const inflight = inflightModelCalls.get(workflowID) ?? 0;
   if (inflight > 0) {
     // embedMany parallelizes its batches; maxParallelCalls: 1 serializes them deterministically. Other callers use child workflows.
@@ -62,7 +66,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
-      const workflowID = enterDurableModelCall('generate');
+      const workflowID = await enterDurableModelCall('generate');
       try {
         return await DBOS.runStep(async () => ensureResponseMetadata(encodeBinaryContent(await doGenerate())), {
           ...stepConfig,
@@ -83,28 +87,24 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       if (!isInWorkflowFunction()) {
         return await doStream();
       }
-      const workflowID = enterDurableModelCall('stream');
+      const workflowID = await enterDurableModelCall('stream');
       // The caller's abortSignal merged with the AI SDK's timeouts; an abort stops the provider call and is recorded as the step's outcome.
       const abortSignal = params.abortSignal;
       const aborted = () => abortSignal?.aborted === true;
 
-      // Free the concurrency guard as soon as the consumer detaches (abort/cancel), not only when the step
-      // settles: this call's step is already sequenced, so a sequential follow-up in the same workflow is
-      // deterministic on replay and must not be rejected as concurrent while this step settles in the background.
-      let guardReleased = false;
-      const releaseGuard = () => {
-        if (guardReleased) return;
-        guardReleased = true;
-        abortSignal?.removeEventListener('abort', releaseGuard);
-        exitDurableModelCall(workflowID);
-      };
-      abortSignal?.addEventListener('abort', releaseGuard, { once: true });
-
       let executed = false;
       let cancelled = false;
       let emittedLive = false;
+      let released = false;
       let controller!: ReadableStreamDefaultController<LanguageModelV4StreamPart>;
       let step!: Promise<LanguageModelV4GenerateResult>;
+      let settled!: Promise<void>;
+      // A detached consumer (abort/cancel) may issue a sequential follow-up while this step still settles: make that call wait for this checkpoint instead of refusing it as concurrent.
+      const detach = () => {
+        abortSignal?.removeEventListener('abort', detach);
+        if (!released) settlingModelCalls.set(workflowID, settled);
+      };
+      abortSignal?.addEventListener('abort', detach, { once: true });
       const stream = new ReadableStream<LanguageModelV4StreamPart>({
         start(c) {
           controller = c;
@@ -112,7 +112,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         // Await the step so an early cancel still blocks until the model result is checkpointed.
         async cancel() {
           cancelled = true;
-          releaseGuard();
+          detach();
           // Post-cancel failures normally checkpoint as a success; anything else (e.g. a failed checkpoint write) is only visible here.
           await step.catch((error: unknown) => {
             if (!aborted()) DBOS.logger.warn(`Durable model call step failed after consumer cancel: ${String(error)}`);
@@ -191,15 +191,25 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
         );
       } catch (error) {
         // runStep can throw synchronously (e.g. a shutdown race); don't leak the guard entry.
-        releaseGuard();
+        abortSignal?.removeEventListener('abort', detach);
+        exitDurableModelCall(workflowID);
         throw error;
       }
+      // Hold the guard until the step has settled, so the next call in this workflow always starts after this checkpoint.
+      settled = step.then(
+        () => undefined,
+        () => undefined,
+      ).then(() => {
+        released = true;
+        abortSignal?.removeEventListener('abort', detach);
+        exitDurableModelCall(workflowID);
+        if (settlingModelCalls.get(workflowID) === settled) settlingModelCalls.delete(workflowID);
+      });
 
       // Drive the returned stream from the settled step: a live run emits only the withheld 'finish' (deltas already
       // streamed); a recovered run synthesizes the whole stream from the checkpoint. Either way consumers finish
       // only after the result is durable.
-      void step
-        .then(
+      void step.then(
           (recorded) => {
             if (cancelled) return;
             if (executed) {
@@ -219,8 +229,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
             // Live abort: surface the signal's own reason so the AI SDK takes its abort path; a replayed abort is an ordinary error.
             controller.error(executed && aborted() ? (abortSignal?.reason ?? error) : restoreAISDKErrorIdentity(error));
           },
-        )
-        .finally(releaseGuard);
+        );
 
       return { stream };
     },
@@ -237,7 +246,7 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelM
       if (!isInWorkflowFunction()) {
         return await doEmbed();
       }
-      const workflowID = enterDurableModelCall('embed');
+      const workflowID = await enterDurableModelCall('embed');
       try {
         return await DBOS.runStep(async () => doEmbed(), {
           ...stepConfig,

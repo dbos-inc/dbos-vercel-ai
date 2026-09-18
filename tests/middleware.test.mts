@@ -800,9 +800,8 @@ const abortRecoveryWorkflow = DBOS.registerWorkflow(
   { name: 'abortRecoveryWorkflow' },
 );
 
-// A follow-up durable call after aborting a stream must not be rejected as concurrent: the stream step is
-// already sequenced (its funcID is assigned), so the follow-up is deterministic on replay even while the
-// aborted stream step drains and checkpoints in the background.
+// A follow-up durable call after aborting a stream must not be rejected as concurrent; it waits for the aborted
+// step to settle, so the two steps are recorded in the order they were started.
 const guardRaceMock = new MockLateAbortStreamModel();
 const guardRaceModel = wrapLanguageModel({ model: guardRaceMock, middleware: durableCalls() });
 const guardRaceWorkflow = DBOS.registerWorkflow(
@@ -1177,6 +1176,31 @@ const sdkTimeoutWorkflow = DBOS.registerWorkflow(
     return text;
   },
   { name: 'sdkTimeoutWorkflow' },
+);
+
+// A generateText abort is recorded as the step error; replay must rethrow it without the AI SDK retrying (a retry would open an unexpected step).
+class AbortingGenerateModel extends MockLanguageModel {
+  controller = new AbortController();
+  override async doGenerate(options: Parameters<MockLanguageModel['doGenerate']>[0]) {
+    this.controller.abort();
+    return super.doGenerate(options);
+  }
+}
+const generateAbortMock = new AbortingGenerateModel();
+const generateAbortModel = wrapLanguageModel({ model: generateAbortMock, middleware: durableCalls() });
+const generateAbortWorkflow = DBOS.registerWorkflow(
+  async () => {
+    generateAbortMock.controller = new AbortController();
+    let outcome: string;
+    try {
+      outcome = (await generateText({ model: generateAbortModel, prompt: 'hi', abortSignal: generateAbortMock.controller.signal })).text;
+    } catch (error) {
+      outcome = `caught:${(error as Error).name}`;
+    }
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return outcome;
+  },
+  { name: 'generateAbortWorkflow' },
 );
 
 before(async () => {
@@ -2007,12 +2031,22 @@ test('aborting mid-stream records the abort as the step failure, so recovery ret
   assert.equal(abortRecoveryMock.streamCalls, 1);
 });
 
-test('a durable call after aborting a stream is not rejected as concurrent', async () => {
+test('a durable call after aborting a stream is not rejected as concurrent, and is recorded after the aborted step', async () => {
   guardRaceMock.generateResults.push(textResponse('summary'));
-  const handle = await DBOS.startWorkflow(guardRaceWorkflow, { workflowID: randomUUID() })();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(guardRaceWorkflow, { workflowID })();
   // Before the fix the guard stayed held until the aborted stream step settled, so this follow-up threw
   // "Concurrent durable model calls ..." and the workflow rejected.
   assert.equal(await handle.getResult(), 'summary');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const streamStep = steps!.find((s) => s.name === 'mock.mock-model.stream')!;
+  const generateStep = steps!.find((s) => s.name === 'mock.mock-model.generate')!;
+  assert.match(String(streamStep.error), /abort/i);
+  // The follow-up started only after the aborted step was checkpointed, so a crash can't leave them recorded out of order.
+  assert.ok(
+    streamStep.completedAtEpochMs! <= generateStep.startedAtEpochMs!,
+    `follow-up started at ${generateStep.startedAtEpochMs} before the aborted step completed at ${streamStep.completedAtEpochMs}`,
+  );
 });
 
 test('an MCP tool aborted with a DOMException reason checkpoints the real error, not a TypeError', async () => {
@@ -2443,4 +2477,21 @@ test("the AI SDK's timeout bounds a durable stream: recorded as a TimeoutError, 
   const forked = await DBOS.forkWorkflow<ReturnType<typeof sdkTimeoutWorkflow>>(workflowID, 1);
   await assert.rejects(forked.getResult(), /timeout/i);
   assert.equal(sdkTimeoutMock.streamCalls, 1);
+});
+
+test('a generateText abort is recorded as the step error, and replay rethrows it without the AI SDK retrying', async () => {
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(generateAbortWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'caught:AbortError');
+  assert.equal(generateAbortMock.generateCalls, 1); // maxRetries defaults to 2, but an abort is never retried
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  assert.deepEqual(steps!.map((s) => s.name), ['mock.mock-model.generate', 'noop']);
+  assert.match(String(steps![0]!.error), /abort/i);
+
+  // Fork past the model step: the revived error keeps its AbortError name, so the AI SDK rethrows instead of retrying into a new step.
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof generateAbortWorkflow>>(workflowID, 1);
+  assert.equal(await forked.getResult(), 'caught:AbortError');
+  assert.equal(generateAbortMock.generateCalls, 1);
+  const forkedSteps = await DBOS.listWorkflowSteps(forked.workflowID);
+  assert.deepEqual(forkedSteps!.map((s) => s.name), ['mock.mock-model.generate', 'noop']);
 });
