@@ -1495,6 +1495,24 @@ const preAbortedAgentWorkflow = DBOS.registerWorkflow(
   },
   { name: 'preAbortedAgentWorkflow' },
 );
+// An agent tool whose signal aborts mid-flight; the workflow catches the outcome and continues, so it can be forked.
+let midAbortGate = newGate();
+const midAbortedAgentWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 200);
+    let outcome: string;
+    try {
+      await research.execute!({ question: 'M?' }, { toolCallId: 'call-m', messages: [], abortSignal: controller.signal } as never);
+      outcome = 'returned';
+    } catch (error) {
+      outcome = `caught:${(error as Error).message}`;
+    }
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return outcome;
+  },
+  { name: 'midAbortedAgentWorkflow' },
+);
 const orchMock = new MockLanguageModel();
 const orchModel = wrapLanguageModel({ model: orchMock, middleware: durableCalls({ durableStream: 'ui' }) });
 const orchTools = durableTools(
@@ -3399,4 +3417,66 @@ test('agentTool: an already-aborted signal cancels the child, and the cancel lea
   const steps = await DBOS.listWorkflowSteps(workflowID);
   const forked = await DBOS.forkWorkflow<ReturnType<typeof preAbortedAgentWorkflow>>(workflowID, steps!.length);
   assert.equal(await forked.getResult(), outcome);
+});
+
+test('agentTool: an abort mid-flight cancels the child and leaves no trace in the replay log', async () => {
+  resetAgentMocks();
+  midAbortGate = newGate();
+  subMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'partial' },
+    () => midAbortGate.promise,
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  setTimeout(() => midAbortGate.release(), 800);
+  const workflowID = randomUUID();
+  const callsBefore = subMock.streamCalls;
+  const outcome = await (await DBOS.startWorkflow(midAbortedAgentWorkflow, { workflowID })()).getResult();
+  assert.match(outcome, /caught:.*cancel/i);
+  assert.equal((await DBOS.getWorkflowStatus(`${workflowID}-call-m`))?.status, 'CANCELLED');
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  // The cancel ran outside the workflow context: only the child steps and noop were recorded, and replay reproduces them.
+  assert.deepEqual(steps!.map((s) => s.childWorkflowID !== null || s.name === 'noop'), steps!.map(() => true));
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof midAbortedAgentWorkflow>>(workflowID, noopStep.functionID);
+  assert.equal(await forked.getResult(), outcome);
+  assert.equal(subMock.streamCalls - callsBefore, 1);
+});
+
+test('agentTool: aborting the parent also cancels a child that is still queued', async () => {
+  resetAgentMocks();
+  orchMock.generateResults.push(
+    toolCallsResponse([
+      { toolName: 'queuedResearch', input: '{"question":"first?"}' },
+      { toolName: 'queuedResearch', input: '{"question":"second?"}' },
+    ]),
+  );
+  subGate = newGate();
+  subMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'partial' },
+    () => subGate.promise,
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research two, queued');
+  // Wait until the first child runs (parked at the gate) and the second is waiting on the queue.
+  for (let i = 0; i < 500 && (await DBOS.getWorkflowStatus(`${workflowID}-call-1`))?.status !== 'ENQUEUED'; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal((await DBOS.getWorkflowStatus(`${workflowID}-call-1`))?.status, 'ENQUEUED');
+  orchAbort!.abort();
+  const statuses: Record<string, string | undefined> = {};
+  for (let i = 0; i < 500; i++) {
+    for (const call of ['call-0', 'call-1']) statuses[call] = (await DBOS.getWorkflowStatus(`${workflowID}-${call}`))?.status;
+    if (statuses['call-0'] === 'CANCELLED' && statuses['call-1'] === 'CANCELLED') break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  subGate.release();
+  await handle.getResult().catch(() => undefined);
+  assert.deepEqual(statuses, { 'call-0': 'CANCELLED', 'call-1': 'CANCELLED' });
 });
