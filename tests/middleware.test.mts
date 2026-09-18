@@ -38,6 +38,7 @@ import {
 import { restoreAISDKErrorIdentity } from '../src/internal.js';
 import {
   contentResponse,
+  finishReason,
   IMAGE_BYTES,
   MockEmbeddingModel,
   MockImageModel,
@@ -3479,4 +3480,35 @@ test('agentTool: aborting the parent also cancels a child that is still queued',
   subGate.release();
   await handle.getResult().catch(() => undefined);
   assert.deepEqual(statuses, { 'call-0': 'CANCELLED', 'call-1': 'CANCELLED' });
+});
+
+test('agentTool: a queue or timeout on one sub-agent does not leak into siblings or later calls', async () => {
+  resetAgentMocks();
+  orchMock.generateResults.push(
+    // Two overlapping queued calls (the restore-order case) alongside an unqueued and a timed one.
+    toolCallsResponse([
+      { toolName: 'queuedResearch', input: '{"question":"q1?"}' },
+      { toolName: 'queuedResearch', input: '{"question":"q2?"}' },
+      { toolName: 'research', input: '{"question":"plain?"}' },
+      { toolName: 'slowResearch', input: '{"question":"timed?"}' },
+    ]),
+    // A later call in the same workflow must not inherit anything either (unique call id: the child id is derived from it).
+    contentResponse(
+      [{ type: 'tool-call', toolCallId: 'call-later', toolName: 'research', input: '{"question":"later?"}' }],
+      finishReason('tool-calls'),
+    ),
+    textResponse('All done.'),
+  );
+  for (const text of ['q1', 'q2', 'plain', 'timed', 'later']) subMock.streamPartLists.push(textStreamParts([text]));
+  const workflowID = randomUUID();
+  const result = await (await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('mixed')).getResult();
+  assert.equal(result.text, 'All done.');
+  assert.deepEqual(result.toolErrors, []);
+  const status = async (call: string) => (await DBOS.getWorkflowStatus(`${workflowID}-${call}`))!;
+  assert.equal((await status('call-0')).queueName, 'subagents');
+  assert.equal((await status('call-1')).queueName, 'subagents');
+  assert.equal((await status('call-2')).queueName, undefined);
+  assert.equal((await status('call-3')).queueName, undefined);
+  assert.equal((await status('call-later')).queueName, undefined);
+  assert.equal(Object.values(result.toolOutputs).length, 5);
 });

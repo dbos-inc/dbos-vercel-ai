@@ -68,11 +68,12 @@ export function agentTool<INPUT, AGENT extends StreamingAgent, OUTPUT = string>(
   const registered = DBOS.registerWorkflow(run, { name });
   // Unbound on purpose: DBOS's registered invoker reads `this`, and as a method `this` would be the tool object.
   const workflow = (input: INPUT): Promise<OUTPUT> => registered(input);
-  return build(options, workflow, options.durableStream);
+  return build(options, registered, workflow, options.durableStream);
 }
 
 function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
   options: AgentToolOptions<INPUT, AGENT, OUTPUT>,
+  registered: (input: INPUT) => Promise<OUTPUT>,
   workflow: (input: INPUT) => Promise<OUTPUT>,
   durableStream: string | undefined,
 ): AgentTool<INPUT, OUTPUT> {
@@ -82,11 +83,10 @@ function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
     const { toolCallId } = execOptions;
     // The tool call id comes from the checkpointed model output, so the child id is the same on replay and known for cancellation.
     const childID = `${DBOS.workflowID}-${toolCallId}`;
-    let invoke = () => workflow(input);
-    if (timeoutMS !== undefined) invoke = ((inner) => () => DBOS.withWorkflowTimeout(timeoutMS, inner))(invoke);
-    if (queue) invoke = ((inner) => () => DBOS.withWorkflowQueue(queue, inner))(invoke);
-    // Invoke first: the direct call reserves the child's function ids synchronously, so parallel calls replay in order.
-    const pending = DBOS.withNextWorkflowID(childID, invoke);
+    // Start and getResult each reserve their function id synchronously here, so parallel calls replay in order.
+    const started = DBOS.startWorkflow(registered, { workflowID: childID, queueName: queue, timeoutMS })(input);
+    const pending = DBOS.getResult<OUTPUT>(childID);
+    started.catch(() => {});
     pending.catch(() => {});
     let settled = false;
     const cancel = () => void outsideWorkflow(() => cancelChild(childID, () => settled)).catch(() => {});
@@ -98,7 +98,8 @@ function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
           { type: 'data-dbos-subagent', id: toolCallId, data: { toolCallId, workflowID: childID, name } },
         ]);
       }
-      const result = await pending;
+      await started;
+      const result = (await pending) as OUTPUT;
       if (durableStream) await writeDurableStream(durableStream, [{ type: 'tool-output-available', toolCallId, output: result }]);
       return result;
     } catch (error) {
@@ -117,6 +118,6 @@ function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
     inputSchema,
     execute,
     workflow,
-    [AGENT_TOOL]: (key: string) => build(options, workflow, key),
+    [AGENT_TOOL]: (key: string) => build(options, registered, workflow, key),
   } as unknown as AgentTool<INPUT, OUTPUT>;
 }
