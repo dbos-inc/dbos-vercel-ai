@@ -118,8 +118,7 @@ You can also pass a `DBOSClient` into `readDurableStream` to read it from a diff
 
 ## Durable Tools
 
-Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop.
-Wrap your tools with `durableTools` so each tool call is checkpointed too: on recovery, completed tool calls replay their recorded output (or error) instead of re-running.
+To durably checkpoint your agents' tool calls, wrap them in `durableTools`:
 
 ```ts
 import { tool, stepCountIs } from 'ai';
@@ -155,8 +154,7 @@ const tools = durableTools(myTools, {
 
 ### Durable MCP Tools
 
-`durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (e.g. from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps.
-Each tool call is checkpointed as a step named `mcp.tool.<tool>.<toolCallId>`, so recovery replays results instead of re-invoking the tool:
+`durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (for example, from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps:
 
 ```ts
 import { createMCPClient } from '@ai-sdk/mcp';
