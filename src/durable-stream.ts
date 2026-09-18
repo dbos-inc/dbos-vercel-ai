@@ -220,7 +220,8 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
   if (status === StatusString.CANCELLED) {
     yield { type: 'abort' };
   } else if (status === undefined || status === StatusString.SUCCESS || status === StatusString.PENDING || status === StatusString.ENQUEUED) {
-    yield { type: 'finish', finishReason: (state.finishReason ?? 'unknown') as UIFinishReason };
+    // The AI SDK's finish schema has no 'unknown'; a turn with no model call ends with the reason omitted.
+    yield state.finishReason === undefined ? { type: 'finish' } : { type: 'finish', finishReason: state.finishReason as UIFinishReason };
   } else {
     const error = (await client.retrieveWorkflow(workflowID).getStatus())?.error;
     yield { type: 'error', errorText: error instanceof Error ? error.message : String(error ?? 'The workflow ended before the response completed.') };

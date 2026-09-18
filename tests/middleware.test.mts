@@ -17,6 +17,7 @@ import {
   tool,
   ToolLoopAgent,
   type UIMessageChunk,
+  uiMessageChunkSchema,
   wrapEmbeddingModel,
   wrapImageModel,
   wrapLanguageModel,
@@ -1316,6 +1317,14 @@ const dsRetryWorkflow = DBOS.registerWorkflow(
   { name: 'dsRetryWorkflow' },
 );
 
+// Writes only user chunks and never closes: the reader ends the turn from workflow status with no finish reason to report.
+const dsUiOnlyWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await writeDurableStream('ui', [{ type: 'data-note', id: 'only', data: { n: 1 } }]);
+    return 'done';
+  },
+  { name: 'dsUiOnlyWorkflow' },
+);
 const dsManualWorkflow = DBOS.registerWorkflow(
   async () => {
     await writeDurableStream('ui', [{ type: 'data-note', id: 'n1', data: { n: 1 } }]);
@@ -1325,9 +1334,15 @@ const dsManualWorkflow = DBOS.registerWorkflow(
   { name: 'dsManualWorkflow' },
 );
 
+// Every chunk the reader emits must satisfy the AI SDK's own chunk schema, as a client transport would enforce.
+const chunkSchema = asSchema(uiMessageChunkSchema);
 async function readChunks(workflowID: string, key: string, offset?: number): Promise<UIMessageChunk[]> {
   const chunks: UIMessageChunk[] = [];
-  for await (const chunk of readDurableStream({ workflowID, key, messageId: 'msg-1', offset })) chunks.push(chunk);
+  for await (const chunk of readDurableStream({ workflowID, key, messageId: 'msg-1', offset })) {
+    const validation = await chunkSchema.validate!(chunk);
+    assert.ok(validation.success, `invalid UI chunk ${JSON.stringify(chunk)}: ${validation.success ? '' : String(validation.error)}`);
+    chunks.push(chunk);
+  }
   return chunks;
 }
 async function readRecords(workflowID: string, key: string): Promise<DurableStreamRecord[]> {
@@ -3556,4 +3571,15 @@ test('durable stream: a persistent write failure fails the model call instead of
   assert.equal(writes.calls(), 3);
   const chunks = visible(await readChunks(workflowID, 'ui'));
   assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['error', 'finish']);
+});
+
+test('durable stream: a turn with no model call ends with a finish chunk that omits the reason', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsUiOnlyWorkflow, { workflowID })()).getResult();
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(chunks, [
+    { type: 'start', messageId: 'msg-1' },
+    { type: 'data-note', id: 'only', data: { n: 1 } },
+    { type: 'finish' },
+  ]);
 });
