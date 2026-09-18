@@ -109,7 +109,7 @@ return createUIMessageStreamResponse({
 You can also write your own data to a stream with `writeDurableStream(key, chunks)`.
 Your streams are closed when your workflow finishes; you can also close a stream early using `closeDurableStream`.
 If a crash interrupts a model call, the recovered run streams that call again.
-Readers that connect afterwards see the model's output once, live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
+Readers that connect afterwards see the model's output once; live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
 
 You can read from a durable stream using `readDurableStream`, for example to stream it to a UI.
 It emits a stream of AI SDK `UIMessageChunk`s.
@@ -141,7 +141,7 @@ const agent = DBOS.registerWorkflow(async (question: string) => {
 ```
 
 You can pass step configuration (such as timeouts or retries) to `durableTools`.
-You can set default for all tools or configure tools individually.
+You can set defaults for all tools or configure tools individually.
 Retries are off by default.
 
 ```ts
