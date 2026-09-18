@@ -27,19 +27,14 @@ const inflightModelCalls = new Map<string, number>();
 // A stream call whose consumer detached (abort/cancel) but whose step is still settling; the next call in that workflow waits for it.
 const settlingModelCalls = new Map<string, Promise<void>>();
 
-async function enterDurableModelCall(operation: 'generate' | 'stream' | 'embed'): Promise<string> {
+async function enterDurableModelCall(): Promise<string> {
   const workflowID = DBOS.workflowID!;
   // Sequence after a detached call's checkpoint, so steps are always recorded in the order they were started.
   await settlingModelCalls.get(workflowID);
   const inflight = inflightModelCalls.get(workflowID) ?? 0;
   if (inflight > 0) {
-    // embedMany parallelizes its batches; maxParallelCalls: 1 serializes them deterministically. Other callers use child workflows.
-    const remedy =
-      operation === 'embed'
-        ? 'pass maxParallelCalls: 1 to embedMany, or run each call in its own child workflow with DBOS.startWorkflow'
-        : 'run each call in its own child workflow with DBOS.startWorkflow';
     throw new Error(
-      `Concurrent durable model calls in workflow "${workflowID}" are not supported because their step order is nondeterministic on replay; ${remedy}.`,
+      `Concurrent durable model calls in workflow "${workflowID}" are not supported because their step order is nondeterministic on replay; run each call in its own child workflow with DBOS.startWorkflow.`,
     );
   }
   inflightModelCalls.set(workflowID, inflight + 1);
@@ -66,7 +61,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
-      const workflowID = await enterDurableModelCall('generate');
+      const workflowID = await enterDurableModelCall();
       try {
         return await DBOS.runStep(async () => ensureResponseMetadata(encodeBinaryContent(await doGenerate())), {
           ...stepConfig,
@@ -87,7 +82,7 @@ export function durableCalls(options: StepConfig = {}): LanguageModelMiddleware 
       if (!isInWorkflowFunction()) {
         return await doStream();
       }
-      const workflowID = await enterDurableModelCall('stream');
+      const workflowID = await enterDurableModelCall();
       // The caller's abortSignal merged with the AI SDK's timeouts; an abort stops the provider call and is recorded as the step's outcome.
       const abortSignal = params.abortSignal;
       const aborted = () => abortSignal?.aborted === true;
@@ -241,12 +236,14 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelM
   const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
+    // embedMany runs its batches in parallel only for models that support it; sequential batches keep their step order deterministic on replay.
+    overrideSupportsParallelCalls: () => false,
     wrapEmbed: async ({ doEmbed, model }) => {
       assertNotInTransaction('embed');
       if (!isInWorkflowFunction()) {
         return await doEmbed();
       }
-      const workflowID = await enterDurableModelCall('embed');
+      const workflowID = await enterDurableModelCall();
       try {
         return await DBOS.runStep(async () => doEmbed(), {
           ...stepConfig,

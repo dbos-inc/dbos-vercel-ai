@@ -1367,12 +1367,24 @@ test('embedMany checkpoints as a durable step and replays from the checkpoint wi
   assert.equal(embedReplayMock.embedCalls, 1); // not re-called on replay
 });
 
-test('multi-batch embedMany (parallel batches) trips the guard with a remedy in the message', async () => {
-  const handle = await DBOS.startWorkflow(parallelEmbedWorkflow, { workflowID: randomUUID() })(['a', 'b', 'c', 'd']);
-  await assert.rejects(handle.getResult(), /Concurrent durable model calls.*maxParallelCalls: 1/s);
+test('multi-batch embedMany runs its batches sequentially as durable steps without maxParallelCalls', async () => {
+  const workflowID = randomUUID();
+  const callsBefore = batchEmbedMock.embedCalls;
+  const handle = await DBOS.startWorkflow(parallelEmbedWorkflow, { workflowID })(['a', 'b', 'c', 'd']);
+  // The wrapped model reports no parallel-call support, so the two batches never overlap and the guard never trips.
+  assert.equal(await handle.getResult(), 4);
+  assert.equal(batchEmbedMock.embedCalls - callsBefore, 2);
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const embedSteps = steps!.filter((s) => s.name === 'mock.mock-embed.embed');
+  assert.equal(embedSteps.length, 2);
+  assert.ok(embedSteps[0]!.completedAtEpochMs! <= embedSteps[1]!.startedAtEpochMs!, 'batches overlapped');
+
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof parallelEmbedWorkflow>>(workflowID, 2);
+  assert.equal(await forked.getResult(), 4);
+  assert.equal(batchEmbedMock.embedCalls - callsBefore, 2); // replayed from the checkpoints
 });
 
-test('multi-batch embedMany with maxParallelCalls: 1 is durable and correct', async () => {
+test('multi-batch embedMany with an explicit maxParallelCalls: 1 still works', async () => {
   const handle = await DBOS.startWorkflow(serialEmbedWorkflow, { workflowID: randomUUID() })(['a', 'b', 'c', 'd']);
   const result = await handle.getResult();
   assert.equal(result.count, 4);

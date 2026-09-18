@@ -203,10 +203,8 @@ const embeddingModel = wrapEmbeddingModel({
   middleware: durableEmbeddingCalls({ retriesAllowed: true }),
 });
 
-const { embeddings } = await embedMany({ model: embeddingModel, values: chunks, maxParallelCalls: 1 });
+const { embeddings } = await embedMany({ model: embeddingModel, values: chunks });
 ```
-
-Pass `maxParallelCalls: 1` when embedding more values than the model's per-call limit. `embedMany` otherwise splits the input into batches and runs them concurrently, which the concurrency guard rejects (their step order would be nondeterministic on replay); `maxParallelCalls: 1` runs the batches sequentially, keeping them durable and replay-safe.
 
 ## Images
 
