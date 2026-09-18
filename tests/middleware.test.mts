@@ -1685,7 +1685,7 @@ test('MCP tools list and execute as durable steps; replay does not re-execute th
 
   const steps = await DBOS.listWorkflowSteps(workflowID);
   assert.ok(steps?.some((s) => s.name === 'mcp.listTools'), 'tool listing recorded as a durable step');
-  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather'), 'tool call recorded as a durable step');
+  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather.call-1'), 'tool call recorded as a durable step');
   const generateCallsBefore = mcpToolMock.generateCalls;
 
   // Fork past every model/tool step: they all replay from checkpoints, so nothing is re-invoked.
@@ -1712,8 +1712,8 @@ test('parallel MCP tool calls each execute durably and replay without re-executi
   assert.equal(parallelMcpClient.timeCalls, 1);
 
   const steps = await DBOS.listWorkflowSteps(workflowID);
-  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather'), 'first parallel tool recorded as a step');
-  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getTime'), 'second parallel tool recorded as a step');
+  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getWeather.call-0'), 'first parallel tool recorded as a step');
+  assert.ok(steps?.some((s) => s.name === 'mcp.tool.getTime.call-1'), 'second parallel tool recorded as a step');
 
   // Fork past both parallel tool steps: they replay from checkpoints (would throw DBOSUnexpectedStepError if reordered).
   const noopStep = steps!.find((s) => s.name === 'noop')!;
@@ -1944,7 +1944,7 @@ test('a streaming MCP tool execute checkpoints its final value, not an empty obj
 
   // The checkpoint records the last yielded value; before the fix the generator serialized as {}.
   const steps = await DBOS.listWorkflowSteps(workflowID);
-  const toolStep = steps!.find((s) => s.name === 'mcp.tool.countdown')!;
+  const toolStep = steps!.find((s) => s.name === 'mcp.tool.countdown.call-1')!;
   assert.equal(toolStep.output, 'lift off');
 
   // The follow-up model call saw the final value, not {}.
@@ -2083,7 +2083,7 @@ test('an MCP tool aborted with a DOMException reason checkpoints the real error,
   assert.equal(slowToolExecutions - executionsBefore, 1); // aborted tool not retried
 
   const steps = await DBOS.listWorkflowSteps(workflowID);
-  const toolStep = steps!.find((s) => s.name === 'mcp.tool.slowTool')!;
+  const toolStep = steps!.find((s) => s.name === 'mcp.tool.slowTool.call-1')!;
   // The real abort reason is recorded — before the fix this was "Cannot set property message ... which has only a getter".
   assert.ok(toolStep.error !== null, 'aborted tool call recorded as a step error');
   assert.match(String(toolStep.error), /abort/i);
@@ -2103,7 +2103,7 @@ test('an aborted MCP tool call is not retried even when its error is not named A
   assert.equal(slowToolExecutions - executionsBefore, 1);
 
   const steps = await DBOS.listWorkflowSteps(workflowID);
-  const toolStep = steps!.find((s) => s.name === 'mcp.tool.slowTool')!;
+  const toolStep = steps!.find((s) => s.name === 'mcp.tool.slowTool.call-1')!;
   assert.match(String(toolStep.error), /connection reset by peer/);
 });
 
@@ -2529,4 +2529,29 @@ test('a stream started with an already-aborted signal lets a follow-up call wait
   const generateStep = steps!.find((s) => s.name === 'mock.mock-model.generate')!;
   assert.match(String(streamStep.error), /abort/i);
   assert.ok(streamStep.completedAtEpochMs! <= generateStep.startedAtEpochMs!, 'follow-up started before the aborted step was recorded');
+});
+
+test('parallel calls to the same MCP tool checkpoint under distinct step names and replay with their own results', async () => {
+  parallelMcpMock.generateResults.push(
+    toolCallsResponse([
+      { toolName: 'getWeather', input: '{"city":"Paris"}' },
+      { toolName: 'getWeather', input: '{"city":"Oslo"}' },
+    ]),
+    textResponse('Both fetched.'),
+  );
+  const workflowID = randomUUID();
+  const before = parallelMcpClient.weatherCalls;
+  const handle = await DBOS.startWorkflow(parallelMcpWorkflow, { workflowID })('weather in Paris and Oslo?');
+  assert.equal(await handle.getResult(), 'Both fetched.');
+  assert.equal(parallelMcpClient.weatherCalls - before, 2);
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  // A shared name would let a reordered replay hand each call the other's checkpoint; the call id keeps them apart.
+  assert.equal(steps!.find((s) => s.name === 'mcp.tool.getWeather.call-0')!.output, 'sunny in Paris');
+  assert.equal(steps!.find((s) => s.name === 'mcp.tool.getWeather.call-1')!.output, 'sunny in Oslo');
+
+  const noopStep = steps!.find((s) => s.name === 'noop')!;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof parallelMcpWorkflow>>(workflowID, noopStep.functionID);
+  assert.equal(await forked.getResult(), 'Both fetched.');
+  assert.equal(parallelMcpClient.weatherCalls - before, 2);
 });

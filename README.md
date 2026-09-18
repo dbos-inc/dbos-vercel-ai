@@ -145,7 +145,7 @@ const tools = durableTools(myTools, {
 ### MCP tools
 
 `durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (e.g. from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps.
-Each tool call is checkpointed so recovery replays results instead of re-invoking the tool:
+Each tool call is checkpointed as a step named `mcp.tool.<tool>.<toolCallId>`, so recovery replays results instead of re-invoking the tool:
 
 ```ts
 import { createMCPClient } from '@ai-sdk/mcp';

@@ -98,15 +98,16 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
       toModelOutput: def.convertsOutput ? ({ output }) => mcpToolOutput(output) : undefined,
       // Re-fetch the live tool inside the step (its execute closure can't be checkpointed); replay returns the recorded result.
       execute: (input: unknown, execOptions) => {
-        const signal = (execOptions as { abortSignal?: AbortSignal } | undefined)?.abortSignal;
+        const { abortSignal: signal, toolCallId } = (execOptions ?? {}) as { abortSignal?: AbortSignal; toolCallId?: string };
         // An aborted consumer is done with this call, whatever the failure looks like; a retry would re-run a cancelled side effect.
         const callConfig: StepConfig = {
           ...stepConfig,
           shouldRetry: async (error: unknown) =>
             !signal?.aborted && (stepConfig.shouldRetry ? await stepConfig.shouldRetry(error) : true),
         };
+        // The tool call id comes from the checkpointed model result, so a reordered parallel step fails replay instead of swapping results.
         return run(
-          `mcp.tool.${name}`,
+          `mcp.tool.${name}.${toolCallId ?? 'call'}`,
           async () => {
             const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
             if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
