@@ -1,4 +1,5 @@
-import { DBOS, StatusString } from '@dbos-inc/dbos-sdk';
+import { randomUUID } from 'node:crypto';
+import { DBOS, Error as DBOSErrors, StatusString } from '@dbos-inc/dbos-sdk';
 import type { UIMessageChunk } from 'ai' with { 'resolution-mode': 'import' };
 import type { LanguageModelV4FinishReason, LanguageModelV4StreamPart } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
 
@@ -7,8 +8,8 @@ export type DurableStreamOptions = string | { key: string; maxBatchParts?: numbe
 
 /** One DBOS stream value; the reader turns these into AI SDK UI message chunks. */
 export type DurableStreamRecord =
-  | { kind: 'model'; step: number; attempt: number; parts: LanguageModelV4StreamPart[] }
-  | { kind: 'model-end'; step: number; attempt: number; finishReason?: LanguageModelV4FinishReason; aborted?: true }
+  | { kind: 'model'; step: number; attempt: string; parts: LanguageModelV4StreamPart[] }
+  | { kind: 'model-end'; step: number; attempt: string; finishReason?: LanguageModelV4FinishReason; aborted?: true }
   | { kind: 'tool'; step: number; attempt: number; toolCallId: string; output?: unknown; errorText?: string }
   | { kind: 'ui'; step?: number; attempt?: number; chunks: UIMessageChunk[] }
   | { kind: 'end'; finishReason: string };
@@ -56,12 +57,11 @@ export class ModelStreamWriter {
   private pending: LanguageModelV4StreamPart[] = [];
   private chain: Promise<void> = Promise.resolve();
   private timer: ReturnType<typeof setTimeout> | undefined;
-  private readonly step: number;
-  private readonly attempt: number;
+  private readonly step = DBOS.stepID ?? -1;
+  // Unique per execution of the step, so a recovered run's re-execution is distinguishable from the crashed one.
+  private readonly attempt = randomUUID();
 
-  constructor(private readonly config: ResolvedDurableStream) {
-    ({ step: this.step, attempt: this.attempt } = stepInfo());
-  }
+  constructor(private readonly config: ResolvedDurableStream) {}
 
   push(part: LanguageModelV4StreamPart): void {
     if (!isContentPart(part)) return;
@@ -120,6 +120,7 @@ export async function closeDurableStream(key: string, finishReason = 'stop'): Pr
 /** What the reader needs from DBOS: the `DBOS` class in a launched process, or a `DBOSClient` anywhere else. */
 export interface DurableStreamSource {
   readStream<T>(workflowID: string, key: string, options?: { offset?: number }): AsyncGenerator<T, void, unknown>;
+  readStreamOffset<T>(workflowID: string, key: string, offset: number, options?: { timeoutSeconds?: number }): Promise<T>;
   retrieveWorkflow(workflowID: string): { getStatus(): Promise<{ status: string; error?: unknown } | null> };
 }
 
@@ -156,74 +157,143 @@ export function readDurableStream(options: ReadDurableStreamOptions): ReadableSt
 async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMessageChunk> {
   const { workflowID, key, sendReasoning = true, sendSources = false } = options;
   const client: DurableStreamSource = options.client ?? DBOS;
-  let offset = options.offset ?? 0;
-  if (offset === 0) yield { type: 'start', messageId: options.messageId };
-  let openStep: number | undefined;
-  // A resume usually lands mid-step, and the client already has that step open.
-  let resumed = offset > 0;
-  let finishReason: string | undefined;
-  const attempts = new Map<number, number>();
-  const closeStep = function* (): Generator<UIMessageChunk> {
-    if (openStep !== undefined) yield { type: 'finish-step' };
-    openStep = undefined;
+  const state: ReaderState = {
+    offset: options.offset ?? 0,
+    resumed: (options.offset ?? 0) > 0,
+    openParts: new Map(),
+    ended: false,
   };
+  if (state.offset === 0) yield { type: 'start', messageId: options.messageId };
+  const emit = (record: DurableStreamRecord) => emitRecord(state, record, { sendReasoning, sendSources });
 
-  for await (const record of client.readStream<DurableStreamRecord>(workflowID, key, { offset })) {
-    offset += 1;
-    switch (record.kind) {
-      case 'model': {
-        // A retried attempt supersedes an earlier one; content only streams live once, so this mostly guards reconnects.
-        if (record.attempt < (attempts.get(record.step) ?? 0)) break;
-        attempts.set(record.step, record.attempt);
-        if (openStep !== record.step) {
-          yield* closeStep();
-          if (!resumed) yield { type: 'start-step' };
-          resumed = false;
-          openStep = record.step;
-        }
-        for (const part of record.parts) {
-          if (!sendReasoning && part.type.startsWith('reasoning-')) continue;
-          if (!sendSources && part.type === 'source') continue;
-          const chunk = toUIChunk(part, record.step);
-          if (chunk) yield chunk;
-        }
-        break;
-      }
-      case 'model-end':
-        // The stream outlives the call: the workflow may run more calls, so only its end (or closeDurableStream) ends the turn.
-        if (record.attempt < (attempts.get(record.step) ?? 0)) break;
-        finishReason = record.aborted ? 'other' : record.finishReason?.unified;
-        break;
-      case 'tool':
-        yield record.errorText !== undefined
-          ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: record.errorText }
-          : { type: 'tool-output-available', toolCallId: record.toolCallId, output: record.output };
-        break;
-      case 'ui':
-        yield* record.chunks;
-        break;
-      case 'end':
-        // The terminal chunk comes last, so the offset goes out first.
-        yield { type: 'data-dbos-offset', data: { offset }, transient: true } as UIMessageChunk;
-        yield* closeStep();
-        yield { type: 'finish', finishReason: record.finishReason as UIFinishReason };
-        return;
+  // Phase 1: everything already stored, one value per query until an offset is empty; a superseded attempt is skipped whole.
+  const history: DurableStreamRecord[] = [];
+  for (;;) {
+    try {
+      history.push(await client.readStreamOffset<DurableStreamRecord>(workflowID, key, state.offset + history.length, { timeoutSeconds: 0 }));
+    } catch (error) {
+      if (!DBOSErrors.isStreamTimeoutError(error)) throw error;
+      break;
     }
-    yield { type: 'data-dbos-offset', data: { offset }, transient: true } as UIMessageChunk;
+  }
+  const finalAttempt = new Map<number, string>();
+  for (const record of history) {
+    if (record.kind === 'model' || record.kind === 'model-end') finalAttempt.set(record.step, record.attempt);
+  }
+  for (const record of history) {
+    const stale = (record.kind === 'model' || record.kind === 'model-end') && finalAttempt.get(record.step) !== record.attempt;
+    yield* stale ? skipRecord(state) : emit(record);
+    if (state.ended) return;
+  }
+
+  // Phase 2: live; a re-executed step shows up as a new attempt and is handed off in place.
+  for await (const record of client.readStream<DurableStreamRecord>(workflowID, key, { offset: state.offset })) {
+    yield* emit(record);
+    if (state.ended) return;
   }
 
   // No end record: the workflow's status decides how the turn ended (a stream closed while it still runs counts as finished).
   const status = (await client.retrieveWorkflow(workflowID).getStatus())?.status;
-  yield* closeStep();
+  yield* closeStep(state);
   if (status === StatusString.CANCELLED) {
     yield { type: 'abort' };
   } else if (status === undefined || status === StatusString.SUCCESS || status === StatusString.PENDING || status === StatusString.ENQUEUED) {
-    yield { type: 'finish', finishReason: (finishReason ?? 'unknown') as UIFinishReason };
+    yield { type: 'finish', finishReason: (state.finishReason ?? 'unknown') as UIFinishReason };
   } else {
     const error = (await client.retrieveWorkflow(workflowID).getStatus())?.error;
     yield { type: 'error', errorText: error instanceof Error ? error.message : String(error ?? 'The workflow ended before the response completed.') };
     yield { type: 'finish', finishReason: 'error' };
   }
+}
+
+interface ReaderState {
+  offset: number;
+  resumed: boolean;
+  openStep?: number;
+  openAttempt?: string;
+  // Text/reasoning parts of the open attempt that have started but not ended, by UI part id.
+  openParts: Map<string, 'text' | 'reasoning'>;
+  finishReason?: string;
+  ended: boolean;
+}
+
+function offsetChunk(state: ReaderState): UIMessageChunk {
+  return { type: 'data-dbos-offset', data: { offset: state.offset }, transient: true } as UIMessageChunk;
+}
+
+function* skipRecord(state: ReaderState): Generator<UIMessageChunk> {
+  state.offset += 1;
+  yield offsetChunk(state);
+}
+
+function* closeStep(state: ReaderState): Generator<UIMessageChunk> {
+  if (state.openStep !== undefined) yield { type: 'finish-step' };
+  state.openStep = undefined;
+  state.openAttempt = undefined;
+  state.openParts.clear();
+}
+
+// A live re-execution of the open step: end the stale attempt's parts and tell the client which ones to discard.
+function* supersede(state: ReaderState, attempt: string): Generator<UIMessageChunk> {
+  for (const [id, kind] of state.openParts) yield { type: kind === 'text' ? 'text-end' : 'reasoning-end', id };
+  yield {
+    type: 'data-dbos-superseded',
+    data: { attempt: state.openAttempt, parts: [...state.openParts.keys()] },
+    transient: true,
+  } as UIMessageChunk;
+  state.openParts.clear();
+  state.openAttempt = attempt;
+}
+
+function* emitRecord(
+  state: ReaderState,
+  record: DurableStreamRecord,
+  filter: { sendReasoning: boolean; sendSources: boolean },
+): Generator<UIMessageChunk> {
+  state.offset += 1;
+  switch (record.kind) {
+    case 'model': {
+      if (state.openStep !== record.step) {
+        yield* closeStep(state);
+        if (!state.resumed) yield { type: 'start-step' };
+        state.resumed = false;
+        state.openStep = record.step;
+        state.openAttempt = record.attempt;
+      } else if (state.openAttempt !== record.attempt) {
+        yield* supersede(state, record.attempt);
+      }
+      for (const part of record.parts) {
+        if (!filter.sendReasoning && part.type.startsWith('reasoning-')) continue;
+        if (!filter.sendSources && part.type === 'source') continue;
+        const chunk = toUIChunk(part, record.attempt);
+        if (!chunk) continue;
+        if (chunk.type === 'text-start' || chunk.type === 'reasoning-start') state.openParts.set(chunk.id, chunk.type === 'text-start' ? 'text' : 'reasoning');
+        if (chunk.type === 'text-end' || chunk.type === 'reasoning-end') state.openParts.delete(chunk.id);
+        yield chunk;
+      }
+      break;
+    }
+    case 'model-end':
+      // The stream outlives the call: the workflow may run more calls, so only its end (or closeDurableStream) ends the turn.
+      if (record.attempt === state.openAttempt) state.finishReason = record.aborted ? 'other' : record.finishReason?.unified;
+      break;
+    case 'tool':
+      yield record.errorText !== undefined
+        ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: record.errorText }
+        : { type: 'tool-output-available', toolCallId: record.toolCallId, output: record.output };
+      break;
+    case 'ui':
+      yield* record.chunks;
+      break;
+    case 'end':
+      // The terminal chunk comes last, so the offset goes out first.
+      yield offsetChunk(state);
+      yield* closeStep(state);
+      yield { type: 'finish', finishReason: record.finishReason as UIFinishReason };
+      state.ended = true;
+      return;
+  }
+  yield offsetChunk(state);
 }
 
 type UIFinishReason = Extract<UIMessageChunk, { type: 'finish' }>['finishReason'];
@@ -236,9 +306,9 @@ function parseInput(input: string): unknown {
   }
 }
 
-// Text and reasoning ids are only unique within one model call; the step number keeps calls apart in one message.
-function toUIChunk(part: LanguageModelV4StreamPart, step: number): UIMessageChunk | undefined {
-  const id = 'id' in part ? `${step}:${part.id}` : '';
+// Text and reasoning ids are only unique within one model call; the attempt id keeps calls, and re-executions, apart in one message.
+function toUIChunk(part: LanguageModelV4StreamPart, attempt: string): UIMessageChunk | undefined {
+  const id = 'id' in part ? `${attempt}:${part.id}` : '';
   switch (part.type) {
     case 'text-start':
       return { type: 'text-start', id, providerMetadata: part.providerMetadata };

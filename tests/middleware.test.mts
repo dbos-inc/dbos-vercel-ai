@@ -1353,7 +1353,7 @@ const dsSyntheticWorkflow = DBOS.registerWorkflow(
     const record: DurableStreamRecord = {
       kind: 'model',
       step: 0,
-      attempt: 1,
+      attempt: 'attempt-a',
       parts: [
         { type: 'reasoning-start', id: 'r1' },
         { type: 'reasoning-delta', id: 'r1', delta: 'thinking' },
@@ -1379,6 +1379,64 @@ let dsCancelledGate = newGate();
 const dsCancelledWorkflow = DBOS.registerWorkflow(
   async () => (await streamText({ model: dsCancelledModel, prompt: 'hi', maxRetries: 0 }).text),
   { name: 'dsCancelledWorkflow' },
+);
+
+// Simulates a crash mid-call: a partial attempt's records stay in the stream ahead of the re-executed call's.
+const staleParts = (text: string): DurableStreamRecord => ({
+  kind: 'model',
+  step: 0,
+  attempt: 'stale',
+  parts: [{ type: 'text-start', id: 't1' }, { type: 'text-delta', id: 't1', delta: text }],
+});
+const freshRecords = (text: string): DurableStreamRecord[] => [
+  { kind: 'model', step: 0, attempt: 'fresh', parts: [{ type: 'text-start', id: 't1' }, { type: 'text-delta', id: 't1', delta: text }, { type: 'text-end', id: 't1' }] },
+  { kind: 'model-end', step: 0, attempt: 'fresh', finishReason: { unified: 'stop', raw: undefined } },
+];
+const dsStaleHistoryWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await DBOS.runStep(
+      async () => {
+        await DBOS.writeStream('ui', staleParts('STALE'));
+        for (const record of freshRecords('fresh')) await DBOS.writeStream('ui', record);
+      },
+      { name: 'write' },
+    );
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'dsStaleHistoryWorkflow' },
+);
+let dsStaleLiveGate = newGate();
+const dsStaleLiveWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await DBOS.runStep(
+      async () => {
+        await DBOS.writeStream('ui', staleParts('STALE'));
+        await dsStaleLiveGate.promise;
+        for (const record of freshRecords('fresh')) await DBOS.writeStream('ui', record);
+      },
+      { name: 'write' },
+    );
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'dsStaleLiveWorkflow' },
+);
+// A long history followed by a gated live tail, to exercise the history-to-live handoff.
+let dsHandoffGate = newGate();
+const dsHandoffWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await DBOS.runStep(
+      async () => {
+        for (let i = 0; i < 30; i++) {
+          await DBOS.writeStream('ui', { kind: 'ui', chunks: [{ type: 'data-tick', id: `tick-${i}`, data: { i } }] } satisfies DurableStreamRecord);
+        }
+        await dsHandoffGate.promise;
+        for (const record of freshRecords('after the gate')) await DBOS.writeStream('ui', record);
+      },
+      { name: 'write' },
+    );
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'dsHandoffWorkflow' },
 );
 
 before(async () => {
@@ -2873,7 +2931,9 @@ test('durable stream: a retry before any output writes the response once, under 
   assert.equal(dsRetryMock.streamCalls, 2);
   const records = await readRecords(workflowID, 'ui');
   assert.deepEqual(records.map((r) => r.kind), ['model', 'model-end']);
-  assert.ok(records.every((r) => r.kind === 'end' || r.attempt === 2));
+  const attempts = new Set(records.map((r) => ('attempt' in r ? r.attempt : undefined)));
+  assert.equal(attempts.size, 1);
+  assert.match(String([...attempts][0]), /^[0-9a-f-]{36}$/);
   assert.equal(streamedText(visible(await readChunks(workflowID, 'ui'))), 'Recovered');
 });
 
@@ -2974,4 +3034,48 @@ test('durable stream: a cancelled workflow ends the stream with an abort chunk',
   assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['finish-step', 'abort']);
   dsCancelledGate.release();
   await handle.getResult().catch(() => undefined);
+});
+
+test('durable stream: a superseded attempt in history is skipped, so a re-streamed call is read once', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsStaleHistoryWorkflow, { workflowID })()).getResult();
+  const chunks = await readChunks(workflowID, 'ui');
+  assert.equal(streamedText(visible(chunks)), 'fresh');
+  assert.ok(!chunks.some((c) => c.type === 'data-dbos-superseded'));
+  assert.deepEqual(visible(chunks).map((c) => c.type), ['start', 'start-step', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  // Skipped records still advance the offset, so a resume lands in the right place.
+  assert.deepEqual((chunks.find((c) => c.type === 'data-dbos-offset') as { data: { offset: number } }).data, { offset: 1 });
+});
+
+test('durable stream: a re-execution seen live ends the stale parts and names them in a superseded chunk', async () => {
+  dsStaleLiveGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsStaleLiveWorkflow, { workflowID })();
+  const reader = readDurableStream({ workflowID, key: 'ui', messageId: 'msg-1' }).getReader();
+  const chunks: UIMessageChunk[] = [];
+  while (!chunks.some((c) => c.type === 'text-delta')) chunks.push((await reader.read()).value!);
+  dsStaleLiveGate.release();
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  await handle.getResult();
+  const types = visible(chunks).map((c) => c.type);
+  assert.deepEqual(types, ['start', 'start-step', 'text-start', 'text-delta', 'text-end', 'data-dbos-superseded', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  assert.deepEqual((chunks.find((c) => c.type === 'data-dbos-superseded') as { data: unknown }).data, { attempt: 'stale', parts: ['stale:t1'] });
+  assert.equal((chunks.filter((c) => c.type === 'text-start')[1] as { id: string }).id, 'fresh:t1');
+});
+
+test('durable stream: records written while history is being read are delivered by the live phase', async () => {
+  dsHandoffGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsHandoffWorkflow, { workflowID })();
+  for (let i = 0; i < 500 && (await readRecordsSoFar(workflowID)) === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  const live = readChunks(workflowID, 'ui');
+  dsHandoffGate.release();
+  await handle.getResult();
+  assert.deepEqual(await live, await readChunks(workflowID, 'ui'));
+  assert.equal(streamedText(visible(await live)), 'after the gate');
+  assert.equal((await live).filter((c) => c.type === 'data-tick').length, 30);
 });
