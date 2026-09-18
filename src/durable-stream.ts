@@ -52,10 +52,23 @@ function encodePart(part: LanguageModelV4StreamPart): LanguageModelV4StreamPart 
   return part;
 }
 
+// A transient write error (the SDK already retries offset conflicts) gets a few attempts before it fails the model call.
+async function writeWithRetry(key: string, record: DurableStreamRecord): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await DBOS.writeStream(key, record);
+    } catch (error) {
+      if (attempt === 3) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
+    }
+  }
+}
+
 /** Batches a live model step's parts into step-scope stream writes; nothing is written on replay because the step body does not run. */
 export class ModelStreamWriter {
   private pending: LanguageModelV4StreamPart[] = [];
   private chain: Promise<void> = Promise.resolve();
+  private failure: unknown;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly step = DBOS.stepID ?? -1;
   // Unique per execution of the step, so a recovered run's re-execution is distinguishable from the crashed one.
@@ -70,27 +83,36 @@ export class ModelStreamWriter {
     else this.timer ??= setTimeout(() => this.flush(), this.config.maxBatchDelayMs);
   }
 
-  /** Flushes, records how the call ended, and resolves once every write is durable. */
+  /** Flushes, records how the call ended, and resolves once every write is durable; a write that failed after retries fails the call here. */
   async end(outcome: { finishReason: LanguageModelV4FinishReason } | { aborted: true }): Promise<void> {
     this.flush();
-    const record: DurableStreamRecord = { kind: 'model-end', step: this.step, attempt: this.attempt, ...outcome };
-    this.chain = this.chain.then(() => DBOS.writeStream(this.config.key, record));
+    this.write({ kind: 'model-end', step: this.step, attempt: this.attempt, ...outcome });
     await this.chain;
+    if (this.failure !== undefined) throw this.failure;
   }
 
   /** After a failure: flush what streamed so the record matches what the consumer saw; the stream's end then comes from the workflow's status. */
   async abandon(): Promise<void> {
     this.flush();
-    await this.chain.catch(() => {});
+    await this.chain;
   }
 
   private flush(): void {
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
     if (this.pending.length === 0) return;
-    const record: DurableStreamRecord = { kind: 'model', step: this.step, attempt: this.attempt, parts: this.pending };
+    const parts = this.pending;
     this.pending = [];
-    this.chain = this.chain.then(() => DBOS.writeStream(this.config.key, record));
+    this.write({ kind: 'model', step: this.step, attempt: this.attempt, parts });
+  }
+
+  // Every link has a handler, so a rejection can never sit unobserved; after one failure later writes are skipped.
+  private write(record: DurableStreamRecord): void {
+    this.chain = this.chain
+      .then(() => (this.failure === undefined ? writeWithRetry(this.config.key, record) : undefined))
+      .catch((error: unknown) => {
+        this.failure ??= error;
+      });
   }
 }
 

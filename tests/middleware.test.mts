@@ -3512,3 +3512,48 @@ test('agentTool: a queue or timeout on one sub-agent does not leak into siblings
   assert.equal((await status('call-later')).queueName, undefined);
   assert.equal(Object.values(result.toolOutputs).length, 5);
 });
+
+// Replaces the SDK's static writeStream for one test; the original is restored in finally.
+function failWrites(count: number, message: string): { restore: () => void; calls: () => number } {
+  const original = DBOS.writeStream;
+  let failuresLeft = count;
+  let calls = 0;
+  DBOS.writeStream = (async (key, value, options) => {
+    calls++;
+    if (failuresLeft > 0) {
+      failuresLeft--;
+      throw new Error(message);
+    }
+    return original.call(DBOS, key, value, options);
+  }) as typeof DBOS.writeStream;
+  return { restore: () => void (DBOS.writeStream = original), calls: () => calls };
+}
+
+test('durable stream: a transient write failure is retried and the call succeeds with a complete stream', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['a', 'b', 'c']));
+  const workflowID = randomUUID();
+  const writes = failWrites(1, 'transient write failure');
+  try {
+    assert.equal((await (await DBOS.startWorkflow(dsWorkflow, { workflowID })('retry')).getResult()).text, 'abc');
+  } finally {
+    writes.restore();
+  }
+  const records = await readRecords(workflowID, 'ui');
+  assert.deepEqual(records.map((r) => r.kind), ['model', 'model', 'model', 'model-end']);
+  assert.equal(streamedText(visible(await readChunks(workflowID, 'ui'))), 'abc');
+});
+
+test('durable stream: a persistent write failure fails the model call instead of crashing the process', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['a', 'b', 'c']));
+  const workflowID = randomUUID();
+  const writes = failWrites(Number.POSITIVE_INFINITY, 'persistent write failure');
+  try {
+    await assert.rejects((await DBOS.startWorkflow(dsWorkflow, { workflowID })('fail')).getResult(), /persistent write failure/);
+  } finally {
+    writes.restore();
+  }
+  // The first record's three attempts were made; after that failure the writer skipped the rest.
+  assert.equal(writes.calls(), 3);
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['error', 'finish']);
+});
