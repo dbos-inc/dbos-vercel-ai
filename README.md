@@ -3,12 +3,9 @@
 [DBOS](https://docs.dbos.dev/) durable execution for the [Vercel AI SDK](https://ai-sdk.dev/).
 
 This package makes AI SDK **agents** durable, backed by your Postgres database.
-All you have to do is wrap your model with `durableCalls` and run your generation inside a DBOS workflow.
+All you have to do is wrap your model with `durableCalls` and your tools with `durableTools` and run your agents inside a DBOS workflow.
 Then, this integration automatically checkpoints every action your agents take in Postgres.
-If your process crashes mid-agent, DBOS replays the completed steps from their checkpoints and the agent resumes exactly where it left off.
-
-This package is implemented as standard AI SDK [middleware](https://ai-sdk.dev/docs/ai-sdk-core/middleware), so you keep your provider, your model configuration, and the familiar APIs like `generateText`, `streamText`, and `ToolLoopAgent`.
-Durability is transparent to your agent code.
+If your process is interrupted, DBOS replays your agent from its checkpoints so it resumes from where it left off.
 
 ```ts
 import { DBOS } from '@dbos-inc/dbos-sdk';
@@ -47,35 +44,44 @@ npm install @dbos-inc/vercel-ai @dbos-inc/dbos-sdk ai
 
 Requires DBOS v4.21+ or v5, AI SDK v7+, and a Postgres database for DBOS.
 
-## How it works
+## Models
 
-When an agent runs inside a DBOS workflow, DBOS makes three things durable:
+To durably checkpoint each call you make to a model, wrap your model in `durableCalls`.
+Then, call your model or agent from a workflow:
 
-- **Every model call.** `durableCalls()` is AI SDK middleware that intercepts `doGenerate`/`doStream` and runs each call through [`DBOS.runStep`](https://docs.dbos.dev/typescript/tutorials/step-tutorial). The complete result (content, usage, finish reason, response metadata) is checkpointed in Postgres. On recovery, completed calls replay from their checkpoints without contacting the model provider.
-- **The agent loop.** Because DBOS workflows replay deterministically on recovery and each model call replays from its checkpoint, a multi-step, tool-calling agent resumes from the first unfinished step instead of restarting from the beginning.
-- **Tool calls.** Your own tools are checkpointed when wrapped with [`durableTools`](#tools), and MCP tools via [`durableMCPTools`](#mcp-tools). On recovery, completed tool calls replay their recorded output instead of re-running.
+```ts
+import { DBOS } from '@dbos-inc/dbos-sdk';
+import { ToolLoopAgent, wrapLanguageModel } from 'ai';
+import { openai } from '@ai-sdk/openai';
+import { durableCalls } from '@dbos-inc/vercel-ai';
 
-Outside a workflow (or inside another step) the wrapped model calls the provider directly with no checkpointing, so the same model works anywhere in your app.
+const model = wrapLanguageModel({ model: openai('gpt-5'), middleware: durableCalls() });
+const agent = new ToolLoopAgent({ model, instructions: 'You are a helpful research assistant.', tools });
 
-All DBOS step options are accepted and apply per model call:
+const researchAgent = DBOS.registerWorkflow(
+  async (question: string) => {
+    const result = await agent.stream({ prompt: question });
+    for await (const delta of result.textStream) process.stdout.write(delta);
+    return await result.text;
+  },
+  { name: 'researchAgent' },
+);
+```
+
+You can parameterize `durableCalls` to configure model call retries and timeouts:
 
 ```ts
 durableCalls({
-  retriesAllowed: true,   // retry failed model calls (default: true)
-  maxAttempts: 5,         // total attempts when retries are allowed (default: 3)
-  intervalSeconds: 1,     // delay before first retry (default: 1)
-  backoffRate: 2,         // exponential backoff multiplier (default: 2)
-  shouldRetry: (error) => true,  // per-error retry predicate (default: skip provider-declared non-retryable errors and aborts)
-  timeoutMS: 60000,       // per-attempt timeout
-  name: 'my-model-call',  // step name (default: "<provider>.<modelId>.<operation>")
+  name?: string;              // step name (default: "<provider>.<modelId>.<operation>")
+  retriesAllowed?: boolean;   // retry failed model calls (default: true)
+  maxAttempts?: number;       // total attempts when retries are allowed (default: 3)
+  intervalSeconds?: number;   // delay before first retry (default: 1)
+  backoffRate?: number;       // exponential backoff multiplier (default: 2)
+  shouldRetry?: (error: unknown) => boolean;  // default: skip provider-declared non-retryable errors and aborts
+  timeoutMS?: number;         // per-attempt timeout
+  durableStream?: string;     // stream each call's output to this durable stream
 });
 ```
-
-Retries are on by default so that a transient provider error is absorbed inside a single durable step.
-The default `shouldRetry` treats errors the provider marks non-retryable (an AI SDK `APICallError`/`GatewayError` with `isRetryable === false`, e.g. a 401 or an invalid-request 400) and aborts/timeouts as terminal, so they fail fast instead of retrying `maxAttempts` times. 
-Pass your own `shouldRetry` to override it, or `retriesAllowed: false` to disable step retries.
-
-Because DBOS owns retries by default, pass `maxRetries: 0` to the AI SDK call so retry behavior is governed in one place; otherwise the two compose multiplicatively and each AI SDK retry is a fresh step.
 
 ## Durable streams
 
@@ -112,6 +118,14 @@ It emits a stream of AI SDK `UIMessageChunk`s.
 After every record it emits a transient `data-dbos-offset` chunk; to reconnect an interrupted stream, pass the last `offset` a client saw back as `readDurableStream({ ..., offset })` and the stream resumes from there.
 You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
 
+Details:
+
+- Serve the first response from the durable stream too, as above: its part ids differ from the AI SDK's live stream, so a client must not mix the two.
+- `readDurableStream` accepts `sendReasoning` (default true) and `sendSources` (default false), like `toUIMessageStream`. Call it from route handlers, not from workflow code.
+- `durableStream` also accepts `{ key, maxBatchParts, maxBatchDelayMs }` to tune the model step's batched writes (default: 20 parts or 25 ms per write).
+- `writeDurableStream` from a step is cheap and at-least-once, so give `data-*` parts stable ids. From workflow code each call is a checkpointed step, so the number of calls must be deterministic: never write per token from workflow code.
+- Tool outputs reach the stream from inside the tool's step, so a tool left non-durable writes nothing.
+
 ## Tools
 
 Model calls in a tool-calling loop are each checkpointed individually, so a recovered agent resumes mid-loop.
@@ -145,9 +159,14 @@ const tools = durableTools(myTools, {
   timeoutMS: 30_000,
   tools: {
     getWeather: { retriesAllowed: true, maxAttempts: 3 },
+    lookupCache: false, // leave this tool non-durable
   },
 });
 ```
+
+Each call runs as a step named `<tool>.<toolCallId>`, so a reordered parallel replay fails rather than swapping results.
+A tool that throws has its error checkpointed and replayed to the model without re-running.
+A `timeoutMS` is forwarded to the tool's `abortSignal`, and an `execute` that is an async generator is drained inside the step and records its last yield.
 
 ### MCP tools
 
