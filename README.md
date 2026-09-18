@@ -199,7 +199,8 @@ const tools = durableTools({ research, getWeather }, { durableStream: 'ui' });
 const orchestrator = new ToolLoopAgent({ model, tools });
 ```
 
-Internally, subagents are implemented as child workflows of the parent agent workflow.
+Internally, subagents are implemented as child workflows of the parent agent workflow, so each call has its own checkpoints and parallel calls are safe.
+Call `agentTool` before `DBOS.launch()`, since it registers that workflow.
 
 ## Durable Embedding Models
 
