@@ -71,7 +71,18 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
       }
       const workflowID = await enterDurableModelCall();
       try {
-        return await DBOS.runStep(async () => ensureResponseMetadata(encodeBinaryContent(await doGenerate())), {
+        return await DBOS.runStep(
+          async () => {
+            const result = ensureResponseMetadata(encodeBinaryContent(await doGenerate()));
+            // A non-streaming call writes its whole output at once, so the stream holds every call the loop makes, not only streamed ones.
+            if (streamConfig) {
+              const streamWriter = new ModelStreamWriter(streamConfig);
+              for (const part of replayParts(result)) streamWriter.push(part);
+              await streamWriter.end({ finishReason: result.finishReason });
+            }
+            return result;
+          },
+          {
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'generate'),
           // An aborted call is never retried, whatever the provider's rejection looks like.

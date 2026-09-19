@@ -106,15 +106,15 @@ return createUIMessageStreamResponse({
 });
 ```
 
-You can also write your own data to a stream with `writeDurableStream(key, chunks)`.
-Your streams are closed when your workflow finishes; you can also close a stream early using `closeDurableStream`.
-If a model call is interrupted, the recovered run streams that call again.
-Readers that connect afterwards see the model's output once; live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
-
 You can read from a durable stream using `readDurableStream`, for example to stream it to a UI.
 It emits a stream of AI SDK `UIMessageChunk`.
-After every record it emits a transient `data-dbos-offset` chunk; to reconnect an interrupted stream, pass the last `offset` a client saw back as `readDurableStream({ ..., offset })` and the stream resumes from there.
 You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
+
+You can write your own data to a stream with `writeDurableStream(key, chunks)`.
+Your streams are closed when your workflow finishes; you can also close a stream early using `closeDurableStream`.
+
+If a workflow is interrupted during a model call, when the workflow recovers, it restarts the model call and streams its output again.
+Readers that connect afterwards see the model's output once; live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
 
 ## Durable Tools
 
@@ -151,6 +151,8 @@ const tools = durableTools(myTools, {
   },
 });
 ```
+
+When using durable tools, to ensure the ordering of parallel tool calls is consistent during recovery, do not await I/O in callbacks that run before a tool executes, such as `onToolExecutionStart`.
 
 ### Durable MCP Tools
 

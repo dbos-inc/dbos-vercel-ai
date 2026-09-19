@@ -52,10 +52,23 @@ function encodePart(part: LanguageModelV4StreamPart): LanguageModelV4StreamPart 
   return part;
 }
 
+// A transient write error (the SDK already retries offset conflicts) gets a few attempts before it fails the model call.
+async function writeWithRetry(key: string, record: DurableStreamRecord): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await DBOS.writeStream(key, record);
+    } catch (error) {
+      if (attempt === 3) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
+    }
+  }
+}
+
 /** Batches a live model step's parts into step-scope stream writes; nothing is written on replay because the step body does not run. */
 export class ModelStreamWriter {
   private pending: LanguageModelV4StreamPart[] = [];
   private chain: Promise<void> = Promise.resolve();
+  private failure: unknown;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly step = DBOS.stepID ?? -1;
   // Unique per execution of the step, so a recovered run's re-execution is distinguishable from the crashed one.
@@ -70,27 +83,36 @@ export class ModelStreamWriter {
     else this.timer ??= setTimeout(() => this.flush(), this.config.maxBatchDelayMs);
   }
 
-  /** Flushes, records how the call ended, and resolves once every write is durable. */
+  /** Flushes, records how the call ended, and resolves once every write is durable; a write that failed after retries fails the call here. */
   async end(outcome: { finishReason: LanguageModelV4FinishReason } | { aborted: true }): Promise<void> {
     this.flush();
-    const record: DurableStreamRecord = { kind: 'model-end', step: this.step, attempt: this.attempt, ...outcome };
-    this.chain = this.chain.then(() => DBOS.writeStream(this.config.key, record));
+    this.write({ kind: 'model-end', step: this.step, attempt: this.attempt, ...outcome });
     await this.chain;
+    if (this.failure !== undefined) throw this.failure;
   }
 
   /** After a failure: flush what streamed so the record matches what the consumer saw; the stream's end then comes from the workflow's status. */
   async abandon(): Promise<void> {
     this.flush();
-    await this.chain.catch(() => {});
+    await this.chain;
   }
 
   private flush(): void {
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
     if (this.pending.length === 0) return;
-    const record: DurableStreamRecord = { kind: 'model', step: this.step, attempt: this.attempt, parts: this.pending };
+    const parts = this.pending;
     this.pending = [];
-    this.chain = this.chain.then(() => DBOS.writeStream(this.config.key, record));
+    this.write({ kind: 'model', step: this.step, attempt: this.attempt, parts });
+  }
+
+  // Every link has a handler, so a rejection can never sit unobserved; after one failure later writes are skipped.
+  private write(record: DurableStreamRecord): void {
+    this.chain = this.chain
+      .then(() => (this.failure === undefined ? writeWithRetry(this.config.key, record) : undefined))
+      .catch((error: unknown) => {
+        this.failure ??= error;
+      });
   }
 }
 
@@ -137,6 +159,8 @@ export interface ReadDurableStreamOptions {
   sendReasoning?: boolean;
   /** Emit source parts (default false, as in the AI SDK). */
   sendSources?: boolean;
+  /** Text sent to clients for a workflow or tool error; defaults to a generic message, as in the AI SDK, so server details stay private. */
+  onError?: (error: unknown) => string;
 }
 
 /** Reads a durable stream as AI SDK UI message chunks, live or after the fact, resuming from `offset`. */
@@ -155,7 +179,7 @@ export function readDurableStream(options: ReadDurableStreamOptions): ReadableSt
 }
 
 async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMessageChunk> {
-  const { workflowID, key, sendReasoning = true, sendSources = false } = options;
+  const { workflowID, key, sendReasoning = true, sendSources = false, onError = () => 'An error occurred.' } = options;
   const client: DurableStreamSource = options.client ?? DBOS;
   const state: ReaderState = {
     offset: options.offset ?? 0,
@@ -164,7 +188,7 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     ended: false,
   };
   if (state.offset === 0) yield { type: 'start', messageId: options.messageId };
-  const emit = (record: DurableStreamRecord) => emitRecord(state, record, { sendReasoning, sendSources });
+  const emit = (record: DurableStreamRecord) => emitRecord(state, record, { sendReasoning, sendSources, onError });
 
   // Phase 1: everything already stored, one value per query until an offset is empty; a superseded attempt is skipped whole.
   const history: DurableStreamRecord[] = [];
@@ -198,10 +222,11 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
   if (status === StatusString.CANCELLED) {
     yield { type: 'abort' };
   } else if (status === undefined || status === StatusString.SUCCESS || status === StatusString.PENDING || status === StatusString.ENQUEUED) {
-    yield { type: 'finish', finishReason: (state.finishReason ?? 'unknown') as UIFinishReason };
+    // The AI SDK's finish schema has no 'unknown'; a turn with no model call ends with the reason omitted.
+    yield state.finishReason === undefined ? { type: 'finish' } : { type: 'finish', finishReason: state.finishReason as UIFinishReason };
   } else {
     const error = (await client.retrieveWorkflow(workflowID).getStatus())?.error;
-    yield { type: 'error', errorText: error instanceof Error ? error.message : String(error ?? 'The workflow ended before the response completed.') };
+    yield { type: 'error', errorText: onError(error ?? new Error('The workflow ended before the response completed.')) };
     yield { type: 'finish', finishReason: 'error' };
   }
 }
@@ -248,7 +273,7 @@ function* supersede(state: ReaderState, attempt: string): Generator<UIMessageChu
 function* emitRecord(
   state: ReaderState,
   record: DurableStreamRecord,
-  filter: { sendReasoning: boolean; sendSources: boolean },
+  filter: { sendReasoning: boolean; sendSources: boolean; onError: (error: unknown) => string },
 ): Generator<UIMessageChunk> {
   state.offset += 1;
   switch (record.kind) {
@@ -278,8 +303,9 @@ function* emitRecord(
       if (record.attempt === state.openAttempt) state.finishReason = record.aborted ? 'other' : record.finishReason?.unified;
       break;
     case 'tool':
+      // Local tool errors are masked like the AI SDK does; provider-executed ones (in model records) pass through verbatim.
       yield record.errorText !== undefined
-        ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: record.errorText }
+        ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: filter.onError(new Error(record.errorText)) }
         : { type: 'tool-output-available', toolCallId: record.toolCallId, output: record.output };
       break;
     case 'ui':

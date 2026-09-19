@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import type { FlexibleSchema, ModelMessage, Tool } from 'ai' with { 'resolution-mode': 'import' };
-import { writeDurableStream } from './durable-stream';
+import { writeDurableStream, writeToolRecord } from './durable-stream';
 import { isInWorkflowFunction } from './internal';
 
 /** Marks a tool built by agentTool: durableTools leaves it unwrapped (it is a child workflow, not a step) and binds its durable stream. */
@@ -14,7 +14,8 @@ const outsideWorkflow = AsyncLocalStorage.snapshot();
 async function cancelChild(childID: string, settled: () => boolean): Promise<void> {
   for (let i = 0; i < 100 && !settled(); i++) {
     if (await DBOS.getWorkflowStatus(childID)) {
-      await DBOS.cancelWorkflow(childID);
+      // The child's own sub-agents are its children; without the cascade they would run on with nobody awaiting them.
+      await DBOS.cancelWorkflow(childID, { cancelChildren: true });
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -68,11 +69,12 @@ export function agentTool<INPUT, AGENT extends StreamingAgent, OUTPUT = string>(
   const registered = DBOS.registerWorkflow(run, { name });
   // Unbound on purpose: DBOS's registered invoker reads `this`, and as a method `this` would be the tool object.
   const workflow = (input: INPUT): Promise<OUTPUT> => registered(input);
-  return build(options, workflow, options.durableStream);
+  return build(options, registered, workflow, options.durableStream);
 }
 
 function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
   options: AgentToolOptions<INPUT, AGENT, OUTPUT>,
+  registered: (input: INPUT) => Promise<OUTPUT>,
   workflow: (input: INPUT) => Promise<OUTPUT>,
   durableStream: string | undefined,
 ): AgentTool<INPUT, OUTPUT> {
@@ -82,11 +84,10 @@ function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
     const { toolCallId } = execOptions;
     // The tool call id comes from the checkpointed model output, so the child id is the same on replay and known for cancellation.
     const childID = `${DBOS.workflowID}-${toolCallId}`;
-    let invoke = () => workflow(input);
-    if (timeoutMS !== undefined) invoke = ((inner) => () => DBOS.withWorkflowTimeout(timeoutMS, inner))(invoke);
-    if (queue) invoke = ((inner) => () => DBOS.withWorkflowQueue(queue, inner))(invoke);
-    // Invoke first: the direct call reserves the child's function ids synchronously, so parallel calls replay in order.
-    const pending = DBOS.withNextWorkflowID(childID, invoke);
+    // Start and getResult each reserve their function id synchronously here, so parallel calls replay in order.
+    const started = DBOS.startWorkflow(registered, { workflowID: childID, queueName: queue, timeoutMS })(input);
+    const pending = DBOS.getResult<OUTPUT>(childID);
+    started.catch(() => {});
     pending.catch(() => {});
     let settled = false;
     const cancel = () => void outsideWorkflow(() => cancelChild(childID, () => settled)).catch(() => {});
@@ -98,14 +99,13 @@ function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
           { type: 'data-dbos-subagent', id: toolCallId, data: { toolCallId, workflowID: childID, name } },
         ]);
       }
-      const result = await pending;
-      if (durableStream) await writeDurableStream(durableStream, [{ type: 'tool-output-available', toolCallId, output: result }]);
+      await started;
+      const result = (await pending) as OUTPUT;
+      // A tool record, not a raw chunk, so the reader masks a sub-agent's error text like any other tool's.
+      if (durableStream) await writeToolRecord(durableStream, toolCallId, { output: result });
       return result;
     } catch (error) {
-      if (durableStream) {
-        const errorText = error instanceof Error ? error.message : String(error);
-        await writeDurableStream(durableStream, [{ type: 'tool-output-error', toolCallId, errorText }]);
-      }
+      if (durableStream) await writeToolRecord(durableStream, toolCallId, { errorText: error instanceof Error ? error.message : String(error) });
       throw error;
     } finally {
       settled = true;
@@ -117,6 +117,6 @@ function build<INPUT, AGENT extends StreamingAgent, OUTPUT>(
     inputSchema,
     execute,
     workflow,
-    [AGENT_TOOL]: (key: string) => build(options, workflow, key),
+    [AGENT_TOOL]: (key: string) => build(options, registered, workflow, key),
   } as unknown as AgentTool<INPUT, OUTPUT>;
 }

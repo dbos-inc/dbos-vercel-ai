@@ -17,6 +17,7 @@ import {
   tool,
   ToolLoopAgent,
   type UIMessageChunk,
+  uiMessageChunkSchema,
   wrapEmbeddingModel,
   wrapImageModel,
   wrapLanguageModel,
@@ -38,6 +39,7 @@ import {
 import { restoreAISDKErrorIdentity } from '../src/internal.js';
 import {
   contentResponse,
+  finishReason,
   IMAGE_BYTES,
   MockEmbeddingModel,
   MockImageModel,
@@ -1252,6 +1254,13 @@ const dsTools = durableTools(
         return `sunny in ${city}`;
       },
     }),
+    leaky: tool({
+      description: 'Fails with a message a client must not see',
+      inputSchema: z.object({}),
+      execute: async (): Promise<string> => {
+        throw new Error('connection to db-internal.example refused');
+      },
+    }),
   },
   { durableStream: 'ui' },
 );
@@ -1275,6 +1284,15 @@ const dsSlowModel = wrapLanguageModel({
 const dsSlowWorkflow = DBOS.registerWorkflow(
   async () => (await streamText({ model: dsSlowModel, prompt: 'hi', maxRetries: 0 }).text),
   { name: 'dsSlowWorkflow' },
+);
+
+// generateText with durable tools: a non-streaming call must still put its calls and answer in the stream.
+const dsGenerateWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    const result = await generateText({ model: dsModel, prompt, tools: dsTools, stopWhen: stepCountIs(5), maxRetries: 0 });
+    return result.text;
+  },
+  { name: 'dsGenerateWorkflow' },
 );
 
 const dsAbortMock = new MockLanguageModel();
@@ -1315,6 +1333,14 @@ const dsRetryWorkflow = DBOS.registerWorkflow(
   { name: 'dsRetryWorkflow' },
 );
 
+// Writes only user chunks and never closes: the reader ends the turn from workflow status with no finish reason to report.
+const dsUiOnlyWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await writeDurableStream('ui', [{ type: 'data-note', id: 'only', data: { n: 1 } }]);
+    return 'done';
+  },
+  { name: 'dsUiOnlyWorkflow' },
+);
 const dsManualWorkflow = DBOS.registerWorkflow(
   async () => {
     await writeDurableStream('ui', [{ type: 'data-note', id: 'n1', data: { n: 1 } }]);
@@ -1324,9 +1350,15 @@ const dsManualWorkflow = DBOS.registerWorkflow(
   { name: 'dsManualWorkflow' },
 );
 
+// Every chunk the reader emits must satisfy the AI SDK's own chunk schema, as a client transport would enforce.
+const chunkSchema = asSchema(uiMessageChunkSchema);
 async function readChunks(workflowID: string, key: string, offset?: number): Promise<UIMessageChunk[]> {
   const chunks: UIMessageChunk[] = [];
-  for await (const chunk of readDurableStream({ workflowID, key, messageId: 'msg-1', offset })) chunks.push(chunk);
+  for await (const chunk of readDurableStream({ workflowID, key, messageId: 'msg-1', offset })) {
+    const validation = await chunkSchema.validate!(chunk);
+    assert.ok(validation.success, `invalid UI chunk ${JSON.stringify(chunk)}: ${validation.success ? '' : String(validation.error)}`);
+    chunks.push(chunk);
+  }
   return chunks;
 }
 async function readRecords(workflowID: string, key: string): Promise<DurableStreamRecord[]> {
@@ -1513,6 +1545,24 @@ const midAbortedAgentWorkflow = DBOS.registerWorkflow(
   },
   { name: 'midAbortedAgentWorkflow' },
 );
+// A nested sub-agent: the child agent's own tool is another agent tool, so a parent abort must reach the grandchild.
+const grandchild = agentTool({
+  name: 'grandchildResearch',
+  description: 'Research a detail',
+  inputSchema: z.object({ question: z.string() }),
+  agent: subAgent,
+  prompt: ({ question }) => question,
+});
+const nestedMock = new MockLanguageModel();
+const nestedModel = wrapLanguageModel({ model: nestedMock, middleware: durableCalls() });
+const nestedAgent = new ToolLoopAgent({ model: nestedModel, instructions: 'Delegate.', tools: durableTools({ grandchild }) });
+const nestedResearch = agentTool({
+  name: 'nestedResearchChild',
+  description: 'Research via a helper',
+  inputSchema: z.object({ question: z.string() }),
+  agent: nestedAgent,
+  prompt: ({ question }) => question,
+});
 const orchMock = new MockLanguageModel();
 const orchModel = wrapLanguageModel({ model: orchMock, middleware: durableCalls({ durableStream: 'ui' }) });
 const orchTools = durableTools(
@@ -1521,6 +1571,7 @@ const orchTools = durableTools(
     queuedResearch,
     summarize,
     slowResearch,
+    nestedResearch,
     getTime: tool({
       description: 'Get the time in a city',
       inputSchema: z.object({ city: z.string() }),
@@ -3019,7 +3070,11 @@ test('durable stream: a failed workflow ends the stream with an error chunk from
   const chunks = visible(await readChunks(workflowID, 'ui'));
   assert.equal(streamedText(chunks), 'partial');
   assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['error', 'finish']);
-  assert.match((chunks.at(-2) as { errorText: string }).errorText, /model exploded/);
+  // Like the AI SDK, the reader masks server error text by default; onError opts into the real message.
+  assert.equal((chunks.at(-2) as { errorText: string }).errorText, 'An error occurred.');
+  const revealed: UIMessageChunk[] = [];
+  for await (const chunk of readDurableStream({ workflowID, key: 'ui', onError: (e) => `masked:${(e as Error).message}` })) revealed.push(chunk);
+  assert.match((visible(revealed).at(-2) as { errorText: string }).errorText, /^masked:.*model exploded/);
 });
 
 test('durable stream: a reader that disconnects resumes from its last offset without gaps or repeats', async () => {
@@ -3479,4 +3534,153 @@ test('agentTool: aborting the parent also cancels a child that is still queued',
   subGate.release();
   await handle.getResult().catch(() => undefined);
   assert.deepEqual(statuses, { 'call-0': 'CANCELLED', 'call-1': 'CANCELLED' });
+});
+
+test('agentTool: a queue or timeout on one sub-agent does not leak into siblings or later calls', async () => {
+  resetAgentMocks();
+  orchMock.generateResults.push(
+    // Two overlapping queued calls (the restore-order case) alongside an unqueued and a timed one.
+    toolCallsResponse([
+      { toolName: 'queuedResearch', input: '{"question":"q1?"}' },
+      { toolName: 'queuedResearch', input: '{"question":"q2?"}' },
+      { toolName: 'research', input: '{"question":"plain?"}' },
+      { toolName: 'slowResearch', input: '{"question":"timed?"}' },
+    ]),
+    // A later call in the same workflow must not inherit anything either (unique call id: the child id is derived from it).
+    contentResponse(
+      [{ type: 'tool-call', toolCallId: 'call-later', toolName: 'research', input: '{"question":"later?"}' }],
+      finishReason('tool-calls'),
+    ),
+    textResponse('All done.'),
+  );
+  for (const text of ['q1', 'q2', 'plain', 'timed', 'later']) subMock.streamPartLists.push(textStreamParts([text]));
+  const workflowID = randomUUID();
+  const result = await (await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('mixed')).getResult();
+  assert.equal(result.text, 'All done.');
+  assert.deepEqual(result.toolErrors, []);
+  const status = async (call: string) => (await DBOS.getWorkflowStatus(`${workflowID}-${call}`))!;
+  assert.equal((await status('call-0')).queueName, 'subagents');
+  assert.equal((await status('call-1')).queueName, 'subagents');
+  assert.equal((await status('call-2')).queueName, undefined);
+  assert.equal((await status('call-3')).queueName, undefined);
+  assert.equal((await status('call-later')).queueName, undefined);
+  assert.equal(Object.values(result.toolOutputs).length, 5);
+});
+
+// Replaces the SDK's static writeStream for one test; the original is restored in finally.
+function failWrites(count: number, message: string): { restore: () => void; calls: () => number } {
+  const original = DBOS.writeStream;
+  let failuresLeft = count;
+  let calls = 0;
+  DBOS.writeStream = (async (key, value, options) => {
+    calls++;
+    if (failuresLeft > 0) {
+      failuresLeft--;
+      throw new Error(message);
+    }
+    return original.call(DBOS, key, value, options);
+  }) as typeof DBOS.writeStream;
+  return { restore: () => void (DBOS.writeStream = original), calls: () => calls };
+}
+
+test('durable stream: a transient write failure is retried and the call succeeds with a complete stream', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['a', 'b', 'c']));
+  const workflowID = randomUUID();
+  const writes = failWrites(1, 'transient write failure');
+  try {
+    assert.equal((await (await DBOS.startWorkflow(dsWorkflow, { workflowID })('retry')).getResult()).text, 'abc');
+  } finally {
+    writes.restore();
+  }
+  const records = await readRecords(workflowID, 'ui');
+  assert.deepEqual(records.map((r) => r.kind), ['model', 'model', 'model', 'model-end']);
+  assert.equal(streamedText(visible(await readChunks(workflowID, 'ui'))), 'abc');
+});
+
+test('durable stream: a persistent write failure fails the model call instead of crashing the process', async () => {
+  dsMock.streamPartLists.push(textStreamParts(['a', 'b', 'c']));
+  const workflowID = randomUUID();
+  const writes = failWrites(Number.POSITIVE_INFINITY, 'persistent write failure');
+  try {
+    await assert.rejects((await DBOS.startWorkflow(dsWorkflow, { workflowID })('fail')).getResult(), /persistent write failure/);
+  } finally {
+    writes.restore();
+  }
+  // The first record's three attempts were made; after that failure the writer skipped the rest.
+  assert.equal(writes.calls(), 3);
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['error', 'finish']);
+});
+
+test('durable stream: a turn with no model call ends with a finish chunk that omits the reason', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsUiOnlyWorkflow, { workflowID })()).getResult();
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(chunks, [
+    { type: 'start', messageId: 'msg-1' },
+    { type: 'data-note', id: 'only', data: { n: 1 } },
+    { type: 'finish' },
+  ]);
+});
+
+test('durable stream: generateText writes each call whole, so tool outputs follow their calls and the answer is present', async () => {
+  dsMock.generateResults.push(toolCallResponse('getWeather', '{"city":"Oslo"}'), textResponse('Rainy in Oslo.'));
+  const workflowID = randomUUID();
+  assert.equal(await (await DBOS.startWorkflow(dsGenerateWorkflow, { workflowID })('weather?')).getResult(), 'Rainy in Oslo.');
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  assert.deepEqual(
+    chunks.map((c) => c.type),
+    ['start', 'start-step', 'tool-input-start', 'tool-input-delta', 'tool-input-available', 'data-progress', 'tool-output-available', 'finish-step', 'start-step', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish'],
+  );
+  assert.equal(streamedText(chunks), 'Rainy in Oslo.');
+  assert.deepEqual(chunks.at(-1), { type: 'finish', finishReason: 'stop' });
+});
+
+test('agentTool: aborting the parent cancels a child and the grandchild it started', async () => {
+  resetAgentMocks();
+  nestedMock.streamPartLists.length = 0;
+  orchMock.generateResults.push(toolCallResponse('nestedResearch', '{"question":"deep?"}'));
+  // The child agent delegates to the grandchild, whose model call parks at the gate.
+  nestedMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'tool-call', toolCallId: 'call-g', toolName: 'grandchild', input: '{"question":"detail?"}' },
+    { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+  ]);
+  subGate = newGate();
+  subMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'text-start', id: 't1' },
+    { type: 'text-delta', id: 't1', delta: 'partial' },
+    () => subGate.promise,
+    { type: 'text-end', id: 't1' },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
+  ]);
+  const workflowID = randomUUID();
+  const childID = `${workflowID}-call-1`;
+  const grandchildID = `${childID}-call-g`;
+  const handle = await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research deeply');
+  for (let i = 0; i < 500 && (await DBOS.getWorkflowStatus(grandchildID)) === null; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(await DBOS.getWorkflowStatus(grandchildID), 'grandchild never started');
+  orchAbort!.abort();
+  const statuses: Record<string, string | undefined> = {};
+  for (let i = 0; i < 500; i++) {
+    statuses.child = (await DBOS.getWorkflowStatus(childID))?.status;
+    statuses.grandchild = (await DBOS.getWorkflowStatus(grandchildID))?.status;
+    if (statuses.child === 'CANCELLED' && statuses.grandchild === 'CANCELLED') break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  subGate.release();
+  await handle.getResult().catch(() => undefined);
+  assert.deepEqual(statuses, { child: 'CANCELLED', grandchild: 'CANCELLED' });
+});
+
+test('durable stream: a local tool error is masked for clients unless onError reveals it', async () => {
+  dsMock.generateResults.push(toolCallResponse('leaky', '{}'), textResponse('Recovered.'));
+  const workflowID = randomUUID();
+  assert.equal(await (await DBOS.startWorkflow(dsGenerateWorkflow, { workflowID })('leak?')).getResult(), 'Recovered.');
+  const masked = visible(await readChunks(workflowID, 'ui')).find((c) => c.type === 'tool-output-error') as { errorText: string };
+  assert.equal(masked.errorText, 'An error occurred.');
+  const revealed: UIMessageChunk[] = [];
+  for await (const chunk of readDurableStream({ workflowID, key: 'ui', onError: (e) => (e as Error).message })) revealed.push(chunk);
+  assert.equal((revealed.find((c) => c.type === 'tool-output-error') as { errorText: string }).errorText, 'connection to db-internal.example refused');
 });
