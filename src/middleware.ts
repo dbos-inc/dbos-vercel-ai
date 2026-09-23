@@ -26,6 +26,8 @@ import { type DurableStreamOptions, ModelStreamWriter, resolveDurableStream } fr
 export interface DurableCallsOptions extends StepConfig {
   /** Write each streamed model call's parts to this durable stream from inside its step (see readDurableStream). */
   durableStream?: DurableStreamOptions;
+  /** Checkpoint a generate call's raw provider request/response bodies; set to match generateText's `include` (both default false). */
+  include?: { requestBody?: boolean; responseBody?: boolean };
 }
 
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
@@ -58,7 +60,7 @@ function exitDurableModelCall(workflowID: string): void {
 
 /** AI SDK language-model middleware that runs each model call as a durable, checkpointed DBOS step (replayed on recovery); outside a workflow it calls the model directly. */
 export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMiddleware {
-  const { durableStream, ...stepOptions } = options;
+  const { durableStream, include, ...stepOptions } = options;
   const stepConfig = withErrorClassification(stepOptions);
   const streamConfig = resolveDurableStream(durableStream);
   return {
@@ -73,7 +75,7 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
       try {
         return await DBOS.runStep(
           async () => {
-            const result = ensureResponseMetadata(encodeBinaryContent(await doGenerate()));
+            const result = ensureResponseMetadata(encodeBinaryContent(omitBodies(await doGenerate(), include)));
             // A non-streaming call writes its whole output at once, so the stream holds every call the loop makes, not only streamed ones.
             if (streamConfig) {
               const streamWriter = new ModelStreamWriter(streamConfig);
@@ -366,6 +368,21 @@ function ensureResponseMetadata(result: LanguageModelV4GenerateResult): Language
   return {
     ...result,
     response: { ...response, id: response?.id ?? randomUUID(), timestamp: response?.timestamp ?? new Date() },
+  };
+}
+
+// generateText discards the raw bodies unless `include` asks for them, and the request body repeats the whole prompt.
+function omitBodies(
+  result: LanguageModelV4GenerateResult,
+  include: DurableCallsOptions['include'],
+): LanguageModelV4GenerateResult {
+  const dropRequest = !include?.requestBody && result.request?.body !== undefined;
+  const dropResponse = !include?.responseBody && result.response?.body !== undefined;
+  if (!dropRequest && !dropResponse) return result;
+  return {
+    ...result,
+    request: dropRequest ? { ...result.request, body: undefined } : result.request,
+    response: dropResponse ? { ...result.response, body: undefined } : result.response,
   };
 }
 

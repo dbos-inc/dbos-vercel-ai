@@ -80,6 +80,7 @@ durableCalls({
   shouldRetry?: (error: unknown) => boolean;  // default: skip provider-declared non-retryable errors and aborts
   timeoutMS?: number;         // per-attempt timeout
   durableStream?: string;     // stream each call's output to this durable stream
+  include?: { requestBody?: boolean; responseBody?: boolean };  // checkpoint raw provider bodies; match generateText's `include` (default: false)
 });
 ```
 

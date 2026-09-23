@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { DBOS, DBOSClient } from '@dbos-inc/dbos-sdk';
-import { APICallError } from '@ai-sdk/provider';
+import { APICallError, type LanguageModelV4GenerateResult } from '@ai-sdk/provider';
 import { GatewayRateLimitError } from '@ai-sdk/gateway';
 import { Client as PgClient } from 'pg';
 import {
@@ -77,6 +77,26 @@ const generateWorkflow = DBOS.registerWorkflow(
     };
   },
   { name: 'generateWorkflow' },
+);
+
+const bodyMock = new MockLanguageModel();
+const bodyModel = wrapLanguageModel({ model: bodyMock, middleware: durableCalls() });
+const includeBodyModel = wrapLanguageModel({
+  model: bodyMock,
+  middleware: durableCalls({ include: { requestBody: true, responseBody: true } }),
+});
+
+const bodyWorkflow = DBOS.registerWorkflow(
+  async (include: boolean) => {
+    const result = await generateText({
+      model: include ? includeBodyModel : bodyModel,
+      prompt: 'hi',
+      include: { requestBody: include, responseBody: include },
+    });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { text: result.text, requestBody: result.request.body, responseBody: result.response.body };
+  },
+  { name: 'bodyWorkflow' },
 );
 
 const toolMock = new MockLanguageModel();
@@ -1656,6 +1676,40 @@ test('replayed workflows use the checkpointed model result instead of calling th
   assert.equal(replayed.text, original.text);
   assert.ok(replayed.timestamp instanceof Date);
   assert.equal(generateMock.generateCalls, 2);
+});
+
+function withBodies(text: string): LanguageModelV4GenerateResult {
+  const result = textResponse(text);
+  return { ...result, request: { body: { prompt: 'the whole prompt' } }, response: { ...result.response, body: { raw: text } } };
+}
+
+test('generate calls checkpoint no raw provider bodies by default, matching generateText', async () => {
+  bodyMock.generateResults.push(withBodies('no bodies'));
+  const workflowID = randomUUID();
+  const result = await (await DBOS.startWorkflow(bodyWorkflow, { workflowID })(false)).getResult();
+  assert.deepEqual(result, { text: 'no bodies', requestBody: undefined, responseBody: undefined });
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const recorded = steps![0]!.output as LanguageModelV4GenerateResult;
+  assert.equal(recorded.request?.body, undefined);
+  assert.equal(recorded.response?.body, undefined);
+  assert.equal(recorded.response?.id, 'resp-1');
+});
+
+test('generate calls checkpoint and replay raw provider bodies when include opts in', async () => {
+  bodyMock.generateResults.push(withBodies('with bodies'));
+  const workflowID = randomUUID();
+  const original = await (await DBOS.startWorkflow(bodyWorkflow, { workflowID })(true)).getResult();
+  assert.deepEqual(original, {
+    text: 'with bodies',
+    requestBody: { prompt: 'the whole prompt' },
+    responseBody: { raw: 'with bodies' },
+  });
+
+  const calls = bodyMock.generateCalls;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof bodyWorkflow>>(workflowID, 1);
+  assert.deepEqual(await forked.getResult(), original);
+  assert.equal(bodyMock.generateCalls, calls);
 });
 
 test('tool-calling loop with a durable tool step', async () => {
