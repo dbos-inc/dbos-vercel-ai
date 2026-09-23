@@ -155,7 +155,6 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
             const accumulator = new StreamAccumulator();
             // A timed-out attempt is abandoned by DBOS (its outcome is discarded) but keeps running; stop it so it can't emit alongside a retry.
             const timeoutSignal = DBOS.stepStatus?.timeoutSignal;
-            let streamResult: Awaited<ReturnType<typeof doStream>> | undefined;
             let reader: ReadableStreamDefaultReader<LanguageModelV4StreamPart> | undefined;
             let sawFinish = false;
             const abandon = () => void reader?.cancel().catch(() => {});
@@ -165,8 +164,7 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
             // Step-scope stream writes: cheap, replay-safe, and never duplicated since a retry is refused once content has streamed.
             const streamWriter = streamConfig ? new ModelStreamWriter(streamConfig) : undefined;
             try {
-              streamResult = await doStream();
-              reader = streamResult.stream.getReader();
+              reader = (await doStream()).stream.getReader();
               for (;;) {
                 const { done, value: part } = await reader.read();
                 if (timeoutSignal?.aborted) throw (timeoutSignal.reason ?? new Error('step attempt timed out'));
@@ -208,7 +206,7 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
             // Skip the live emit for a timed-out (abandoned) attempt so it can't interleave with its retry.
             const responseMetadataPart = accumulator.fillResponseMetadata(randomUUID(), new Date());
             if (responseMetadataPart && !timeoutSignal?.aborted) emit(responseMetadataPart);
-            const recorded = encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
+            const recorded = encodeBinaryContent(accumulator.result());
             // Every stream write lands before the checkpoint, so a reader that sees the next step has seen all of this one.
             await streamWriter?.end({ finishReason: recorded.finishReason });
             return recorded;
@@ -515,18 +513,15 @@ class StreamAccumulator {
     return block;
   }
 
-  result(
-    request?: { body?: unknown },
-    response?: { headers?: Record<string, string> },
-  ): LanguageModelV4GenerateResult {
+  // Omits the provider's request/response (wrapStream returns only the stream): the request body repeats the whole prompt.
+  result(): LanguageModelV4GenerateResult {
     return {
       content: this.content,
       finishReason: this.finishReason,
       usage: this.usage,
       warnings: this.warnings,
       providerMetadata: this.providerMetadata,
-      request,
-      response: this.responseMetadata ? { ...this.responseMetadata, ...response } : response,
+      response: this.responseMetadata,
     };
   }
 }

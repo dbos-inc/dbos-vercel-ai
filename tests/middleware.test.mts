@@ -1721,6 +1721,10 @@ test('streaming tool call runs as a durable step ordered after the model step, a
   const toolStep = steps!.find((s) => s.name === 'getWeather')!;
   // The tool runs on 'finish', which is withheld until the model step is durable, so its step is ordered after it.
   assert.ok(streamStep.functionID < toolStep.functionID);
+  // The provider's request body (the whole prompt) is never surfaced by a stream, so it isn't checkpointed.
+  const recorded = streamStep.output as { request?: unknown; response?: { headers?: unknown } };
+  assert.equal(recorded.request, undefined);
+  assert.equal(recorded.response?.headers, undefined);
 
   // Fork past every model/tool step: all replay from checkpoints, so nothing is re-invoked.
   const noopStep = steps!.find((s) => s.name === 'noop')!;
