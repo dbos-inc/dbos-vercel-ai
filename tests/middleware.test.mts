@@ -3095,6 +3095,22 @@ test('durable stream: model parts are batched in order and the turn ends when th
   assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['finish-step', 'finish']);
 });
 
+test('durable stream: parts the reader never renders are not written', async () => {
+  dsSlowMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'reasoning-file', mediaType: 'image/png', data: { type: 'data', data: new Uint8Array(1024) } },
+    { type: 'custom', kind: 'mock.note' },
+    ...textStreamParts(['ok']).slice(1),
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsSlowWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'ok');
+
+  const records = await readRecords(workflowID, 'ui');
+  const types = records.flatMap((r) => (r.kind === 'model' ? r.parts : [])).map((p) => p.type);
+  assert.deepEqual(types, ['text-start', 'text-delta', 'text-end']);
+});
+
 test('durable stream: an aborted call records what streamed, and the workflow that caught it finishes the turn', async () => {
   dsAbortMock.streamPartLists.push([
     { type: 'stream-start', warnings: [] },

@@ -30,17 +30,24 @@ function stepInfo(): { step: number; attempt: number } {
   return { step: DBOS.stepID ?? -1, attempt: DBOS.stepStatus?.currentAttempt ?? 1 };
 }
 
-// Parts the reader can render; framing, metadata and terminal parts are recorded elsewhere or not at all.
+// Only the parts toUIChunk renders; anything else would be written and never read.
 function isContentPart(part: LanguageModelV4StreamPart): boolean {
   switch (part.type) {
-    case 'stream-start':
-    case 'response-metadata':
-    case 'finish':
-    case 'error':
-    case 'raw':
-      return false;
-    default:
+    case 'text-start':
+    case 'text-delta':
+    case 'text-end':
+    case 'reasoning-start':
+    case 'reasoning-delta':
+    case 'reasoning-end':
+    case 'tool-input-start':
+    case 'tool-input-delta':
+    case 'tool-call':
+    case 'tool-result':
+    case 'source':
+    case 'file':
       return true;
+    default:
+      return false;
   }
 }
 
