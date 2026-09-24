@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { DBOS, DBOSClient } from '@dbos-inc/dbos-sdk';
-import { APICallError } from '@ai-sdk/provider';
+import { APICallError, type LanguageModelV4GenerateResult } from '@ai-sdk/provider';
 import { GatewayRateLimitError } from '@ai-sdk/gateway';
 import { Client as PgClient } from 'pg';
 import {
@@ -77,6 +77,26 @@ const generateWorkflow = DBOS.registerWorkflow(
     };
   },
   { name: 'generateWorkflow' },
+);
+
+const bodyMock = new MockLanguageModel();
+const bodyModel = wrapLanguageModel({ model: bodyMock, middleware: durableCalls() });
+const includeBodyModel = wrapLanguageModel({
+  model: bodyMock,
+  middleware: durableCalls({ include: { requestBody: true, responseBody: true } }),
+});
+
+const bodyWorkflow = DBOS.registerWorkflow(
+  async (include: boolean) => {
+    const result = await generateText({
+      model: include ? includeBodyModel : bodyModel,
+      prompt: 'hi',
+      include: { requestBody: include, responseBody: include },
+    });
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { text: result.text, requestBody: result.request.body, responseBody: result.response.body };
+  },
+  { name: 'bodyWorkflow' },
 );
 
 const toolMock = new MockLanguageModel();
@@ -1658,6 +1678,40 @@ test('replayed workflows use the checkpointed model result instead of calling th
   assert.equal(generateMock.generateCalls, 2);
 });
 
+function withBodies(text: string): LanguageModelV4GenerateResult {
+  const result = textResponse(text);
+  return { ...result, request: { body: { prompt: 'the whole prompt' } }, response: { ...result.response, body: { raw: text } } };
+}
+
+test('generate calls checkpoint no raw provider bodies by default, matching generateText', async () => {
+  bodyMock.generateResults.push(withBodies('no bodies'));
+  const workflowID = randomUUID();
+  const result = await (await DBOS.startWorkflow(bodyWorkflow, { workflowID })(false)).getResult();
+  assert.deepEqual(result, { text: 'no bodies', requestBody: undefined, responseBody: undefined });
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const recorded = steps![0]!.output as LanguageModelV4GenerateResult;
+  assert.equal(recorded.request?.body, undefined);
+  assert.equal(recorded.response?.body, undefined);
+  assert.equal(recorded.response?.id, 'resp-1');
+});
+
+test('generate calls checkpoint and replay raw provider bodies when include opts in', async () => {
+  bodyMock.generateResults.push(withBodies('with bodies'));
+  const workflowID = randomUUID();
+  const original = await (await DBOS.startWorkflow(bodyWorkflow, { workflowID })(true)).getResult();
+  assert.deepEqual(original, {
+    text: 'with bodies',
+    requestBody: { prompt: 'the whole prompt' },
+    responseBody: { raw: 'with bodies' },
+  });
+
+  const calls = bodyMock.generateCalls;
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof bodyWorkflow>>(workflowID, 1);
+  assert.deepEqual(await forked.getResult(), original);
+  assert.equal(bodyMock.generateCalls, calls);
+});
+
 test('tool-calling loop with a durable tool step', async () => {
   toolMock.generateResults.push(toolCallResponse('getWeather', '{"city":"Tokyo"}'), textResponse('It is sunny in Tokyo.'));
   const handle = await DBOS.startWorkflow(toolWorkflow, { workflowID: randomUUID() })('weather in Tokyo?');
@@ -1721,6 +1775,10 @@ test('streaming tool call runs as a durable step ordered after the model step, a
   const toolStep = steps!.find((s) => s.name === 'getWeather')!;
   // The tool runs on 'finish', which is withheld until the model step is durable, so its step is ordered after it.
   assert.ok(streamStep.functionID < toolStep.functionID);
+  // The provider's request body (the whole prompt) is never surfaced by a stream, so it isn't checkpointed.
+  const recorded = streamStep.output as { request?: unknown; response?: { headers?: unknown } };
+  assert.equal(recorded.request, undefined);
+  assert.equal(recorded.response?.headers, undefined);
 
   // Fork past every model/tool step: all replay from checkpoints, so nothing is re-invoked.
   const noopStep = steps!.find((s) => s.name === 'noop')!;
@@ -3035,6 +3093,22 @@ test('durable stream: model parts are batched in order and the turn ends when th
   assert.equal(deltas.join(''), 'abcde');
   const chunks = visible(await readChunks(workflowID, 'ui'));
   assert.deepEqual(chunks.slice(-2).map((c) => c.type), ['finish-step', 'finish']);
+});
+
+test('durable stream: parts the reader never renders are not written', async () => {
+  dsSlowMock.streamPartLists.push([
+    { type: 'stream-start', warnings: [] },
+    { type: 'reasoning-file', mediaType: 'image/png', data: { type: 'data', data: new Uint8Array(1024) } },
+    { type: 'custom', kind: 'mock.note' },
+    ...textStreamParts(['ok']).slice(1),
+  ]);
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsSlowWorkflow, { workflowID })();
+  assert.equal(await handle.getResult(), 'ok');
+
+  const records = await readRecords(workflowID, 'ui');
+  const types = records.flatMap((r) => (r.kind === 'model' ? r.parts : [])).map((p) => p.type);
+  assert.deepEqual(types, ['text-start', 'text-delta', 'text-end']);
 });
 
 test('durable stream: an aborted call records what streamed, and the workflow that caught it finishes the turn', async () => {

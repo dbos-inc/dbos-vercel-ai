@@ -26,6 +26,8 @@ import { type DurableStreamOptions, ModelStreamWriter, resolveDurableStream } fr
 export interface DurableCallsOptions extends StepConfig {
   /** Write each streamed model call's parts to this durable stream from inside its step (see readDurableStream). */
   durableStream?: DurableStreamOptions;
+  /** Checkpoint a generate call's raw provider request/response bodies; set to match generateText's `include` (both default false). */
+  include?: { requestBody?: boolean; responseBody?: boolean };
 }
 
 // In-flight durable model calls per workflow; concurrent calls have a nondeterministic DBOS step order on replay, so we reject them.
@@ -58,7 +60,7 @@ function exitDurableModelCall(workflowID: string): void {
 
 /** AI SDK language-model middleware that runs each model call as a durable, checkpointed DBOS step (replayed on recovery); outside a workflow it calls the model directly. */
 export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMiddleware {
-  const { durableStream, ...stepOptions } = options;
+  const { durableStream, include, ...stepOptions } = options;
   const stepConfig = withErrorClassification(stepOptions);
   const streamConfig = resolveDurableStream(durableStream);
   return {
@@ -73,7 +75,7 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
       try {
         return await DBOS.runStep(
           async () => {
-            const result = ensureResponseMetadata(encodeBinaryContent(await doGenerate()));
+            const result = ensureResponseMetadata(encodeBinaryContent(omitBodies(await doGenerate(), include)));
             // A non-streaming call writes its whole output at once, so the stream holds every call the loop makes, not only streamed ones.
             if (streamConfig) {
               const streamWriter = new ModelStreamWriter(streamConfig);
@@ -155,7 +157,6 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
             const accumulator = new StreamAccumulator();
             // A timed-out attempt is abandoned by DBOS (its outcome is discarded) but keeps running; stop it so it can't emit alongside a retry.
             const timeoutSignal = DBOS.stepStatus?.timeoutSignal;
-            let streamResult: Awaited<ReturnType<typeof doStream>> | undefined;
             let reader: ReadableStreamDefaultReader<LanguageModelV4StreamPart> | undefined;
             let sawFinish = false;
             const abandon = () => void reader?.cancel().catch(() => {});
@@ -165,8 +166,7 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
             // Step-scope stream writes: cheap, replay-safe, and never duplicated since a retry is refused once content has streamed.
             const streamWriter = streamConfig ? new ModelStreamWriter(streamConfig) : undefined;
             try {
-              streamResult = await doStream();
-              reader = streamResult.stream.getReader();
+              reader = (await doStream()).stream.getReader();
               for (;;) {
                 const { done, value: part } = await reader.read();
                 if (timeoutSignal?.aborted) throw (timeoutSignal.reason ?? new Error('step attempt timed out'));
@@ -208,7 +208,7 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
             // Skip the live emit for a timed-out (abandoned) attempt so it can't interleave with its retry.
             const responseMetadataPart = accumulator.fillResponseMetadata(randomUUID(), new Date());
             if (responseMetadataPart && !timeoutSignal?.aborted) emit(responseMetadataPart);
-            const recorded = encodeBinaryContent(accumulator.result(streamResult?.request, streamResult?.response));
+            const recorded = encodeBinaryContent(accumulator.result());
             // Every stream write lands before the checkpoint, so a reader that sees the next step has seen all of this one.
             await streamWriter?.end({ finishReason: recorded.finishReason });
             return recorded;
@@ -371,6 +371,21 @@ function ensureResponseMetadata(result: LanguageModelV4GenerateResult): Language
   };
 }
 
+// generateText discards the raw bodies unless `include` asks for them, and the request body repeats the whole prompt.
+function omitBodies(
+  result: LanguageModelV4GenerateResult,
+  include: DurableCallsOptions['include'],
+): LanguageModelV4GenerateResult {
+  const dropRequest = !include?.requestBody && result.request?.body !== undefined;
+  const dropResponse = !include?.responseBody && result.response?.body !== undefined;
+  if (!dropRequest && !dropResponse) return result;
+  return {
+    ...result,
+    request: dropRequest ? { ...result.request, body: undefined } : result.request,
+    response: dropResponse ? { ...result.response, body: undefined } : result.response,
+  };
+}
+
 /** Convert generated-file bytes (Uint8Array) to base64 (spec-allowed) to keep checkpoints compact. */
 function encodeBinaryContent(result: LanguageModelV4GenerateResult): LanguageModelV4GenerateResult {
   const content = result.content.map(encodeBinaryPart);
@@ -515,18 +530,15 @@ class StreamAccumulator {
     return block;
   }
 
-  result(
-    request?: { body?: unknown },
-    response?: { headers?: Record<string, string> },
-  ): LanguageModelV4GenerateResult {
+  // Omits the provider's request/response (wrapStream returns only the stream): the request body repeats the whole prompt.
+  result(): LanguageModelV4GenerateResult {
     return {
       content: this.content,
       finishReason: this.finishReason,
       usage: this.usage,
       warnings: this.warnings,
       providerMetadata: this.providerMetadata,
-      request,
-      response: this.responseMetadata ? { ...this.responseMetadata, ...response } : response,
+      response: this.responseMetadata,
     };
   }
 }
