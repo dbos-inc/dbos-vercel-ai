@@ -10,7 +10,7 @@ export interface DurableToolsOptions extends StepConfig {
   tools?: Record<string, StepConfig | false>;
   /** Write each tool call's output (or error) to this durable stream from inside its step. */
   durableStream?: string;
-  /** Receives chunks tools write via `toolWriter()`; non-transient ones are checkpointed and re-emitted on replay, before the tool's output. */
+  /** Receives chunks tools write via `toolWriter()`; those that are part of the message are checkpointed and re-emitted on replay, before the tool's output. */
   writer?: UIMessageStreamWriter;
 }
 
@@ -23,7 +23,7 @@ export function toolWriter(): UIMessageStreamWriter {
   return writer;
 }
 
-// Tool output plus the non-transient chunks its call wrote, as checkpointed; a bare output is a call that wrote none.
+// Tool output plus the message chunks its call wrote, as checkpointed; a bare output is a call that wrote none.
 interface ToolEnvelope {
   __dbosToolChunks: 1;
   output: unknown;

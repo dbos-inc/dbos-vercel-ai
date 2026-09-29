@@ -150,15 +150,10 @@ It emits a stream of AI SDK `UIMessageChunk`.
 You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
 
 You can write your own data to a stream with `writeDurableStream(key, chunks)`.
-Your streams are closed when your workflow finishes; you can also close a stream early using `closeDurableStream`.
 
-If a workflow is interrupted during a model call, when the workflow recovers, it restarts the model call and streams its output again.
-Readers that connect afterwards see the model's output once; live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
-
-### Writing UI Chunks from Tools
-
-Tools can write UI message chunks with `toolWriter()`, which returns a `UIMessageStreamWriter` bound to the current tool call.
-Pass your `createUIMessageStream` writer to `durableTools` so the chunks become part of the response message:
+Tools can also write chunks with `toolWriter()`, which returns a `UIMessageStreamWriter` bound to the current tool call.
+Chunks from a tool call are written when the tool call succeeds, just before its output (`transient: true` data parts are written live instead).
+To also include them in the response message your workflow builds, pass your `createUIMessageStream` writer to `durableTools`:
 
 ```ts
 import { createUIMessageStream, streamText } from 'ai';
@@ -183,9 +178,10 @@ const stream = createUIMessageStream({
 });
 ```
 
-Transient chunks are written live.
-Non-transient chunks are checkpointed with the tool's output and written, to both the writer and the durable stream, just before it when the tool call succeeds.
-When a workflow recovers, they are written again from the checkpoint, so the response message is the same as if it had never been interrupted.
+Your streams are closed when your workflow finishes; you can also close a stream early using `closeDurableStream`.
+
+If a workflow is interrupted during a model call, when the workflow recovers, it restarts the model call and streams its output again.
+Readers that connect afterwards see the model's output once; live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
 
 ### Durable MCP Tools
 

@@ -123,7 +123,7 @@ export class ModelStreamWriter {
   }
 }
 
-/** Records a tool call's outcome, with the non-transient chunks it wrote, from inside its step. */
+/** Records a tool call's outcome, with the message chunks it wrote, from inside its step. */
 export function writeToolRecord(
   key: string,
   toolCallId: string,
