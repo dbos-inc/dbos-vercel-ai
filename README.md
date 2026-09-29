@@ -84,39 +84,6 @@ durableCalls({
 });
 ```
 
-## Durable Streams
-
-You can **durably stream** agent or model output so it can be read by an external client or UI.
-To do this, configure `durableCalls` or `durableTools`/`durableMCPTools` with a durable stream name:
-
-```ts
-import { createUIMessageStreamResponse, streamText } from 'ai';
-import { durableCalls, durableTools, readDurableStream } from '@dbos-inc/vercel-ai';
-
-const model = wrapLanguageModel({ model: openai('gpt-5'), middleware: durableCalls({ durableStream: 'ui' }) });
-const tools = durableTools(myTools, { durableStream: 'ui' });
-
-const chatTurn = DBOS.registerWorkflow(async (messages: ModelMessage[]) => {
-  const result = streamText({ model, messages, tools, stopWhen: stepCountIs(10) });
-  return await result.text;
-}, { name: 'chatTurn' });
-
-const handle = await DBOS.startWorkflow(chatTurn)(messages);
-return createUIMessageStreamResponse({
-  stream: readDurableStream({ workflowID: handle.workflowID, key: 'ui', messageId }),
-});
-```
-
-You can read from a durable stream using `readDurableStream`, for example to stream it to a UI.
-It emits a stream of AI SDK `UIMessageChunk`.
-You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
-
-You can write your own data to a stream with `writeDurableStream(key, chunks)`.
-Your streams are closed when your workflow finishes; you can also close a stream early using `closeDurableStream`.
-
-If a workflow is interrupted during a model call, when the workflow recovers, it restarts the model call and streams its output again.
-Readers that connect afterwards see the model's output once; live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
-
 ## Durable Tools
 
 To durably checkpoint your agents' tool calls, wrap them in `durableTools`:
@@ -154,6 +121,39 @@ const tools = durableTools(myTools, {
 ```
 
 When using durable tools, to ensure the ordering of parallel tool calls is consistent during recovery, do not await I/O in callbacks that run before a tool executes, such as `onToolExecutionStart`.
+
+## Durable Streams
+
+You can **durably stream** agent or model output so it can be read by an external client or UI.
+To do this, configure `durableCalls` or `durableTools`/`durableMCPTools` with a durable stream name:
+
+```ts
+import { createUIMessageStreamResponse, streamText } from 'ai';
+import { durableCalls, durableTools, readDurableStream } from '@dbos-inc/vercel-ai';
+
+const model = wrapLanguageModel({ model: openai('gpt-5'), middleware: durableCalls({ durableStream: 'ui' }) });
+const tools = durableTools(myTools, { durableStream: 'ui' });
+
+const chatTurn = DBOS.registerWorkflow(async (messages: ModelMessage[]) => {
+  const result = streamText({ model, messages, tools, stopWhen: stepCountIs(10) });
+  return await result.text;
+}, { name: 'chatTurn' });
+
+const handle = await DBOS.startWorkflow(chatTurn)(messages);
+return createUIMessageStreamResponse({
+  stream: readDurableStream({ workflowID: handle.workflowID, key: 'ui', messageId }),
+});
+```
+
+You can read from a durable stream using `readDurableStream`, for example to stream it to a UI.
+It emits a stream of AI SDK `UIMessageChunk`.
+You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
+
+You can write your own data to a stream with `writeDurableStream(key, chunks)`.
+Your streams are closed when your workflow finishes; you can also close a stream early using `closeDurableStream`.
+
+If a workflow is interrupted during a model call, when the workflow recovers, it restarts the model call and streams its output again.
+Readers that connect afterwards see the model's output once; live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
 
 ### Writing UI Chunks from Tools
 
