@@ -163,7 +163,10 @@ export interface ReadDurableStreamOptions {
   key: string;
   /** Id for the `start` chunk; omitted on a resume (`offset` > 0). */
   messageId?: string;
-  /** Number of records already consumed, from the last `data-dbos-offset` chunk. */
+  /**
+   * Number of records already consumed, from the last `data-dbos-offset` chunk. A resume from mid-text can't be applied
+   * to a partial message by the AI SDK (it has no record of the open part); to rebuild a message, read from 0 instead.
+   */
   offset?: number;
   /** Defaults to `DBOS`; pass a `DBOSClient` to read from a process that has not launched DBOS. */
   client?: DurableStreamSource;
