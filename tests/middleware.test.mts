@@ -1692,12 +1692,12 @@ const toolRecord = (step: number, output: string, sourceId: string): DurableStre
   chunks: [{ type: 'source-url', sourceId, url: `https://example.com/${sourceId}` }],
 });
 const twRepeatWorkflow = DBOS.registerWorkflow(
-  async () => {
+  async (identical: boolean) => {
     await DBOS.runStep(
       async () => {
         await DBOS.writeStream('ui', toolRecord(0, 'first', 's1'));
         await twRepeatGate.promise;
-        await DBOS.writeStream('ui', toolRecord(0, 'second', 's2'));
+        await DBOS.writeStream('ui', identical ? toolRecord(0, 'first', 's1') : toolRecord(0, 'second', 's2'));
         await DBOS.writeStream('ui', toolRecord(3, 'other', 's3'));
       },
       { name: 'write' },
@@ -1734,6 +1734,15 @@ const twTimeoutTools = durableTools(
         return `run ${run}`;
       },
     }),
+    // Retries allowed, but its predicate never retries a timeout; honors its abort signal.
+    picky: tool({
+      inputSchema: z.object({}),
+      execute: async (_input, { abortSignal }): Promise<string> => {
+        await new Promise<void>((resolve) => abortSignal?.addEventListener('abort', () => resolve(), { once: true }));
+        twTimeoutFinished++;
+        throw new Error('aborted');
+      },
+    }),
     // No retries: its timeout is the call's outcome.
     stuck: tool({
       inputSchema: z.object({}),
@@ -1747,7 +1756,11 @@ const twTimeoutTools = durableTools(
   },
   {
     durableStream: 'ui',
-    tools: { slow: { timeoutMS: 100, retriesAllowed: true, maxAttempts: 2, intervalSeconds: 0 }, stuck: { timeoutMS: 100 } },
+    tools: {
+      slow: { timeoutMS: 100, retriesAllowed: true, maxAttempts: 2, intervalSeconds: 0 },
+      picky: { timeoutMS: 100, retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0, shouldRetry: (error) => !/timed out/.test(String(error)) },
+      stuck: { timeoutMS: 100 },
+    },
   },
 );
 // Held open until the late attempt has finished, since a finished workflow's stream rejects writes.
@@ -4069,7 +4082,7 @@ test('toolWriter: a stored history shows only the last record chunks for a re-ex
   twRepeatGate = newGate();
   twRepeatGate.release();
   const workflowID = randomUUID();
-  await (await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })()).getResult();
+  await (await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })(false)).getResult();
   assert.deepEqual(toolSummary(visible(await readChunks(workflowID, 'ui'))), [
     'start',
     'output:first',
@@ -4081,10 +4094,10 @@ test('toolWriter: a stored history shows only the last record chunks for a re-ex
   ]);
 });
 
-test('toolWriter: a live reader is told to discard the earlier chunks of a re-executed call', async () => {
+async function readRepeatLive(identical: boolean): Promise<string[]> {
   twRepeatGate = newGate();
   const workflowID = randomUUID();
-  const handle = await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })();
+  const handle = await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })(identical);
   await until(async () => (await readRecordsSoFar(workflowID)) >= 1);
   const reader = readDurableStream({ workflowID, key: 'ui' }).getReader();
   const seen: UIMessageChunk[] = [];
@@ -4101,7 +4114,11 @@ test('toolWriter: a live reader is told to discard the earlier chunks of a re-ex
     seen.push(value);
   }
   await handle.getResult();
-  assert.deepEqual(toolSummary(visible(seen)), [
+  return toolSummary(visible(seen));
+}
+
+test('toolWriter: a live reader is told to discard the earlier chunks of a re-executed call', async () => {
+  assert.deepEqual(await readRepeatLive(false), [
     'start',
     'source:s1',
     'output:first',
@@ -4112,6 +4129,10 @@ test('toolWriter: a live reader is told to discard the earlier chunks of a re-ex
     'output:other',
     'finish',
   ]);
+});
+
+test('toolWriter: a live reader does not repeat chunks a re-execution wrote again unchanged', async () => {
+  assert.deepEqual(await readRepeatLive(true), ['start', 'source:s1', 'output:first', 'output:first', 'source:s3', 'output:other', 'finish']);
 });
 
 test('toolWriter: a timed-out attempt that finishes late writes no stream record', async () => {
@@ -4146,6 +4167,21 @@ test('toolWriter: a final attempt that times out records the timeout, without it
   assert.equal(tools.length, 1);
   assert.match((tools[0] as { errorText?: string }).errorText ?? '', /timed out/);
   assert.equal((tools[0] as { chunks?: unknown }).chunks, undefined);
+});
+
+test('toolWriter: a timeout that shouldRetry will not retry records the timeout', async () => {
+  twTimeoutFinished = 0;
+  twTimeoutGate = newGate();
+  twTimeoutMock.generateResults.push(toolCallResponse('picky', '{}'), textResponse('done'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(twTimeoutWorkflow, { workflowID })();
+  await until(() => twTimeoutFinished === 1);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  twTimeoutGate.release();
+  assert.equal(await handle.getResult(), 'done');
+  const tools = (await readRecords(workflowID, 'ui')).filter((r) => r.kind === 'tool');
+  assert.equal(tools.length, 1);
+  assert.match((tools[0] as { errorText?: string }).errorText ?? '', /timed out/);
 });
 
 test('workflow cancel: a streamed model call stops, nothing is checkpointed, and resume re-runs it', async (t) => {

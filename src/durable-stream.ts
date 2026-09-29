@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DBOS, Error as DBOSErrors, StatusString } from '@dbos-inc/dbos-sdk';
 import type { UIMessageChunk } from 'ai' with { 'resolution-mode': 'import' };
 import type { LanguageModelV4FinishReason, LanguageModelV4StreamPart } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
@@ -197,7 +197,7 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     offset: options.offset ?? 0,
     resumed: (options.offset ?? 0) > 0,
     openParts: new Map(),
-    toolChunksSent: new Set(),
+    toolChunksSent: new Map(),
     ended: false,
   };
   if (state.offset === 0) yield { type: 'start', messageId: options.messageId };
@@ -255,8 +255,8 @@ interface ReaderState {
   openAttempt?: string;
   // Text/reasoning parts of the open attempt that have started but not ended, by UI part id.
   openParts: Map<string, 'text' | 'reasoning'>;
-  // Tool calls (by toolKey) whose chunks were emitted.
-  toolChunksSent: Set<string>;
+  // Digest of the chunks emitted for each tool call (by toolKey).
+  toolChunksSent: Map<string, string>;
   finishReason?: string;
   ended: boolean;
 }
@@ -329,12 +329,14 @@ function* emitRecord(
     case 'tool':
       if (record.chunks) {
         const key = toolKey(record);
-        // A live re-execution of a call whose chunks were already sent: tell the client to discard them.
-        if (state.toolChunksSent.has(key)) {
-          yield { type: 'data-dbos-tool-superseded', data: { toolCallId: record.toolCallId }, transient: true } as UIMessageChunk;
+        const digest = createHash('sha256').update(JSON.stringify(record.chunks)).digest('base64');
+        const sent = state.toolChunksSent.get(key);
+        // A live re-execution that wrote the same chunks changes nothing; different ones replace what the client has.
+        if (sent !== digest) {
+          if (sent !== undefined) yield { type: 'data-dbos-tool-superseded', data: { toolCallId: record.toolCallId }, transient: true } as UIMessageChunk;
+          state.toolChunksSent.set(key, digest);
+          yield* record.chunks;
         }
-        state.toolChunksSent.add(key);
-        yield* record.chunks;
       }
       // Local tool errors are masked like the AI SDK does; provider-executed ones (in model records) pass through verbatim.
       yield record.errorText !== undefined

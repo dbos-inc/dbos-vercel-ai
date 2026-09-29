@@ -161,7 +161,7 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
             const abortSignal = anySignal(signal, DBOS.stepStatus?.timeoutSignal, cancelSignal);
             const stepWriter = new StepWriter(writer, durableStream);
             const record = async (outcome: { output: unknown } | { errorText: string }, chunks?: UIMessageChunk[]) => {
-              const timeout = timedOutOutcome();
+              const timeout = await timedOutOutcome(callConfig.shouldRetry);
               if (!durableStream || timeout === null) return;
               await writeToolRecord(durableStream, execOptions.toolCallId, timeout ?? outcome, timeout ? [] : chunks);
             };

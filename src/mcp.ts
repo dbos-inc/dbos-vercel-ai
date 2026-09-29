@@ -115,7 +115,7 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
             // Stop the call when the attempt times out or the workflow is cancelled, as well as on the caller's abort.
             const cancelSignal = stepCancelSignal();
             const record = async (outcome: { output: unknown } | { errorText: string }) => {
-              const timeout = timedOutOutcome();
+              const timeout = await timedOutOutcome(callConfig.shouldRetry);
               if (!durableStream || !toolCallId || timeout === null) return;
               await writeToolRecord(durableStream, toolCallId, timeout ?? outcome);
             };

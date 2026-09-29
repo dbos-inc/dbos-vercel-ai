@@ -28,14 +28,16 @@ export function stepCancelSignal(): AbortSignal | undefined {
 
 /**
  * DBOS discards a timed-out attempt's result, so a stream record of it would contradict the checkpoint. Returns the
- * outcome to record instead: the timeout on the final attempt, `null` when a retry follows, `undefined` if not timed out.
+ * outcome to record instead: the timeout when the step ends with it, `null` when a retry follows, `undefined` if not timed out.
  */
-export function timedOutOutcome(): { errorText: string } | null | undefined {
+export async function timedOutOutcome(shouldRetry: StepConfig['shouldRetry']): Promise<{ errorText: string } | null | undefined> {
   const status = DBOS.stepStatus;
   if (status?.timeoutSignal?.aborted !== true) return undefined;
-  const final = status.currentAttempt === undefined || status.currentAttempt >= (status.maxAttempts ?? 1);
   const reason: unknown = status.timeoutSignal.reason;
-  return final ? { errorText: reason instanceof Error ? reason.message : 'The step timed out.' } : null;
+  const lastAttempt = status.currentAttempt === undefined || status.currentAttempt >= (status.maxAttempts ?? 1);
+  // DBOS asks the step's shouldRetry about this same error (the signal's reason) before retrying; a throw ends the step.
+  const retried = !lastAttempt && (await Promise.resolve(shouldRetry ? shouldRetry(reason) : true).catch(() => false));
+  return retried ? null : { errorText: reason instanceof Error ? reason.message : 'The step timed out.' };
 }
 
 // Fires when any given signal does; a lone signal is returned as-is.
