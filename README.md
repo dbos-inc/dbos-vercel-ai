@@ -150,9 +150,8 @@ It emits a stream of AI SDK `UIMessageChunk`.
 You can also pass a `DBOSClient` into `readDurableStream` to read it from a different process.
 
 You can write your own data to a stream with `writeDurableStream(key, chunks)`.
-
 Tools can also write chunks with `toolWriter()`, which returns a `UIMessageStreamWriter` bound to the current tool call.
-Chunks from a tool call are written when the tool call succeeds, just before its output (`transient: true` data parts are written live instead).
+Chunks from a tool call are written when the tool call succeeds (`transient: true` data parts are written live instead).
 To also include them in the response message your workflow builds, pass your `createUIMessageStream` writer to `durableTools`:
 
 ```ts
