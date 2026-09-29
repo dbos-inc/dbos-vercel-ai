@@ -1,6 +1,6 @@
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
-import { anySignal, isAsyncIterable, runDurableStep, stepCancelSignal, withErrorClassification } from './internal';
+import { anySignal, isAsyncIterable, runDurableStep, stepCancelSignal, timedOutOutcome, withErrorClassification } from './internal';
 import { writeToolRecord } from './durable-stream';
 
 // Structural type for an MCP client (e.g. from @ai-sdk/mcp) — deliberately loose: the AI SDK ecosystem
@@ -114,6 +114,11 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
           async () => {
             // Stop the call when the attempt times out or the workflow is cancelled, as well as on the caller's abort.
             const cancelSignal = stepCancelSignal();
+            const record = async (outcome: { output: unknown } | { errorText: string }) => {
+              const timeout = timedOutOutcome();
+              if (!durableStream || !toolCallId || timeout === null) return;
+              await writeToolRecord(durableStream, toolCallId, timeout ?? outcome);
+            };
             const abortSignal = anySignal(signal, DBOS.stepStatus?.timeoutSignal, cancelSignal);
             let output: unknown;
             try {
@@ -127,12 +132,10 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
                 output = last;
               }
             } catch (error) {
-              if (durableStream && toolCallId && !cancelSignal?.aborted) {
-                await writeToolRecord(durableStream, toolCallId, { errorText: error instanceof Error ? error.message : String(error) });
-              }
+              if (!cancelSignal?.aborted) await record({ errorText: error instanceof Error ? error.message : String(error) });
               throw error;
             }
-            if (durableStream && toolCallId) await writeToolRecord(durableStream, toolCallId, { output });
+            await record({ output });
             return output;
           },
           callConfig,

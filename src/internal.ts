@@ -26,6 +26,18 @@ export function stepCancelSignal(): AbortSignal | undefined {
   return (DBOS.stepStatus as { cancelSignal?: AbortSignal } | undefined)?.cancelSignal;
 }
 
+/**
+ * DBOS discards a timed-out attempt's result, so a stream record of it would contradict the checkpoint. Returns the
+ * outcome to record instead: the timeout on the final attempt, `null` when a retry follows, `undefined` if not timed out.
+ */
+export function timedOutOutcome(): { errorText: string } | null | undefined {
+  const status = DBOS.stepStatus;
+  if (status?.timeoutSignal?.aborted !== true) return undefined;
+  const final = status.currentAttempt === undefined || status.currentAttempt >= (status.maxAttempts ?? 1);
+  const reason: unknown = status.timeoutSignal.reason;
+  return final ? { errorText: reason instanceof Error ? reason.message : 'The step timed out.' } : null;
+}
+
 // Fires when any given signal does; a lone signal is returned as-is.
 export function anySignal(...signals: (AbortSignal | undefined)[]): AbortSignal | undefined {
   const defined = signals.filter((s): s is AbortSignal => s !== undefined);

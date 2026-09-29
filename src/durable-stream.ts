@@ -214,12 +214,16 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     }
   }
   const finalAttempt = new Map<number, string>();
-  for (const record of history) {
+  // A re-executed tool call writes another record; the last one matches its checkpoint, so only its chunks are shown.
+  const finalToolChunks = new Map<string, number>();
+  history.forEach((record, index) => {
     if (record.kind === 'model' || record.kind === 'model-end') finalAttempt.set(record.step, record.attempt);
-  }
-  for (const record of history) {
+    if (record.kind === 'tool' && record.chunks) finalToolChunks.set(toolKey(record), index);
+  });
+  for (const [index, record] of history.entries()) {
     const stale = (record.kind === 'model' || record.kind === 'model-end') && finalAttempt.get(record.step) !== record.attempt;
-    yield* stale ? skipRecord(state) : emit(record);
+    const staleChunks = record.kind === 'tool' && record.chunks !== undefined && finalToolChunks.get(toolKey(record)) !== index;
+    yield* stale ? skipRecord(state) : emit(staleChunks ? { ...record, chunks: undefined } : record);
     if (state.ended) return;
   }
 
@@ -251,10 +255,15 @@ interface ReaderState {
   openAttempt?: string;
   // Text/reasoning parts of the open attempt that have started but not ended, by UI part id.
   openParts: Map<string, 'text' | 'reasoning'>;
-  // Tool calls whose chunks were emitted; a re-executed call's record repeats them.
+  // Tool calls (by toolKey) whose chunks were emitted.
   toolChunksSent: Set<string>;
   finishReason?: string;
   ended: boolean;
+}
+
+// A step's function id survives re-execution, and with it tell apart calls that reuse a provider's tool call id.
+function toolKey(record: Extract<DurableStreamRecord, { kind: 'tool' }>): string {
+  return `${record.step}:${record.toolCallId}`;
 }
 
 function offsetChunk(state: ReaderState): UIMessageChunk {
@@ -318,8 +327,13 @@ function* emitRecord(
       if (record.attempt === state.openAttempt) state.finishReason = record.aborted ? 'other' : record.finishReason?.unified;
       break;
     case 'tool':
-      if (record.chunks && !state.toolChunksSent.has(record.toolCallId)) {
-        state.toolChunksSent.add(record.toolCallId);
+      if (record.chunks) {
+        const key = toolKey(record);
+        // A live re-execution of a call whose chunks were already sent: tell the client to discard them.
+        if (state.toolChunksSent.has(key)) {
+          yield { type: 'data-dbos-tool-superseded', data: { toolCallId: record.toolCallId }, transient: true } as UIMessageChunk;
+        }
+        state.toolChunksSent.add(key);
         yield* record.chunks;
       }
       // Local tool errors are masked like the AI SDK does; provider-executed ones (in model records) pass through verbatim.

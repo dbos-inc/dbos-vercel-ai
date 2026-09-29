@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet, UIMessageChunk, UIMessageStreamWriter } from 'ai' with { 'resolution-mode': 'import' };
-import { anySignal, assertNotInTransaction, isAsyncIterable, isInWorkflowFunction, runDurableStep, stepCancelSignal, withErrorClassification } from './internal';
+import { anySignal, assertNotInTransaction, isAsyncIterable, isInWorkflowFunction, runDurableStep, stepCancelSignal, timedOutOutcome, withErrorClassification } from './internal';
 import { AGENT_TOOL } from './agent-tool';
 import { writeDurableStream, writeToolRecord } from './durable-stream';
 
@@ -160,6 +160,11 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
             const cancelSignal = stepCancelSignal();
             const abortSignal = anySignal(signal, DBOS.stepStatus?.timeoutSignal, cancelSignal);
             const stepWriter = new StepWriter(writer, durableStream);
+            const record = async (outcome: { output: unknown } | { errorText: string }, chunks?: UIMessageChunk[]) => {
+              const timeout = timedOutOutcome();
+              if (!durableStream || timeout === null) return;
+              await writeToolRecord(durableStream, execOptions.toolCallId, timeout ?? outcome, timeout ? [] : chunks);
+            };
             let output: unknown;
             try {
               output = await currentWriter.run(stepWriter, async () => {
@@ -173,11 +178,11 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
               await stepWriter.settle();
             } catch (error) {
               // A cancelled workflow's reader ends the turn with an abort; this call has no outcome of its own.
-              if (durableStream && !cancelSignal?.aborted) await writeToolRecord(durableStream, execOptions.toolCallId, { errorText: errorMessage(error) });
+              if (!cancelSignal?.aborted) await record({ errorText: errorMessage(error) });
               throw error;
             }
             const chunks = stepWriter.chunks;
-            if (durableStream) await writeToolRecord(durableStream, execOptions.toolCallId, { output }, chunks);
+            await record({ output }, chunks);
             return chunks.length > 0 ? ({ __dbosToolChunks: 1, output, chunks } satisfies ToolEnvelope) : output;
           },
           callConfig,

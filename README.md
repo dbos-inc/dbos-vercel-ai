@@ -182,6 +182,7 @@ Your streams are closed when your workflow finishes; you can also close a stream
 
 If a workflow is interrupted during a model call, when the workflow recovers, it restarts the model call and streams its output again.
 Readers that connect afterwards see the model's output once; live readers receive a transient `data-dbos-superseded` chunk indicating the model call has been restarted.
+Likewise, if a tool call is re-executed after writing its chunks, readers that connect afterwards see only the re-execution's chunks; live readers receive a transient `data-dbos-tool-superseded` chunk naming the `toolCallId` whose earlier chunks to discard.
 
 ### Durable MCP Tools
 
