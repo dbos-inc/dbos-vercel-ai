@@ -7,6 +7,7 @@ import { GatewayRateLimitError } from '@ai-sdk/gateway';
 import { Client as PgClient } from 'pg';
 import {
   asSchema,
+  createUIMessageStream,
   embed,
   type InferToolOutput,
   embedMany,
@@ -16,6 +17,7 @@ import {
   streamText,
   tool,
   ToolLoopAgent,
+  type UIMessage,
   type UIMessageChunk,
   uiMessageChunkSchema,
   wrapEmbeddingModel,
@@ -34,6 +36,7 @@ import {
   durableTools,
   type MCPClientLike,
   readDurableStream,
+  toolWriter,
   writeDurableStream,
 } from '../src/index.js';
 import { restoreAISDKErrorIdentity } from '../src/internal.js';
@@ -1633,6 +1636,74 @@ function resetAgentMocks(): void {
   orchMock.generateResults.length = 0;
 }
 
+// Tool-written chunks: transient ones stream live, the rest are checkpointed and re-emitted before the tool's output.
+const twMock = new MockLanguageModel();
+const twModel = wrapLanguageModel({ model: twMock, middleware: durableCalls({ durableStream: 'ui' }) });
+let twRuns = 0;
+let twFailFirst = false;
+const twTools = {
+  search: tool({
+    inputSchema: z.object({ q: z.string() }),
+    execute: async ({ q }, { toolCallId }) => {
+      twRuns++;
+      const writer = toolWriter();
+      writer.write({ type: 'data-progress', data: { pct: 50 }, transient: true });
+      writer.write({ type: 'source-url', sourceId: `src-${toolCallId}`, url: 'https://example.com/a', title: 'A' });
+      writer.merge(
+        new ReadableStream<UIMessageChunk>({
+          start(controller) {
+            controller.enqueue({ type: 'file', url: 'https://example.com/chart.png', mediaType: 'image/png' });
+            controller.close();
+          },
+        }),
+      );
+      if (twFailFirst && twRuns === 1) throw new Error('flaky');
+      return `found ${q}`;
+    },
+  }),
+};
+const twWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    let message: UIMessage | undefined;
+    const live: UIMessageChunk[] = [];
+    const stream = createUIMessageStream({
+      execute: ({ writer }) => {
+        const tools = durableTools(twTools, { durableStream: 'ui', writer, tools: { search: { retriesAllowed: true, maxAttempts: 2, intervalSeconds: 0 } } });
+        writer.merge(streamText({ model: twModel, prompt, tools, stopWhen: stepCountIs(5), maxRetries: 0 }).toUIMessageStream());
+      },
+      onFinish: ({ responseMessage }) => {
+        message = responseMessage;
+      },
+    });
+    for await (const chunk of stream) live.push(chunk);
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { parts: message!.parts, live: live.map((c) => c.type) };
+  },
+  { name: 'twWorkflow' },
+);
+// A re-executed tool step repeats its record; the reader must not repeat its chunks.
+const twRepeatWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await DBOS.runStep(
+      async () => {
+        const record: DurableStreamRecord = {
+          kind: 'tool',
+          step: 0,
+          attempt: 1,
+          toolCallId: 'call-1',
+          output: 'ok',
+          chunks: [{ type: 'source-url', sourceId: 's1', url: 'https://example.com' }],
+        };
+        await DBOS.writeStream('ui', record);
+        await DBOS.writeStream('ui', record);
+      },
+      { name: 'write' },
+    );
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'twRepeatWorkflow' },
+);
+
 before(async () => {
   DBOS.setConfig({ name: 'dbos-vercel-ai-test', systemDatabaseUrl });
   await DBOS.launch();
@@ -2862,7 +2933,7 @@ test('a streaming tool execute checkpoints its final value inside a workflow and
   assert.deepEqual(yielded, [1, 0]);
 });
 
-test('wrapped tools run directly outside a workflow, and tools without execute or opted out are untouched', async () => {
+test('wrapped tools run directly outside a workflow; tools without execute are untouched and opted-out ones only bind toolWriter', async () => {
   const before = weatherToolExecutions;
   assert.deepEqual(await wrappedTools.getWeather.execute!({ city: 'Rome' }, directExecOptions), {
     city: 'Rome',
@@ -2870,7 +2941,8 @@ test('wrapped tools run directly outside a workflow, and tools without execute o
   });
   assert.equal(weatherToolExecutions - before, 1);
   assert.equal(wrappedTools.clientOnly, plainTools.clientOnly);
-  assert.equal(wrappedTools.getTime, plainTools.getTime);
+  assert.equal(await wrappedTools.getTime.execute!({ city: 'Rome' }, directExecOptions), 'noon in Rome');
+  assert.equal(wrappedTools.getTime.description, plainTools.getTime.description);
   assert.notEqual(wrappedTools.getWeather, plainTools.getWeather);
 });
 
@@ -3757,4 +3829,75 @@ test('durable stream: a local tool error is masked for clients unless onError re
   const revealed: UIMessageChunk[] = [];
   for await (const chunk of readDurableStream({ workflowID, key: 'ui', onError: (e) => (e as Error).message })) revealed.push(chunk);
   assert.equal((revealed.find((c) => c.type === 'tool-output-error') as { errorText: string }).errorText, 'connection to db-internal.example refused');
+});
+
+function queueToolWriterTurn() {
+  twMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'tool-call', toolCallId: 'call-1', toolName: 'search', input: '{"q":"dbos"}' },
+      { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+    ],
+    textStreamParts(['Done.']),
+  );
+}
+const partTypes = (parts: UIMessage['parts']) => parts.map((p) => p.type);
+
+test('toolWriter: non-transient chunks reach the workflow message and the durable stream, and replay without re-running the tool', async () => {
+  twRuns = 0;
+  twFailFirst = false;
+  queueToolWriterTurn();
+  const workflowID = randomUUID();
+  const result = await (await DBOS.startWorkflow(twWorkflow, { workflowID })('search')).getResult();
+  assert.deepEqual(partTypes(result.parts), ['step-start', 'tool-search', 'source-url', 'file', 'step-start', 'text']);
+  // The transient part streamed live but is not part of the message; the rest come before the tool's output.
+  assert.ok(result.live.includes('data-progress'));
+  assert.ok(result.live.indexOf('source-url') < result.live.indexOf('tool-output-available'));
+  assert.ok(result.live.indexOf('file') < result.live.indexOf('tool-output-available'));
+
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  const types = chunks.map((c) => c.type);
+  assert.deepEqual(
+    types.filter((t) => ['data-progress', 'source-url', 'file', 'tool-output-available'].includes(t)),
+    ['data-progress', 'source-url', 'file', 'tool-output-available'],
+  );
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof twWorkflow>>(workflowID, steps!.find((s) => s.name === 'noop')!.functionID);
+  const replayed = await forked.getResult();
+  assert.equal(twRuns, 1);
+  assert.deepEqual(replayed.parts, result.parts);
+  assert.ok(!replayed.live.includes('data-progress'));
+});
+
+test('toolWriter: a retried attempt contributes its chunks once', async () => {
+  twRuns = 0;
+  twFailFirst = true;
+  queueToolWriterTurn();
+  const workflowID = randomUUID();
+  const result = await (await DBOS.startWorkflow(twWorkflow, { workflowID })('search')).getResult();
+  assert.equal(twRuns, 2);
+  assert.deepEqual(partTypes(result.parts), ['step-start', 'tool-search', 'source-url', 'file', 'step-start', 'text']);
+  const types = visible(await readChunks(workflowID, 'ui')).map((c) => c.type);
+  assert.equal(types.filter((t) => t === 'source-url').length, 1);
+  assert.equal(types.filter((t) => t === 'file').length, 1);
+});
+
+test('toolWriter: outside a workflow chunks go straight to the writer', async () => {
+  const written: UIMessageChunk[] = [];
+  const writer = { write: (c: UIMessageChunk) => written.push(c), merge: () => {}, onError: undefined };
+  const tools = durableTools(twTools, { writer });
+  twRuns = 0;
+  twFailFirst = false;
+  const output = await tools.search.execute!({ q: 'x' }, { toolCallId: 'c1', messages: [], context: undefined as never });
+  assert.equal(output, 'found x');
+  assert.deepEqual(written.map((c) => c.type), ['data-progress', 'source-url']);
+  assert.throws(() => toolWriter(), /toolWriter\(\) can only be called/);
+});
+
+test('toolWriter: the reader emits the chunks of a repeated tool record once', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })()).getResult();
+  const types = visible(await readChunks(workflowID, 'ui')).map((c) => c.type);
+  assert.deepEqual(types, ['start', 'source-url', 'tool-output-available', 'tool-output-available', 'finish']);
 });

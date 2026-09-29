@@ -155,6 +155,38 @@ const tools = durableTools(myTools, {
 
 When using durable tools, to ensure the ordering of parallel tool calls is consistent during recovery, do not await I/O in callbacks that run before a tool executes, such as `onToolExecutionStart`.
 
+### Writing UI Chunks from Tools
+
+Tools can write UI message chunks with `toolWriter()`, which returns a `UIMessageStreamWriter` bound to the current tool call.
+Pass your `createUIMessageStream` writer to `durableTools` so the chunks become part of the response message:
+
+```ts
+import { createUIMessageStream, streamText } from 'ai';
+import { durableTools, toolWriter } from '@dbos-inc/vercel-ai';
+
+const search = tool({
+  inputSchema: z.object({ q: z.string() }),
+  execute: async ({ q }) => {
+    const writer = toolWriter();
+    writer.write({ type: 'data-progress', data: { pct: 50 }, transient: true });
+    writer.write({ type: 'source-url', sourceId: 's1', url: 'https://example.com' });
+    return runSearch(q);
+  },
+});
+
+const stream = createUIMessageStream({
+  execute: ({ writer }) => {
+    const tools = durableTools({ search }, { durableStream: 'ui', writer });
+    writer.merge(streamText({ model, messages, tools }).toUIMessageStream());
+  },
+  onFinish: ({ responseMessage }) => saveMessage(responseMessage),
+});
+```
+
+Transient chunks are written live.
+Non-transient chunks are checkpointed with the tool's output and written, to both the writer and the durable stream, just before it when the tool call succeeds.
+When a workflow recovers, they are written again from the checkpoint, so the response message is the same as if it had never been interrupted.
+
 ### Durable MCP Tools
 
 `durableMCPTools` wraps an [MCP](https://modelcontextprotocol.io/) client (for example, from [`@ai-sdk/mcp`](https://www.npmjs.com/package/@ai-sdk/mcp)) so both the tool listing and every tool call run as durable steps:

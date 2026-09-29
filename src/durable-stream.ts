@@ -10,7 +10,7 @@ export type DurableStreamOptions = string | { key: string; maxBatchParts?: numbe
 export type DurableStreamRecord =
   | { kind: 'model'; step: number; attempt: string; parts: LanguageModelV4StreamPart[] }
   | { kind: 'model-end'; step: number; attempt: string; finishReason?: LanguageModelV4FinishReason; aborted?: true }
-  | { kind: 'tool'; step: number; attempt: number; toolCallId: string; output?: unknown; errorText?: string }
+  | { kind: 'tool'; step: number; attempt: number; toolCallId: string; output?: unknown; errorText?: string; chunks?: UIMessageChunk[] }
   | { kind: 'ui'; step?: number; attempt?: number; chunks: UIMessageChunk[] }
   | { kind: 'end'; finishReason: string };
 
@@ -123,9 +123,14 @@ export class ModelStreamWriter {
   }
 }
 
-/** Records a tool call's outcome from inside its step. */
-export function writeToolRecord(key: string, toolCallId: string, outcome: { output: unknown } | { errorText: string }): Promise<void> {
-  const record: DurableStreamRecord = { kind: 'tool', ...stepInfo(), toolCallId, ...outcome };
+/** Records a tool call's outcome, with the non-transient chunks it wrote, from inside its step. */
+export function writeToolRecord(
+  key: string,
+  toolCallId: string,
+  outcome: { output: unknown } | { errorText: string },
+  chunks: UIMessageChunk[] = [],
+): Promise<void> {
+  const record: DurableStreamRecord = { kind: 'tool', ...stepInfo(), toolCallId, ...outcome, ...(chunks.length > 0 && { chunks }) };
   return DBOS.writeStream(key, record);
 }
 
@@ -192,6 +197,7 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     offset: options.offset ?? 0,
     resumed: (options.offset ?? 0) > 0,
     openParts: new Map(),
+    toolChunksSent: new Set(),
     ended: false,
   };
   if (state.offset === 0) yield { type: 'start', messageId: options.messageId };
@@ -245,6 +251,8 @@ interface ReaderState {
   openAttempt?: string;
   // Text/reasoning parts of the open attempt that have started but not ended, by UI part id.
   openParts: Map<string, 'text' | 'reasoning'>;
+  // Tool calls whose chunks were emitted; a re-executed call's record repeats them.
+  toolChunksSent: Set<string>;
   finishReason?: string;
   ended: boolean;
 }
@@ -310,6 +318,10 @@ function* emitRecord(
       if (record.attempt === state.openAttempt) state.finishReason = record.aborted ? 'other' : record.finishReason?.unified;
       break;
     case 'tool':
+      if (record.chunks && !state.toolChunksSent.has(record.toolCallId)) {
+        state.toolChunksSent.add(record.toolCallId);
+        yield* record.chunks;
+      }
       // Local tool errors are masked like the AI SDK does; provider-executed ones (in model records) pass through verbatim.
       yield record.errorText !== undefined
         ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: filter.onError(new Error(record.errorText)) }
