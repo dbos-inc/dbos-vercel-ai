@@ -195,12 +195,13 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
   const client: DurableStreamSource = options.client ?? DBOS;
   const state: ReaderState = {
     offset: options.offset ?? 0,
-    resumed: (options.offset ?? 0) > 0,
     openParts: new Map(),
+    detachedParts: new Set(),
     toolChunksSent: new Map(),
     ended: false,
   };
   if (state.offset === 0) yield { type: 'start', messageId: options.messageId };
+  else await restoreOpenCall(client, workflowID, key, state);
   const emit = (record: DurableStreamRecord) => emitRecord(state, record, { sendReasoning, sendSources, onError });
 
   // Phase 1: everything already stored, one value per query until an offset is empty; a superseded attempt is skipped whole.
@@ -250,11 +251,12 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
 
 interface ReaderState {
   offset: number;
-  resumed: boolean;
   openStep?: number;
   openAttempt?: string;
   // Text/reasoning parts of the open attempt that have started but not ended, by UI part id.
   openParts: Map<string, 'text' | 'reasoning'>;
+  // Open parts from before a resume: the client's resumed stream no longer tracks them, so they are never ended.
+  detachedParts: Set<string>;
   // Digest of the chunks emitted for each tool call (by toolKey).
   toolChunksSent: Map<string, string>;
   finishReason?: string;
@@ -280,17 +282,65 @@ function* closeStep(state: ReaderState): Generator<UIMessageChunk> {
   state.openStep = undefined;
   state.openAttempt = undefined;
   state.openParts.clear();
+  state.detachedParts.clear();
+}
+
+/**
+ * On resume, rebuild the model call that was open at `offset` by reading back to its start, so the reader continues
+ * exactly as an uninterrupted one would: a re-executed attempt is superseded, and step boundaries fall in the same place.
+ */
+async function restoreOpenCall(client: DurableStreamSource, workflowID: string, key: string, state: ReaderState): Promise<void> {
+  let step: number | undefined;
+  let attempt: string | undefined;
+  const ended = new Set<string>();
+  for (let index = state.offset - 1; index >= 0; index--) {
+    let record: DurableStreamRecord;
+    try {
+      record = await client.readStreamOffset<DurableStreamRecord>(workflowID, key, index, { timeoutSeconds: 0 });
+    } catch (error) {
+      // An offset past the stored records has nothing before it to restore from.
+      if (DBOSErrors.isStreamTimeoutError(error)) continue;
+      throw error;
+    }
+    if (record.kind === 'end') break;
+    if (record.kind !== 'model' && record.kind !== 'model-end') continue;
+    step ??= record.step;
+    attempt ??= record.attempt;
+    if (record.step !== step) break;
+    if (record.attempt !== attempt) continue;
+    if (record.kind === 'model-end') {
+      state.finishReason ??= record.aborted ? 'other' : record.finishReason?.unified;
+      continue;
+    }
+    // Walking backward, a part is open if its start is seen before (i.e. later than) any end.
+    for (const part of [...record.parts].reverse()) {
+      const kind = part.type === 'text-start' || part.type === 'text-end' ? 'text' : part.type === 'reasoning-start' || part.type === 'reasoning-end' ? 'reasoning' : undefined;
+      if (kind === undefined || !('id' in part)) continue;
+      const id = `${record.attempt}:${part.id}`;
+      if (part.type.endsWith('-end')) ended.add(id);
+      else if (!ended.has(id)) {
+        state.openParts.set(id, kind);
+        state.detachedParts.add(id);
+      }
+    }
+  }
+  if (step === undefined) return;
+  state.openStep = step;
+  state.openAttempt = attempt;
 }
 
 // A live re-execution of the open step: end the stale attempt's parts and tell the client which ones to discard.
 function* supersede(state: ReaderState, attempt: string): Generator<UIMessageChunk> {
-  for (const [id, kind] of state.openParts) yield { type: kind === 'text' ? 'text-end' : 'reasoning-end', id };
+  for (const [id, kind] of state.openParts) {
+    if (!state.detachedParts.has(id)) yield { type: kind === 'text' ? 'text-end' : 'reasoning-end', id };
+  }
   yield {
     type: 'data-dbos-superseded',
     data: { attempt: state.openAttempt, parts: [...state.openParts.keys()] },
     transient: true,
   } as UIMessageChunk;
   state.openParts.clear();
+  state.detachedParts.clear();
   state.openAttempt = attempt;
 }
 
@@ -304,8 +354,7 @@ function* emitRecord(
     case 'model': {
       if (state.openStep !== record.step) {
         yield* closeStep(state);
-        if (!state.resumed) yield { type: 'start-step' };
-        state.resumed = false;
+        yield { type: 'start-step' };
         state.openStep = record.step;
         state.openAttempt = record.attempt;
       } else if (state.openAttempt !== record.attempt) {

@@ -13,6 +13,7 @@ import {
   embedMany,
   generateImage,
   generateText,
+  readUIMessageStream,
   stepCountIs,
   streamText,
   tool,
@@ -3567,8 +3568,61 @@ test('durable stream: a resume from an offset inside a stale attempt skips the r
   const resumed = await readChunks(workflowID, 'ui', 0 + 0);
   const fromStale = await readChunks(workflowID, 'ui', 1);
   assert.equal(streamedText(visible(fromStale)), 'fresh');
-  assert.deepEqual(visible(fromStale).map((c) => c.type), ['text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  // The reader can't tell whether the client saw the stale attempt, so it names it; it never ends parts the client may lack.
+  assert.deepEqual(visible(fromStale).map((c) => c.type), ['data-dbos-superseded', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
   assert.equal(streamedText(visible(resumed)), 'fresh');
+});
+
+test('durable stream: a client resuming after a crash is told the re-executed call supersedes what it saw', async () => {
+  dsStaleLiveGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsStaleLiveWorkflow, { workflowID })();
+  // The client sees the stale attempt's first text, then its connection drops.
+  const reader = readDurableStream({ workflowID, key: 'ui', messageId: 'msg-1' }).getReader();
+  const before: UIMessageChunk[] = [];
+  while (!before.some((c) => c.type === 'data-dbos-offset')) before.push((await reader.read()).value!);
+  await reader.cancel();
+  const offset = (before.find((c) => c.type === 'data-dbos-offset') as { data: { offset: number } }).data.offset;
+  dsStaleLiveGate.release();
+  await handle.getResult();
+
+  const resumed = await readChunks(workflowID, 'ui', offset);
+  assert.deepEqual(visible(resumed).map((c) => c.type), ['data-dbos-superseded', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  assert.deepEqual((resumed.find((c) => c.type === 'data-dbos-superseded') as { data: unknown }).data, { attempt: 'stale', parts: ['stale:t1'] });
+
+  // An AI SDK client resuming with its partial message processes the resumed stream without error.
+  const toStream = (chunks: UIMessageChunk[]) =>
+    new ReadableStream<UIMessageChunk>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+  let message: UIMessage | undefined;
+  for await (message of readUIMessageStream({ stream: toStream(before), terminateOnError: true }));
+  for await (message of readUIMessageStream({ message, stream: toStream(resumed), terminateOnError: true }));
+  assert.deepEqual(
+    message!.parts.filter((p) => p.type === 'text').map((p) => (p as { text: string }).text),
+    ['STALE', 'fresh'],
+  );
+});
+
+test('durable stream: a resume between steps puts step boundaries where an uninterrupted read does', async () => {
+  dsMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'tool-call', toolCallId: 'call-1', toolName: 'getWeather', input: '{"city":"Oslo"}' },
+      { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+    ],
+    textStreamParts(['Rainy']),
+  );
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsWorkflow, { workflowID })('weather in Oslo?')).getResult();
+  const full = await readChunks(workflowID, 'ui');
+  // Resume right after the tool's output, before the second model step's first record.
+  const index = full.findIndex((c) => c.type === 'tool-output-available') + 1;
+  const offset = (full[index] as { data: { offset: number } }).data.offset;
+  assert.deepEqual(await readChunks(workflowID, 'ui', offset), full.slice(index + 1));
 });
 
 test('durable stream: a second execution of a model step gets its own attempt id', async () => {
