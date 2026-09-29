@@ -21,6 +21,17 @@ export function runDurableStep<T>(name: string, fn: () => Promise<T>, config: St
   });
 }
 
+// DBOS 5.1+ fires stepStatus.cancelSignal when the step's workflow is cancelled; older versions have none.
+export function stepCancelSignal(): AbortSignal | undefined {
+  return (DBOS.stepStatus as { cancelSignal?: AbortSignal } | undefined)?.cancelSignal;
+}
+
+// Fires when any given signal does; a lone signal is returned as-is.
+export function anySignal(...signals: (AbortSignal | undefined)[]): AbortSignal | undefined {
+  const defined = signals.filter((s): s is AbortSignal => s !== undefined);
+  return defined.length <= 1 ? defined[0] : AbortSignal.any(defined);
+}
+
 export function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return typeof (value as AsyncIterable<unknown> | null | undefined)?.[Symbol.asyncIterator] === 'function';
 }

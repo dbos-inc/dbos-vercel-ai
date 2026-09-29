@@ -1704,10 +1704,95 @@ const twRepeatWorkflow = DBOS.registerWorkflow(
   { name: 'twRepeatWorkflow' },
 );
 
+// Workflow cancellation reaching in-flight calls needs DBOS 5.1+ (stepStatus.cancelSignal); older versions skip these tests.
+let cancelSignalSupported = false;
+const cancelProbeWorkflow = DBOS.registerWorkflow(
+  async () => DBOS.runStep(async () => DBOS.stepStatus !== undefined && 'cancelSignal' in DBOS.stepStatus, { name: 'probe' }),
+  { name: 'cancelProbeWorkflow' },
+);
+async function until(condition: () => boolean | Promise<boolean>, timeoutMS = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMS;
+  while (!(await condition())) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+const cancelStreamMock = new MockLanguageModel();
+const cancelStreamModel = wrapLanguageModel({ model: cancelStreamMock, middleware: durableCalls({ durableStream: 'ui' }) });
+let cancelStreamGate = newGate();
+const cancelStreamWorkflow = DBOS.registerWorkflow(
+  async () => await streamText({ model: cancelStreamModel, prompt: 'hi', maxRetries: 0 }).text,
+  { name: 'cancelStreamWorkflow' },
+);
+
+// Parks the next doGenerate until its abort signal fires, then rejects like a real provider.
+class ParkingGenerateModel extends MockLanguageModel {
+  parkNext = false;
+  parked = 0;
+  rejected = 0;
+  override async doGenerate(options: Parameters<MockLanguageModel['doGenerate']>[0]) {
+    if (!this.parkNext) return super.doGenerate(options);
+    this.parkNext = false;
+    this.parked++;
+    return new Promise<never>((_, reject) => {
+      options.abortSignal?.addEventListener(
+        'abort',
+        () => {
+          this.rejected++;
+          reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+        },
+        { once: true },
+      );
+    });
+  }
+}
+const cancelGenerateMock = new ParkingGenerateModel();
+const cancelGenerateModel = wrapLanguageModel({ model: cancelGenerateMock, middleware: durableCalls() });
+const cancelGenerateWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: cancelGenerateModel, prompt: 'hi', maxRetries: 0 })).text,
+  { name: 'cancelGenerateWorkflow' },
+);
+
+// A tool that waits until its abort signal fires.
+const cancelToolState = { started: 0, aborted: 0 };
+const parkUntilAborted = async (signal: AbortSignal | undefined): Promise<string> => {
+  cancelToolState.started++;
+  await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+  cancelToolState.aborted++;
+  throw new Error('tool aborted');
+};
+const cancelToolMock = new MockLanguageModel();
+const cancelToolModel = wrapLanguageModel({ model: cancelToolMock, middleware: durableCalls({ durableStream: 'ui' }) });
+const cancelTools = durableTools(
+  {
+    park: tool({ inputSchema: z.object({}), execute: async (_input, { abortSignal }) => parkUntilAborted(abortSignal) }),
+  },
+  { durableStream: 'ui' },
+);
+const cancelToolWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: cancelToolModel, prompt: 'hi', tools: cancelTools, stopWhen: stepCountIs(3), maxRetries: 0 })).text,
+  { name: 'cancelToolWorkflow' },
+);
+const cancelMcpClient: MCPClientLike = {
+  tools: async () => ({
+    park: tool({ inputSchema: z.object({}), execute: async (_input, { abortSignal }) => parkUntilAborted(abortSignal) }),
+  }),
+  close: async () => {},
+};
+const cancelMcpWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const tools = await durableMCPTools(cancelMcpClient, { durableStream: 'ui' });
+    return (await generateText({ model: cancelToolModel, prompt: 'hi', tools, stopWhen: stepCountIs(3), maxRetries: 0 })).text;
+  },
+  { name: 'cancelMcpWorkflow' },
+);
+
 before(async () => {
   DBOS.setConfig({ name: 'dbos-vercel-ai-test', systemDatabaseUrl });
   await DBOS.launch();
   await DBOS.registerQueue('subagents', { concurrency: 1 });
+  cancelSignalSupported = await cancelProbeWorkflow();
 });
 
 after(async () => {
@@ -3581,9 +3666,11 @@ test('agentTool: timeoutMS cancels a child that runs too long and the parent see
     { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
   ]);
   const workflowID = randomUUID();
-  // The child's step is parked at the gate; the timeout takes effect once the step returns, so let it return after the deadline.
-  setTimeout(() => slowGate.release(), 800);
+  // The child's step is parked at the gate. With a cancel signal the timeout's cancel stops the step; without one the
+  // timeout takes effect once the step returns, so let it return after the deadline.
+  if (!cancelSignalSupported) setTimeout(() => slowGate.release(), 800);
   const result = await (await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research slowly')).getResult();
+  slowGate.release();
   assert.equal(result.text, 'Timed out.');
   assert.equal(result.toolErrors.length, 1);
   assert.equal((await DBOS.getWorkflowStatus(`${workflowID}-call-1`))?.status, 'CANCELLED');
@@ -3901,3 +3988,79 @@ test('toolWriter: the reader emits the chunks of a repeated tool record once', a
   const types = visible(await readChunks(workflowID, 'ui')).map((c) => c.type);
   assert.deepEqual(types, ['start', 'source-url', 'tool-output-available', 'tool-output-available', 'finish']);
 });
+
+test('workflow cancel: a streamed model call stops, nothing is checkpointed, and resume re-runs it', async (t) => {
+  if (!cancelSignalSupported) return t.skip('requires DBOS 5.1+');
+  cancelStreamGate = newGate();
+  const callsBefore = cancelStreamMock.streamCalls;
+  const cancellationsBefore = cancelStreamMock.streamCancellations;
+  cancelStreamMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', delta: 'partial' },
+      () => cancelStreamGate.promise,
+      { type: 'text-end', id: 't1' },
+      { type: 'finish', finishReason: finishReason(), usage: usage() },
+    ],
+    textStreamParts(['fresh']),
+  );
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(cancelStreamWorkflow, { workflowID })();
+  await until(() => cancelStreamMock.streamCalls === callsBefore + 1);
+  await DBOS.cancelWorkflow(workflowID);
+  await until(() => cancelStreamMock.streamCancellations > cancellationsBefore);
+  assert.equal(cancelStreamMock.streamOptions.at(-1)!.abortSignal?.aborted, true);
+  await assert.rejects(handle.getResult());
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  // A cancelled call is not a consumer abort: nothing is recorded, so a resume calls the model again.
+  assert.ok(!(await DBOS.listWorkflowSteps(workflowID))!.some((s) => s.name === 'mock.mock-model.stream'));
+  await DBOS.resumeWorkflow(workflowID);
+  assert.equal(await DBOS.retrieveWorkflow<string>(workflowID).getResult(), 'fresh');
+  assert.equal(cancelStreamMock.streamCalls, callsBefore + 2);
+  // The durable stream shows only the re-run's output.
+  assert.equal(streamedText(visible(await readChunks(workflowID, 'ui'))), 'fresh');
+  cancelStreamGate.release();
+});
+
+test('workflow cancel: a generate call is aborted and resume re-runs it', async (t) => {
+  if (!cancelSignalSupported) return t.skip('requires DBOS 5.1+');
+  cancelGenerateMock.parkNext = true;
+  cancelGenerateMock.generateResults.push(textResponse('fresh'));
+  const parkedBefore = cancelGenerateMock.parked;
+  const rejectedBefore = cancelGenerateMock.rejected;
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(cancelGenerateWorkflow, { workflowID })();
+  await until(() => cancelGenerateMock.parked === parkedBefore + 1);
+  await DBOS.cancelWorkflow(workflowID);
+  await until(() => cancelGenerateMock.rejected === rejectedBefore + 1);
+  await assert.rejects(handle.getResult());
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.ok(!(await DBOS.listWorkflowSteps(workflowID))!.some((s) => s.name === 'mock.mock-model.generate'));
+  await DBOS.resumeWorkflow(workflowID);
+  assert.equal(await DBOS.retrieveWorkflow<string>(workflowID).getResult(), 'fresh');
+});
+
+for (const [kind, workflow] of [
+  ['durableTools', cancelToolWorkflow],
+  ['durableMCPTools', cancelMcpWorkflow],
+] as const) {
+  test(`workflow cancel: a ${kind} tool call is aborted and records no outcome`, async (t) => {
+    if (!cancelSignalSupported) return t.skip('requires DBOS 5.1+');
+    cancelToolMock.generateResults.push(toolCallResponse('park', '{}'));
+    const startedBefore = cancelToolState.started;
+    const abortedBefore = cancelToolState.aborted;
+    const workflowID = randomUUID();
+    const handle = await DBOS.startWorkflow(workflow, { workflowID })();
+    await until(() => cancelToolState.started === startedBefore + 1);
+    await DBOS.cancelWorkflow(workflowID);
+    await until(() => cancelToolState.aborted === abortedBefore + 1);
+    await assert.rejects(handle.getResult());
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const steps = (await DBOS.listWorkflowSteps(workflowID))!;
+    assert.ok(!steps.some((s) => s.name.includes('park')));
+    // No tool error reaches readers: the turn ends with an abort.
+    assert.ok(!(await readRecords(workflowID, 'ui')).some((r) => r.kind === 'tool'));
+    assert.deepEqual(visible(await readChunks(workflowID, 'ui')).at(-1), { type: 'abort' });
+  });
+}

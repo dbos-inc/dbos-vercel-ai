@@ -20,7 +20,7 @@ import type {
   SharedV4ProviderMetadata,
   SharedV4Warning,
 } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
-import { assertNotInTransaction, isInWorkflowFunction, restoreAISDKErrorIdentity, withErrorClassification } from './internal';
+import { anySignal, assertNotInTransaction, isInWorkflowFunction, restoreAISDKErrorIdentity, stepCancelSignal, withErrorClassification } from './internal';
 import { type DurableStreamOptions, ModelStreamWriter, resolveDurableStream } from './durable-stream';
 
 export interface DurableCallsOptions extends StepConfig {
@@ -75,7 +75,10 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
       try {
         return await DBOS.runStep(
           async () => {
-            const result = ensureResponseMetadata(encodeBinaryContent(omitBodies(await doGenerate(), include)));
+            // The provider call also stops when the attempt times out or the workflow is cancelled.
+            const signal = anySignal(params.abortSignal, DBOS.stepStatus?.timeoutSignal, stepCancelSignal());
+            const raw = signal === params.abortSignal ? await doGenerate() : await model.doGenerate({ ...params, abortSignal: signal });
+            const result = ensureResponseMetadata(encodeBinaryContent(omitBodies(raw, include)));
             // A non-streaming call writes its whole output at once, so the stream holds every call the loop makes, not only streamed ones.
             if (streamConfig) {
               const streamWriter = new ModelStreamWriter(streamConfig);
@@ -157,20 +160,26 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
             const accumulator = new StreamAccumulator();
             // A timed-out attempt is abandoned by DBOS (its outcome is discarded) but keeps running; stop it so it can't emit alongside a retry.
             const timeoutSignal = DBOS.stepStatus?.timeoutSignal;
+            // A workflow cancel is not a consumer abort: it must fail the attempt so nothing is checkpointed and a resume re-runs the call.
+            const cancelSignal = stepCancelSignal();
+            const cancelledWorkflow = () => cancelSignal?.aborted === true;
+            const providerSignal = anySignal(abortSignal, timeoutSignal, cancelSignal);
             let reader: ReadableStreamDefaultReader<LanguageModelV4StreamPart> | undefined;
             let sawFinish = false;
             const abandon = () => void reader?.cancel().catch(() => {});
             timeoutSignal?.addEventListener('abort', abandon, { once: true });
+            cancelSignal?.addEventListener('abort', abandon, { once: true });
             // A consumer abort tears the provider call down too; the attempt is then recorded as aborted below.
             abortSignal?.addEventListener('abort', abandon, { once: true });
             // Step-scope stream writes: cheap, replay-safe, and never duplicated since a retry is refused once content has streamed.
             const streamWriter = streamConfig ? new ModelStreamWriter(streamConfig) : undefined;
             try {
-              reader = (await doStream()).stream.getReader();
+              const result = providerSignal === abortSignal ? await doStream() : await model.doStream({ ...params, abortSignal: providerSignal });
+              reader = result.stream.getReader();
               for (;;) {
                 const { done, value: part } = await reader.read();
                 if (timeoutSignal?.aborted) throw (timeoutSignal.reason ?? new Error('step attempt timed out'));
-                if (done || aborted()) break;
+                if (done || aborted() || cancelledWorkflow()) break;
                 if (part.type === 'error') {
                   // A cancelled consumer abandoned this call; don't let a late failure become the step outcome, or replay would fail where the live run succeeded.
                   if (cancelled) break;
@@ -183,20 +192,25 @@ export function durableCalls(options: DurableCallsOptions = {}): LanguageModelMi
                 accumulator.add(part);
               }
               // No terminal part and no output: fail (retryably) like the AI SDK's NoOutputGeneratedError, instead of checkpointing a permanent empty success.
-              if (!sawFinish && !accumulator.hasContent && !cancelled && !aborted()) {
+              if (!sawFinish && !accumulator.hasContent && !cancelled && !aborted() && !cancelledWorkflow()) {
                 throw new Error('Model stream ended without a finish part or any output.');
               }
             } catch (error) {
-              // Same rule for stream-level failures (doStream or a read rejecting) after a cancel; after an abort, the abort is the outcome.
-              if (!cancelled && !aborted()) {
+              // Same rule for stream-level failures (doStream or a read rejecting) after a cancel; after an abort or a workflow cancel, that is the outcome.
+              if (!cancelled && !aborted() && !cancelledWorkflow()) {
                 await streamWriter?.abandon();
                 throw error;
               }
             } finally {
               timeoutSignal?.removeEventListener('abort', abandon);
+              cancelSignal?.removeEventListener('abort', abandon);
               abortSignal?.removeEventListener('abort', abandon);
               // Tear down the provider stream on early exits (error part, post-cancel break); a no-op after a clean drain.
               void reader?.cancel().catch(() => {});
+            }
+            if (cancelledWorkflow()) {
+              await streamWriter?.abandon();
+              throw cancelSignal!.reason;
             }
             // Record the abort as the step's failure; replay rethrows it, so the workflow must catch aborts it means to survive.
             if (aborted()) {
@@ -272,14 +286,17 @@ export function durableEmbeddingCalls(options: StepConfig = {}): EmbeddingModelM
       then: (onfulfilled, onrejected) =>
         Promise.resolve(isInWorkflowFunction() ? false : model.supportsParallelCalls).then(onfulfilled, onrejected),
     }),
-    wrapEmbed: async ({ doEmbed, model }) => {
+    wrapEmbed: async ({ doEmbed, params, model }) => {
       assertNotInTransaction('embed');
       if (!isInWorkflowFunction()) {
         return await doEmbed();
       }
       const workflowID = await enterDurableModelCall();
       try {
-        return await DBOS.runStep(async () => doEmbed(), {
+        return await DBOS.runStep(async () => {
+          const signal = anySignal(params.abortSignal, DBOS.stepStatus?.timeoutSignal, stepCancelSignal());
+          return signal === params.abortSignal ? doEmbed() : model.doEmbed({ ...params, abortSignal: signal });
+        }, {
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'embed'),
         });
@@ -301,13 +318,16 @@ export function durableImageCalls(options: StepConfig = {}): ImageModelMiddlewar
   const stepConfig = withErrorClassification(options);
   return {
     specificationVersion: 'v4',
-    wrapGenerate: async ({ doGenerate, model }) => {
+    wrapGenerate: async ({ doGenerate, params, model }) => {
       assertNotInTransaction('generateImage');
       if (!isInWorkflowFunction()) {
         return await doGenerate();
       }
       try {
-        return await DBOS.runStep(async () => encodeImageResult(await doGenerate()), {
+        return await DBOS.runStep(async () => {
+          const signal = anySignal(params.abortSignal, DBOS.stepStatus?.timeoutSignal, stepCancelSignal());
+          return encodeImageResult(signal === params.abortSignal ? await doGenerate() : await model.doGenerate({ ...params, abortSignal: signal }));
+        }, {
           ...stepConfig,
           name: stepConfig.name ?? stepName(model, 'image'),
         });

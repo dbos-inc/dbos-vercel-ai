@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet, UIMessageChunk, UIMessageStreamWriter } from 'ai' with { 'resolution-mode': 'import' };
-import { assertNotInTransaction, isAsyncIterable, isInWorkflowFunction, runDurableStep, withErrorClassification } from './internal';
+import { anySignal, assertNotInTransaction, isAsyncIterable, isInWorkflowFunction, runDurableStep, stepCancelSignal, withErrorClassification } from './internal';
 import { AGENT_TOOL } from './agent-tool';
 import { writeDurableStream, writeToolRecord } from './durable-stream';
 
@@ -141,9 +141,9 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
         return runDurableStep(
           `${prefix}.${execOptions.toolCallId}`,
           async () => {
-            // A timed-out attempt is abandoned by DBOS but keeps running; forward its signal so the tool stops too.
-            const timeoutSignal = DBOS.stepStatus?.timeoutSignal;
-            const abortSignal = timeoutSignal && signal ? AbortSignal.any([signal, timeoutSignal]) : (timeoutSignal ?? signal);
+            // A timed-out attempt is abandoned by DBOS but keeps running, and a cancelled workflow's tool should stop: forward both signals.
+            const cancelSignal = stepCancelSignal();
+            const abortSignal = anySignal(signal, DBOS.stepStatus?.timeoutSignal, cancelSignal);
             const stepWriter = new StepWriter(writer, durableStream);
             let output: unknown;
             try {
@@ -157,7 +157,8 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
               });
               await stepWriter.settle();
             } catch (error) {
-              if (durableStream) await writeToolRecord(durableStream, execOptions.toolCallId, { errorText: errorMessage(error) });
+              // A cancelled workflow's reader ends the turn with an abort; this call has no outcome of its own.
+              if (durableStream && !cancelSignal?.aborted) await writeToolRecord(durableStream, execOptions.toolCallId, { errorText: errorMessage(error) });
               throw error;
             }
             const chunks = stepWriter.chunks;
