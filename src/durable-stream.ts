@@ -288,48 +288,73 @@ function* closeStep(state: ReaderState): Generator<UIMessageChunk> {
   state.detachedParts.clear();
 }
 
+// Records outside the open model call a resume reads past before giving up; a reconnect mid-call finds it at once.
+const RESTORE_SCAN_LIMIT = 100;
+
 /**
  * On resume, rebuild the model call that was open at `offset` by reading back to its start, so the reader continues
  * exactly as an uninterrupted one would: a re-executed attempt is superseded, and step boundaries fall in the same place.
+ * Past RESTORE_SCAN_LIMIT unrelated records it gives up, and the resumed stream only lacks that step's `finish-step`.
  */
 async function restoreOpenCall(client: DurableStreamSource, workflowID: string, key: string, state: ReaderState): Promise<void> {
   let step: number | undefined;
   let attempt: string | undefined;
+  // Set once an earlier step's record is reached: the open call is fully read, and only a finish reason is still wanted.
+  let callRead = false;
+  let budget = RESTORE_SCAN_LIMIT;
   const ended = new Set<string>();
   for (let index = state.offset - 1; index >= 0; index--) {
     let record: DurableStreamRecord;
     try {
       record = await client.readStreamOffset<DurableStreamRecord>(workflowID, key, index, { timeoutSeconds: 0 });
     } catch (error) {
-      // An offset past the stored records has nothing before it to restore from.
-      if (DBOSErrors.isStreamTimeoutError(error)) continue;
+      // A real offset never passes the stored records, so a gap means there is nothing to restore.
+      if (DBOSErrors.isStreamTimeoutError(error)) break;
       throw error;
     }
     if (record.kind === 'end') break;
-    if (record.kind !== 'model' && record.kind !== 'model-end') continue;
-    step ??= record.step;
-    attempt ??= record.attempt;
-    if (record.step !== step) break;
-    if (record.attempt !== attempt) continue;
-    if (record.kind === 'model-end') {
-      state.finishReason ??= record.aborted ? 'other' : record.finishReason?.unified;
+    const model = record.kind === 'model' || record.kind === 'model-end' ? record : undefined;
+    if (model && step === undefined) {
+      step = model.step;
+      attempt = model.attempt;
+    }
+    if (model && !callRead && model.step === step) {
+      if (model.attempt === attempt) restorePart(state, ended, model);
       continue;
     }
-    // Walking backward, a part is open if its start is seen before (i.e. later than) any end.
-    for (const part of [...record.parts].reverse()) {
-      const kind = part.type === 'text-start' || part.type === 'text-end' ? 'text' : part.type === 'reasoning-start' || part.type === 'reasoning-end' ? 'reasoning' : undefined;
-      if (kind === undefined || !('id' in part)) continue;
-      const id = `${record.attempt}:${part.id}`;
-      if (part.type.endsWith('-end')) ended.add(id);
-      else if (!ended.has(id)) {
-        state.openParts.set(id, kind);
-        state.detachedParts.add(id);
-      }
+    if (model) callRead = true;
+    // As in an uninterrupted read, the finish reason carries over from the latest earlier call that ended.
+    if (callRead && (state.finishReason !== undefined || model?.kind === 'model-end')) {
+      if (model?.kind === 'model-end') state.finishReason ??= finishReasonOf(model);
+      break;
     }
+    if (--budget === 0) break;
   }
   if (step === undefined) return;
   state.openStep = step;
   state.openAttempt = attempt;
+}
+
+function finishReasonOf(record: Extract<DurableStreamRecord, { kind: 'model-end' }>): string | undefined {
+  return record.aborted ? 'other' : record.finishReason?.unified;
+}
+
+// One record of the open call, read backward: a part is open if its start comes before (i.e. is read after) any end.
+function restorePart(state: ReaderState, ended: Set<string>, record: Extract<DurableStreamRecord, { kind: 'model' | 'model-end' }>): void {
+  if (record.kind === 'model-end') {
+    state.finishReason ??= finishReasonOf(record);
+    return;
+  }
+  for (const part of [...record.parts].reverse()) {
+    const kind = part.type === 'text-start' || part.type === 'text-end' ? 'text' : part.type === 'reasoning-start' || part.type === 'reasoning-end' ? 'reasoning' : undefined;
+    if (kind === undefined || !('id' in part)) continue;
+    const id = `${record.attempt}:${part.id}`;
+    if (part.type.endsWith('-end')) ended.add(id);
+    else if (!ended.has(id)) {
+      state.openParts.set(id, kind);
+      state.detachedParts.add(id);
+    }
+  }
 }
 
 // A live re-execution of the open step: end the stale attempt's parts and tell the client which ones to discard.
@@ -376,7 +401,7 @@ function* emitRecord(
     }
     case 'model-end':
       // The stream outlives the call: the workflow may run more calls, so only its end (or closeDurableStream) ends the turn.
-      if (record.attempt === state.openAttempt) state.finishReason = record.aborted ? 'other' : record.finishReason?.unified;
+      if (record.attempt === state.openAttempt) state.finishReason = finishReasonOf(record);
       break;
     case 'tool':
       if (record.chunks) {

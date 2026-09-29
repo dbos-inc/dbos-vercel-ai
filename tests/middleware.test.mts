@@ -34,6 +34,7 @@ import {
   durableImageCalls,
   durableMCPTools,
   type DurableStreamRecord,
+  type DurableStreamSource,
   durableTools,
   type MCPClientLike,
   readDurableStream,
@@ -1496,6 +1497,53 @@ const dsHandoffWorkflow = DBOS.registerWorkflow(
   },
   { name: 'dsHandoffWorkflow' },
 );
+
+// Resume fixtures: a long run of data records, and a turn whose last call never wrote its model-end.
+const dsTicksWorkflow = DBOS.registerWorkflow(
+  async (count: number) => {
+    await DBOS.runStep(
+      async () => {
+        for (let i = 0; i < count; i++) await writeDurableStream('ui', [{ type: 'data-tick', id: `tick-${i}`, data: { i } }]);
+      },
+      { name: 'write' },
+    );
+  },
+  { name: 'dsTicksWorkflow' },
+);
+const dsUnfinishedCallWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await DBOS.runStep(
+      async () => {
+        const records: DurableStreamRecord[] = [
+          { kind: 'model', step: 0, attempt: 'a', parts: [{ type: 'text-start', id: 't1' }, { type: 'text-delta', id: 't1', delta: 'one' }, { type: 'text-end', id: 't1' }] },
+          { kind: 'model-end', step: 0, attempt: 'a', finishReason: { unified: 'length', raw: undefined } },
+          { kind: 'model', step: 1, attempt: 'b', parts: [{ type: 'text-start', id: 't1' }, { type: 'text-delta', id: 't1', delta: 'two' }] },
+        ];
+        for (const record of records) await DBOS.writeStream('ui', record);
+      },
+      { name: 'write' },
+    );
+  },
+  { name: 'dsUnfinishedCallWorkflow' },
+);
+// Counts the single-record reads a reader makes.
+function countingClient(): DurableStreamSource & { reads: number } {
+  const client = {
+    reads: 0,
+    readStream: <T,>(workflowID: string, key: string, options?: { offset?: number }) => DBOS.readStream<T>(workflowID, key, options),
+    readStreamOffset: <T,>(workflowID: string, key: string, offset: number, options?: { timeoutSeconds?: number }) => {
+      client.reads++;
+      return DBOS.readStreamOffset<T>(workflowID, key, offset, options);
+    },
+    retrieveWorkflow: (workflowID: string) => DBOS.retrieveWorkflow(workflowID),
+  };
+  return client;
+}
+async function drain(stream: ReadableStream<UIMessageChunk>): Promise<UIMessageChunk[]> {
+  const chunks: UIMessageChunk[] = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return chunks;
+}
 
 // Sub-agents as child workflows.
 const subMock = new MockLanguageModel();
@@ -3623,6 +3671,36 @@ test('durable stream: a resume between steps puts step boundaries where an unint
   const index = full.findIndex((c) => c.type === 'tool-output-available') + 1;
   const offset = (full[index] as { data: { offset: number } }).data.offset;
   assert.deepEqual(await readChunks(workflowID, 'ui', offset), full.slice(index + 1));
+});
+
+test('durable stream: a resume offset past the stored records restores nothing and reads nothing before it', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsTicksWorkflow, { workflowID })(2)).getResult();
+  const client = countingClient();
+  const chunks = await drain(readDurableStream({ workflowID, key: 'ui', offset: 2000, client }));
+  assert.deepEqual(visible(chunks), [{ type: 'finish' }]);
+  // One read finds the gap below the offset, one finds nothing at it.
+  assert.equal(client.reads, 2);
+});
+
+test('durable stream: a resume far from any model call reads back a bounded number of records', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsTicksWorkflow, { workflowID })(300)).getResult();
+  const client = countingClient();
+  const chunks = await drain(readDurableStream({ workflowID, key: 'ui', offset: 290, client }));
+  assert.equal(chunks.filter((c) => c.type === 'data-tick').length, 10);
+  // The scan limit (100) plus the ten remaining records and the empty read after them.
+  assert.equal(client.reads, 100 + 11);
+});
+
+test('durable stream: a resume inside a call that never ended keeps the finish reason of the call before it', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsUnfinishedCallWorkflow, { workflowID })()).getResult();
+  const full = await readChunks(workflowID, 'ui');
+  assert.deepEqual(full.at(-1), { type: 'finish', finishReason: 'length' });
+  // Resume after the unfinished call's first record.
+  const index = full.findIndex((c) => c.type === 'data-dbos-offset' && (c.data as { offset: number }).offset === 3);
+  assert.deepEqual(await readChunks(workflowID, 'ui', 3), full.slice(index + 1));
 });
 
 test('durable stream: a second execution of a model step gets its own attempt id', async () => {
