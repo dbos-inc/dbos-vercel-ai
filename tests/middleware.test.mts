@@ -3982,6 +3982,32 @@ test('toolWriter: outside a workflow chunks go straight to the writer', async ()
   assert.throws(() => toolWriter(), /toolWriter\(\) can only be called/);
 });
 
+test('toolWriter: a streaming tool can write from its body outside a workflow and when opted out', async () => {
+  const streaming = {
+    progress: tool({
+      inputSchema: z.object({}),
+      execute: async function* () {
+        toolWriter().write({ type: 'data-step', data: { n: 1 }, transient: true });
+        yield 'half';
+        await new Promise((resolve) => setImmediate(resolve));
+        toolWriter().write({ type: 'data-step', data: { n: 2 }, transient: true });
+        yield 'done';
+      },
+    }),
+  };
+  for (const options of [{}, { tools: { progress: false as const } }]) {
+    const written: UIMessageChunk[] = [];
+    const writer = { write: (c: UIMessageChunk) => written.push(c), merge: () => {}, onError: undefined };
+    const wrapped = durableTools(streaming, { writer, ...options });
+    const yielded: unknown[] = [];
+    for await (const value of wrapped.progress.execute!({}, { toolCallId: 'c1', messages: [], context: undefined as never }) as AsyncIterable<unknown>) {
+      yielded.push(value);
+    }
+    assert.deepEqual(yielded, ['half', 'done']);
+    assert.deepEqual(written.map((c) => (c as { data: { n: number } }).data.n), [1, 2]);
+  }
+});
+
 test('toolWriter: the reader emits the chunks of a repeated tool record once', async () => {
   const workflowID = randomUUID();
   await (await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })()).getResult();

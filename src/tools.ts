@@ -38,6 +38,21 @@ function isTransient(chunk: UIMessageChunk): boolean {
   return (chunk as { transient?: boolean }).transient === true;
 }
 
+// An async generator's body runs as it is iterated, outside run(); bind each step of the iteration to the writer.
+function runWithWriter(writer: UIMessageStreamWriter, fn: () => unknown): unknown {
+  const result = currentWriter.run(writer, fn);
+  if (!isAsyncIterable(result)) return result;
+  const iterator = currentWriter.run(writer, () => result[Symbol.asyncIterator]());
+  return {
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    next: (...args: [] | [unknown]) => currentWriter.run(writer, () => iterator.next(...args)),
+    return: (value?: unknown) => currentWriter.run(writer, () => iterator.return?.(value) ?? Promise.resolve({ done: true as const, value })),
+    throw: (error?: unknown) => currentWriter.run(writer, () => iterator.throw?.(error) ?? Promise.reject(error)),
+  };
+}
+
 // Outside a step: every chunk goes straight to the writer, or nowhere.
 function liveWriter(writer: UIMessageStreamWriter | undefined): UIMessageStreamWriter {
   return writer ?? { write() {}, merge() {}, onError: undefined };
@@ -118,7 +133,7 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
     if (override === false) {
       durable[name] = {
         ...definition,
-        execute: (input: unknown, execOptions: Parameters<ToolExecute>[1]) => currentWriter.run(live, () => execute(input, execOptions)),
+        execute: (input: unknown, execOptions: Parameters<ToolExecute>[1]) => runWithWriter(live, () => execute(input, execOptions)),
       } as ToolSet[string];
       continue;
     }
@@ -130,7 +145,7 @@ export function durableTools<TOOLS extends ToolSet>(tools: TOOLS, options: Durab
       ...definition,
       execute: (input: unknown, execOptions: Parameters<ToolExecute>[1]) => {
         assertNotInTransaction(name);
-        if (!isInWorkflowFunction()) return currentWriter.run(live, () => execute(input, execOptions));
+        if (!isInWorkflowFunction()) return runWithWriter(live, () => execute(input, execOptions));
         const signal = execOptions.abortSignal;
         // An aborted call is done whatever the failure looks like; a retry would re-run a cancelled side effect.
         const callConfig: StepConfig = {

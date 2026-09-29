@@ -42,7 +42,7 @@ console.log(await researchAgent('Why did the agent cross the road?'));
 npm install @dbos-inc/vercel-ai @dbos-inc/dbos-sdk ai
 ```
 
-Requires DBOS v4.21+ or v5, AI SDK v7+, and a Postgres database for DBOS.
+Requires DBOS v4.27+ or v5, AI SDK v7+, and a Postgres database for DBOS.
 
 ## Durable Model Calls
 

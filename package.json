@@ -44,7 +44,7 @@
     "agent"
   ],
   "peerDependencies": {
-    "@dbos-inc/dbos-sdk": "^4.21.0 || ^5.0.0",
+    "@dbos-inc/dbos-sdk": "^4.27.0 || ^5.0.0",
     "ai": "^7.0.0"
   },
   "devDependencies": {
