@@ -218,15 +218,15 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     }
   }
   const finalAttempt = new Map<number, string>();
-  // A re-executed tool call writes another record; the last one matches its checkpoint, so only its chunks are shown.
-  const finalToolChunks = new Map<string, number>();
+  // A re-executed tool call writes another record; the last one matches its checkpoint, so only its chunks (if any) are shown.
+  const finalToolRecord = new Map<string, number>();
   history.forEach((record, index) => {
     if (record.kind === 'model' || record.kind === 'model-end') finalAttempt.set(record.step, record.attempt);
-    if (record.kind === 'tool' && record.chunks) finalToolChunks.set(toolKey(record), index);
+    if (record.kind === 'tool') finalToolRecord.set(toolKey(record), index);
   });
   for (const [index, record] of history.entries()) {
     const stale = (record.kind === 'model' || record.kind === 'model-end') && finalAttempt.get(record.step) !== record.attempt;
-    const staleChunks = record.kind === 'tool' && record.chunks !== undefined && finalToolChunks.get(toolKey(record)) !== index;
+    const staleChunks = record.kind === 'tool' && record.chunks !== undefined && finalToolRecord.get(toolKey(record)) !== index;
     yield* stale ? skipRecord(state) : emit(staleChunks ? { ...record, chunks: undefined } : record);
     if (state.ended) return;
   }
@@ -403,16 +403,17 @@ function* emitRecord(
       // The stream outlives the call: the workflow may run more calls, so only its end (or closeDurableStream) ends the turn.
       if (record.attempt === state.openAttempt) state.finishReason = finishReasonOf(record);
       break;
-    case 'tool':
-      if (record.chunks) {
-        const key = toolKey(record);
-        const digest = createHash('sha256').update(JSON.stringify(record.chunks)).digest('base64');
-        const sent = state.toolChunksSent.get(key);
-        // A live re-execution that wrote the same chunks changes nothing; different ones replace what the client has.
+    case 'tool': {
+      const key = toolKey(record);
+      const chunks = record.chunks ?? [];
+      const sent = state.toolChunksSent.get(key);
+      // A live re-execution that wrote the same chunks changes nothing; different ones (or none) replace what the client has.
+      if (chunks.length > 0 || sent !== undefined) {
+        const digest = createHash('sha256').update(JSON.stringify(chunks)).digest('base64');
         if (sent !== digest) {
           if (sent !== undefined) yield { type: 'data-dbos-tool-superseded', data: { toolCallId: record.toolCallId }, transient: true } as UIMessageChunk;
           state.toolChunksSent.set(key, digest);
-          yield* record.chunks;
+          yield* chunks;
         }
       }
       // Local tool errors are masked like the AI SDK does; provider-executed ones (in model records) pass through verbatim.
@@ -420,6 +421,7 @@ function* emitRecord(
         ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: filter.onError(new Error(record.errorText)) }
         : { type: 'tool-output-available', toolCallId: record.toolCallId, output: record.output };
       break;
+    }
     case 'ui':
       yield* record.chunks;
       break;

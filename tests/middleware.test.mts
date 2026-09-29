@@ -1740,13 +1740,20 @@ const toolRecord = (step: number, output: string, sourceId: string): DurableStre
   output,
   chunks: [{ type: 'source-url', sourceId, url: `https://example.com/${sourceId}` }],
 });
+// The re-execution writes different chunks, the same ones, or none because it fails.
+type Rerun = 'changed' | 'same' | 'failed';
+const rerunRecord: Record<Rerun, DurableStreamRecord> = {
+  changed: toolRecord(0, 'second', 's2'),
+  same: toolRecord(0, 'first', 's1'),
+  failed: { kind: 'tool', step: 0, attempt: 1, toolCallId: 'call-1', errorText: 'boom' },
+};
 const twRepeatWorkflow = DBOS.registerWorkflow(
-  async (identical: boolean) => {
+  async (rerun: Rerun) => {
     await DBOS.runStep(
       async () => {
         await DBOS.writeStream('ui', toolRecord(0, 'first', 's1'));
         await twRepeatGate.promise;
-        await DBOS.writeStream('ui', identical ? toolRecord(0, 'first', 's1') : toolRecord(0, 'second', 's2'));
+        await DBOS.writeStream('ui', rerunRecord[rerun]);
         await DBOS.writeStream('ui', toolRecord(3, 'other', 's3'));
       },
       { name: 'write' },
@@ -4214,7 +4221,7 @@ test('toolWriter: a stored history shows only the last record chunks for a re-ex
   twRepeatGate = newGate();
   twRepeatGate.release();
   const workflowID = randomUUID();
-  await (await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })(false)).getResult();
+  await (await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })('changed')).getResult();
   assert.deepEqual(toolSummary(visible(await readChunks(workflowID, 'ui'))), [
     'start',
     'output:first',
@@ -4226,10 +4233,10 @@ test('toolWriter: a stored history shows only the last record chunks for a re-ex
   ]);
 });
 
-async function readRepeatLive(identical: boolean): Promise<string[]> {
+async function readRepeatLive(rerun: Rerun): Promise<string[]> {
   twRepeatGate = newGate();
   const workflowID = randomUUID();
-  const handle = await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })(identical);
+  const handle = await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })(rerun);
   await until(async () => (await readRecordsSoFar(workflowID)) >= 1);
   const reader = readDurableStream({ workflowID, key: 'ui' }).getReader();
   const seen: UIMessageChunk[] = [];
@@ -4250,7 +4257,7 @@ async function readRepeatLive(identical: boolean): Promise<string[]> {
 }
 
 test('toolWriter: a live reader is told to discard the earlier chunks of a re-executed call', async () => {
-  assert.deepEqual(await readRepeatLive(false), [
+  assert.deepEqual(await readRepeatLive('changed'), [
     'start',
     'source:s1',
     'output:first',
@@ -4264,7 +4271,32 @@ test('toolWriter: a live reader is told to discard the earlier chunks of a re-ex
 });
 
 test('toolWriter: a live reader does not repeat chunks a re-execution wrote again unchanged', async () => {
-  assert.deepEqual(await readRepeatLive(true), ['start', 'source:s1', 'output:first', 'output:first', 'source:s3', 'output:other', 'finish']);
+  assert.deepEqual(await readRepeatLive('same'), ['start', 'source:s1', 'output:first', 'output:first', 'source:s3', 'output:other', 'finish']);
+});
+
+test('toolWriter: a re-execution that wrote no chunks hides the earlier ones, stored or live', async () => {
+  const workflowID = randomUUID();
+  twRepeatGate = newGate();
+  twRepeatGate.release();
+  await (await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })('failed')).getResult();
+  assert.deepEqual(toolSummary(visible(await readChunks(workflowID, 'ui'))), [
+    'start',
+    'output:first',
+    'tool-output-error',
+    'source:s3',
+    'output:other',
+    'finish',
+  ]);
+  assert.deepEqual(await readRepeatLive('failed'), [
+    'start',
+    'source:s1',
+    'output:first',
+    'superseded:call-1',
+    'tool-output-error',
+    'source:s3',
+    'output:other',
+    'finish',
+  ]);
 });
 
 test('toolWriter: a timed-out attempt that finishes late writes no stream record', async () => {
