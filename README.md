@@ -139,10 +139,13 @@ const chatTurn = DBOS.registerWorkflow(async (messages: ModelMessage[]) => {
   return await result.text;
 }, { name: 'chatTurn' });
 
-const handle = await DBOS.startWorkflow(chatTurn)(messages);
-return createUIMessageStreamResponse({
-  stream: readDurableStream({ workflowID: handle.workflowID, key: 'ui', messageId }),
-});
+export async function POST(req: Request) {
+  const { messages, messageId } = (await req.json()) as { messages: ModelMessage[]; messageId: string };
+  const handle = await DBOS.startWorkflow(chatTurn)(messages);
+  return createUIMessageStreamResponse({
+    stream: readDurableStream({ workflowID: handle.workflowID, key: 'ui', messageId }),
+  });
+}
 ```
 
 You can read from a durable stream using `readDurableStream`, for example to stream it to a UI.
@@ -196,9 +199,13 @@ import { durableMCPTools } from '@dbos-inc/vercel-ai';
 
 const agent = DBOS.registerWorkflow(async (question: string) => {
   const mcpClient = await createMCPClient({ transport: { type: 'http', url: MCP_URL } });
-  const tools = await durableMCPTools(mcpClient);
-  const result = await generateText({ model, prompt: question, tools, stopWhen: stepCountIs(10) });
-  return result.text;
+  try {
+    const tools = await durableMCPTools(mcpClient);
+    const result = await generateText({ model, prompt: question, tools, stopWhen: stepCountIs(10) });
+    return result.text;
+  } finally {
+    await mcpClient.close();
+  }
 }, { name: 'mcpAgent' });
 ```
 
@@ -250,7 +257,10 @@ const embeddingModel = wrapEmbeddingModel({
   middleware: durableEmbeddingCalls({ retriesAllowed: true }),
 });
 
-const { embeddings } = await embedMany({ model: embeddingModel, values: chunks });
+const embedChunks = DBOS.registerWorkflow(async (chunks: string[]) => {
+  const { embeddings } = await embedMany({ model: embeddingModel, values: chunks });
+  return embeddings;
+}, { name: 'embedChunks' });
 ```
 
 ## Durable Image Models
@@ -263,6 +273,9 @@ import { durableImageCalls } from '@dbos-inc/vercel-ai';
 
 const imageModel = wrapImageModel({ model: openai.imageModel('gpt-image-1'), middleware: durableImageCalls() });
 
-const { images } = await generateImage({ model: imageModel, prompt: 'a durable cat' });
+const drawImage = DBOS.registerWorkflow(async (prompt: string) => {
+  const { images } = await generateImage({ model: imageModel, prompt });
+  return images.map((image) => image.base64);
+}, { name: 'drawImage' });
 ```
 
