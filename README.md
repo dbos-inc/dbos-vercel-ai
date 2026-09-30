@@ -155,7 +155,7 @@ Chunks from a tool call are written when the tool call succeeds (`transient: tru
 To also include them in the response message your workflow builds, pass your `createUIMessageStream` writer to `durableTools`:
 
 ```ts
-import { createUIMessageStream, streamText } from 'ai';
+import { consumeStream, createUIMessageStream, streamText } from 'ai';
 import { durableTools, toolWriter } from '@dbos-inc/vercel-ai';
 
 const search = tool({
@@ -168,13 +168,16 @@ const search = tool({
   },
 });
 
-const stream = createUIMessageStream({
-  execute: ({ writer }) => {
-    const tools = durableTools({ search }, { durableStream: 'ui', writer });
-    writer.merge(streamText({ model, messages, tools }).toUIMessageStream());
-  },
-  onFinish: ({ responseMessage }) => saveMessage(responseMessage),
-});
+const chatTurn = DBOS.registerWorkflow(async (messages: ModelMessage[]) => {
+  const stream = createUIMessageStream({
+    execute: ({ writer }) => {
+      const tools = durableTools({ search }, { durableStream: 'ui', writer });
+      writer.merge(streamText({ model, messages, tools, stopWhen: stepCountIs(10) }).toUIMessageStream());
+    },
+    onFinish: ({ responseMessage }) => saveMessage(responseMessage),
+  });
+  await consumeStream({ stream });
+}, { name: 'chatTurn' });
 ```
 
 Your streams are closed when your workflow finishes; you can also close a stream early using `closeDurableStream`.
