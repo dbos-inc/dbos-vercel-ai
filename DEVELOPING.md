@@ -40,48 +40,51 @@ npm pack --dry-run      # inspect the exact tarball contents
 
 # Releasing
 
-This package versions and publishes exactly like the other `@dbos-inc/*`
-packages, using [Nerdbank.GitVersioning](https://github.com/dotnet/Nerdbank.GitVersioning)
-(NBGV) to derive the version from git history.
+Release from the tip of `main` with one command, giving the version explicitly:
 
-## How versioning works
+```sh
+npm run release -- --version 0.6
+```
 
-- The committed `package.json` version is the placeholder `0.0.0-placeholder`.
-  The real version is never committed — it is computed and stamped at publish
-  time so there are no version-bump commits or merge conflicts.
-- `version.json` holds the base version (currently `0.1-preview`). NBGV appends a
-  git-height component, producing versions like `0.1.42-preview`.
-- The `-preview` suffix marks this integration as experimental. While it is
-  present, published builds get the `preview` npm dist-tag, so a plain
-  `npm install @dbos-inc/vercel-ai` (which resolves `latest`) will not pick them
-  up until a stable release exists.
+With a clean `main` identical to `origin/main`, this tags `main` as `v0.6`,
+pushes the tag together with a new `release/v0.6` branch, then runs the publish
+workflow on that branch and waits for it. Everything is checked before anything
+is pushed, and no commit is made on any branch.
+
+To patch a release, merge the fix into `release/vX.Y`, then:
+
+```sh
+npm run release -- --patch 0.6
+```
+
+This tags the tip of the branch `v0.6.Z`, pushes the tag, and publishes from the
+branch. Every published release is a tag; never add a release tag by hand.
+
+Both commands are safe to rerun: a tag already on origin whose version never
+reached npm has only its publish repeated. Pass `--no-publish` to tag and push
+without publishing. You need the [GitHub CLI](https://cli.github.com/) logged
+in with the `repo` and `workflow` scopes, and permission to push tags and
+branches. Release branches from before tag-based versioning (`release/v0.5` and
+earlier) cannot be patched this way.
+
+## Versions
+
+The committed `package.json` version is the placeholder `0.0.0-placeholder`.
+`publish/version.mjs` derives the real version from the nearest `vX.Y[.Z]` tag
+and the commits since it, and the publish workflow stamps it at publish time.
+Run it on any checkout to see what a build of the current branch would be:
+
+| Branch         | Version                                         | npm dist-tag |
+| -------------- | ----------------------------------------------- | ------------ |
+| `release/vX.Y` | `X.Y.0` at tag `vX.Y`, then `X.Y.Z` at `vX.Y.Z` | `latest`     |
+| `main`         | `X.(Y+1).<commits since tag>-preview`           | `preview`    |
+| anything else  | `X.(Y+1).<commits since tag>-test.<sha>`        | `test`       |
 
 ## Publishing
 
-Publishing is manual, via the **Publish to npm** GitHub Action
-(`.github/workflows/publish.yml`, triggered with *Run workflow*). On each run it:
-
-1. Installs, then runs `npm run check:package` (build + `publint` + `attw`) and
-   the test suite dependencies — a build that fails validation never publishes.
-2. Stamps the NBGV-computed version into `package.json`.
-3. Publishes to npm with a dist-tag chosen from the branch and version:
-
-   | Branch                    | Version         | npm dist-tag |
-   | ------------------------- | --------------- | ------------ |
-   | `main` / `release/v*`     | `-preview`      | `preview`    |
-   | `main` / `release/v*`     | stable          | `latest`     |
-   | any other branch          | any             | `test`       |
-
-   Run the workflow with **dry-run** checked to pack and validate without
-   publishing.
-
-Requires an npm automation token in the `NPM_PUBLISH_TOKEN` repository secret,
-with publish rights to the `@dbos-inc` scope.
-
-## Cutting a stable (non-preview) release
-
-1. Drop the prerelease tag by running `nbgv prepare-release` (creates a
-   `release/v0.1` branch and bumps `main` to the next version), **or** edit
-   `version.json` to remove `-preview`.
-2. Run the **Publish to npm** workflow from that branch. With no prerelease
-   suffix, the build publishes under the `latest` tag.
+`.github/workflows/publish_npm.yml` runs on every push to `main`, so each merge
+publishes a preview. Dispatching it manually on any other branch publishes a
+`test` build, which exercises the publish path without touching `latest` or
+`preview`. It authenticates to npm with
+[trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC), so no
+npm token is stored in the repo.

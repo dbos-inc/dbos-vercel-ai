@@ -1,0 +1,49 @@
+name: Publish current branch to npm
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+# Serialize publishes per branch so an older build never moves a dist-tag after a newer one.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing authenticates with an OIDC token instead of a secret
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the version is derived from tags and commit history
+          fetch-tags: true
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Update npm # trusted publishing needs npm 11.5.1 or later
+        run: npm install -g npm@latest
+
+      - run: npm ci
+
+      - name: Compute version
+        id: version
+        run: node publish/version.mjs
+
+      - name: Stamp version
+        run: npm pkg set version=${{ steps.version.outputs.version }}
+
+      - name: Validate package (build, publint, attw)
+        run: npm run check:package
+
+      - name: Publish ${{ steps.version.outputs.version }} to npm as ${{ steps.version.outputs.dist_tag }}
+        run: npm publish --access public --tag ${{ steps.version.outputs.dist_tag }}
