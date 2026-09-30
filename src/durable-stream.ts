@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DBOS, Error as DBOSErrors, StatusString } from '@dbos-inc/dbos-sdk';
 import type { UIMessageChunk } from 'ai' with { 'resolution-mode': 'import' };
 import type { LanguageModelV4FinishReason, LanguageModelV4StreamPart } from '@ai-sdk/provider' with { 'resolution-mode': 'import' };
@@ -10,7 +10,7 @@ export type DurableStreamOptions = string | { key: string; maxBatchParts?: numbe
 export type DurableStreamRecord =
   | { kind: 'model'; step: number; attempt: string; parts: LanguageModelV4StreamPart[] }
   | { kind: 'model-end'; step: number; attempt: string; finishReason?: LanguageModelV4FinishReason; aborted?: true }
-  | { kind: 'tool'; step: number; attempt: number; toolCallId: string; output?: unknown; errorText?: string }
+  | { kind: 'tool'; step: number; attempt: number; toolCallId: string; output?: unknown; errorText?: string; chunks?: UIMessageChunk[] }
   | { kind: 'ui'; step?: number; attempt?: number; chunks: UIMessageChunk[] }
   | { kind: 'end'; finishReason: string };
 
@@ -123,9 +123,14 @@ export class ModelStreamWriter {
   }
 }
 
-/** Records a tool call's outcome from inside its step. */
-export function writeToolRecord(key: string, toolCallId: string, outcome: { output: unknown } | { errorText: string }): Promise<void> {
-  const record: DurableStreamRecord = { kind: 'tool', ...stepInfo(), toolCallId, ...outcome };
+/** Records a tool call's outcome, with the message chunks it wrote, from inside its step. */
+export function writeToolRecord(
+  key: string,
+  toolCallId: string,
+  outcome: { output: unknown } | { errorText: string },
+  chunks: UIMessageChunk[] = [],
+): Promise<void> {
+  const record: DurableStreamRecord = { kind: 'tool', ...stepInfo(), toolCallId, ...outcome, ...(chunks.length > 0 && { chunks }) };
   return DBOS.writeStream(key, record);
 }
 
@@ -158,7 +163,10 @@ export interface ReadDurableStreamOptions {
   key: string;
   /** Id for the `start` chunk; omitted on a resume (`offset` > 0). */
   messageId?: string;
-  /** Number of records already consumed, from the last `data-dbos-offset` chunk. */
+  /**
+   * Number of records already consumed, from the last `data-dbos-offset` chunk. A resume from mid-text can't be applied
+   * to a partial message by the AI SDK (it has no record of the open part); to rebuild a message, read from 0 instead.
+   */
   offset?: number;
   /** Defaults to `DBOS`; pass a `DBOSClient` to read from a process that has not launched DBOS. */
   client?: DurableStreamSource;
@@ -190,11 +198,13 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
   const client: DurableStreamSource = options.client ?? DBOS;
   const state: ReaderState = {
     offset: options.offset ?? 0,
-    resumed: (options.offset ?? 0) > 0,
     openParts: new Map(),
+    detachedParts: new Set(),
+    toolChunksSent: new Map(),
     ended: false,
   };
   if (state.offset === 0) yield { type: 'start', messageId: options.messageId };
+  else await restoreOpenCall(client, workflowID, key, state);
   const emit = (record: DurableStreamRecord) => emitRecord(state, record, { sendReasoning, sendSources, onError });
 
   // Phase 1: everything already stored, one value per query until an offset is empty; a superseded attempt is skipped whole.
@@ -208,12 +218,16 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
     }
   }
   const finalAttempt = new Map<number, string>();
-  for (const record of history) {
+  // A re-executed tool call writes another record; the last one matches its checkpoint, so only its chunks (if any) are shown.
+  const finalToolRecord = new Map<string, number>();
+  history.forEach((record, index) => {
     if (record.kind === 'model' || record.kind === 'model-end') finalAttempt.set(record.step, record.attempt);
-  }
-  for (const record of history) {
+    if (record.kind === 'tool') finalToolRecord.set(toolKey(record), index);
+  });
+  for (const [index, record] of history.entries()) {
     const stale = (record.kind === 'model' || record.kind === 'model-end') && finalAttempt.get(record.step) !== record.attempt;
-    yield* stale ? skipRecord(state) : emit(record);
+    const staleChunks = record.kind === 'tool' && record.chunks !== undefined && finalToolRecord.get(toolKey(record)) !== index;
+    yield* stale ? skipRecord(state) : emit(staleChunks ? { ...record, chunks: undefined } : record);
     if (state.ended) return;
   }
 
@@ -240,13 +254,21 @@ async function* uiChunks(options: ReadDurableStreamOptions): AsyncGenerator<UIMe
 
 interface ReaderState {
   offset: number;
-  resumed: boolean;
   openStep?: number;
   openAttempt?: string;
   // Text/reasoning parts of the open attempt that have started but not ended, by UI part id.
   openParts: Map<string, 'text' | 'reasoning'>;
+  // Open parts from before a resume: the client's resumed stream no longer tracks them, so they are never ended.
+  detachedParts: Set<string>;
+  // Digest of the chunks emitted for each tool call (by toolKey).
+  toolChunksSent: Map<string, string>;
   finishReason?: string;
   ended: boolean;
+}
+
+// A step's function id survives re-execution, and with it tell apart calls that reuse a provider's tool call id.
+function toolKey(record: Extract<DurableStreamRecord, { kind: 'tool' }>): string {
+  return `${record.step}:${record.toolCallId}`;
 }
 
 function offsetChunk(state: ReaderState): UIMessageChunk {
@@ -263,17 +285,90 @@ function* closeStep(state: ReaderState): Generator<UIMessageChunk> {
   state.openStep = undefined;
   state.openAttempt = undefined;
   state.openParts.clear();
+  state.detachedParts.clear();
+}
+
+// Records outside the open model call a resume reads past before giving up; a reconnect mid-call finds it at once.
+const RESTORE_SCAN_LIMIT = 100;
+
+/**
+ * On resume, rebuild the model call that was open at `offset` by reading back to its start, so the reader continues
+ * exactly as an uninterrupted one would: a re-executed attempt is superseded, and step boundaries fall in the same place.
+ * Past RESTORE_SCAN_LIMIT unrelated records it gives up, and the resumed stream only lacks that step's `finish-step`.
+ */
+async function restoreOpenCall(client: DurableStreamSource, workflowID: string, key: string, state: ReaderState): Promise<void> {
+  let step: number | undefined;
+  let attempt: string | undefined;
+  // Set once an earlier step's record is reached: the open call is fully read, and only a finish reason is still wanted.
+  let callRead = false;
+  let budget = RESTORE_SCAN_LIMIT;
+  const ended = new Set<string>();
+  for (let index = state.offset - 1; index >= 0; index--) {
+    let record: DurableStreamRecord;
+    try {
+      record = await client.readStreamOffset<DurableStreamRecord>(workflowID, key, index, { timeoutSeconds: 0 });
+    } catch (error) {
+      // A real offset never passes the stored records, so a gap means there is nothing to restore.
+      if (DBOSErrors.isStreamTimeoutError(error)) break;
+      throw error;
+    }
+    if (record.kind === 'end') break;
+    const model = record.kind === 'model' || record.kind === 'model-end' ? record : undefined;
+    if (model && step === undefined) {
+      step = model.step;
+      attempt = model.attempt;
+    }
+    if (model && !callRead && model.step === step) {
+      if (model.attempt === attempt) restorePart(state, ended, model);
+      continue;
+    }
+    if (model) callRead = true;
+    // As in an uninterrupted read, the finish reason carries over from the latest earlier call that ended.
+    if (callRead && (state.finishReason !== undefined || model?.kind === 'model-end')) {
+      if (model?.kind === 'model-end') state.finishReason ??= finishReasonOf(model);
+      break;
+    }
+    if (--budget === 0) break;
+  }
+  if (step === undefined) return;
+  state.openStep = step;
+  state.openAttempt = attempt;
+}
+
+function finishReasonOf(record: Extract<DurableStreamRecord, { kind: 'model-end' }>): string | undefined {
+  return record.aborted ? 'other' : record.finishReason?.unified;
+}
+
+// One record of the open call, read backward: a part is open if its start comes before (i.e. is read after) any end.
+function restorePart(state: ReaderState, ended: Set<string>, record: Extract<DurableStreamRecord, { kind: 'model' | 'model-end' }>): void {
+  if (record.kind === 'model-end') {
+    state.finishReason ??= finishReasonOf(record);
+    return;
+  }
+  for (const part of [...record.parts].reverse()) {
+    const kind = part.type === 'text-start' || part.type === 'text-end' ? 'text' : part.type === 'reasoning-start' || part.type === 'reasoning-end' ? 'reasoning' : undefined;
+    if (kind === undefined || !('id' in part)) continue;
+    const id = `${record.attempt}:${part.id}`;
+    if (part.type.endsWith('-end')) ended.add(id);
+    else if (!ended.has(id)) {
+      state.openParts.set(id, kind);
+      state.detachedParts.add(id);
+    }
+  }
 }
 
 // A live re-execution of the open step: end the stale attempt's parts and tell the client which ones to discard.
 function* supersede(state: ReaderState, attempt: string): Generator<UIMessageChunk> {
-  for (const [id, kind] of state.openParts) yield { type: kind === 'text' ? 'text-end' : 'reasoning-end', id };
+  for (const [id, kind] of state.openParts) {
+    if (!state.detachedParts.has(id)) yield { type: kind === 'text' ? 'text-end' : 'reasoning-end', id };
+  }
   yield {
     type: 'data-dbos-superseded',
     data: { attempt: state.openAttempt, parts: [...state.openParts.keys()] },
     transient: true,
   } as UIMessageChunk;
   state.openParts.clear();
+  state.detachedParts.clear();
   state.openAttempt = attempt;
 }
 
@@ -287,8 +382,7 @@ function* emitRecord(
     case 'model': {
       if (state.openStep !== record.step) {
         yield* closeStep(state);
-        if (!state.resumed) yield { type: 'start-step' };
-        state.resumed = false;
+        yield { type: 'start-step' };
         state.openStep = record.step;
         state.openAttempt = record.attempt;
       } else if (state.openAttempt !== record.attempt) {
@@ -307,14 +401,27 @@ function* emitRecord(
     }
     case 'model-end':
       // The stream outlives the call: the workflow may run more calls, so only its end (or closeDurableStream) ends the turn.
-      if (record.attempt === state.openAttempt) state.finishReason = record.aborted ? 'other' : record.finishReason?.unified;
+      if (record.attempt === state.openAttempt) state.finishReason = finishReasonOf(record);
       break;
-    case 'tool':
+    case 'tool': {
+      const key = toolKey(record);
+      const chunks = record.chunks ?? [];
+      const sent = state.toolChunksSent.get(key);
+      // A live re-execution that wrote the same chunks changes nothing; different ones (or none) replace what the client has.
+      if (chunks.length > 0 || sent !== undefined) {
+        const digest = createHash('sha256').update(JSON.stringify(chunks)).digest('base64');
+        if (sent !== digest) {
+          if (sent !== undefined) yield { type: 'data-dbos-tool-superseded', data: { toolCallId: record.toolCallId }, transient: true } as UIMessageChunk;
+          state.toolChunksSent.set(key, digest);
+          yield* chunks;
+        }
+      }
       // Local tool errors are masked like the AI SDK does; provider-executed ones (in model records) pass through verbatim.
       yield record.errorText !== undefined
         ? { type: 'tool-output-error', toolCallId: record.toolCallId, errorText: filter.onError(new Error(record.errorText)) }
         : { type: 'tool-output-available', toolCallId: record.toolCallId, output: record.output };
       break;
+    }
     case 'ui':
       yield* record.chunks;
       break;

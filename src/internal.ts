@@ -21,6 +21,31 @@ export function runDurableStep<T>(name: string, fn: () => Promise<T>, config: St
   });
 }
 
+// DBOS 5.1+ fires stepStatus.cancelSignal when the step's workflow is cancelled; older versions have none.
+export function stepCancelSignal(): AbortSignal | undefined {
+  return (DBOS.stepStatus as { cancelSignal?: AbortSignal } | undefined)?.cancelSignal;
+}
+
+/**
+ * DBOS discards a timed-out attempt's result, so a stream record of it would contradict the checkpoint. Returns the
+ * outcome to record instead: the timeout when the step ends with it, `null` when a retry follows, `undefined` if not timed out.
+ */
+export async function timedOutOutcome(shouldRetry: StepConfig['shouldRetry']): Promise<{ errorText: string } | null | undefined> {
+  const status = DBOS.stepStatus;
+  if (status?.timeoutSignal?.aborted !== true) return undefined;
+  const reason: unknown = status.timeoutSignal.reason;
+  const lastAttempt = status.currentAttempt === undefined || status.currentAttempt >= (status.maxAttempts ?? 1);
+  // DBOS asks the step's shouldRetry about this same error (the signal's reason) before retrying; a throw ends the step.
+  const retried = !lastAttempt && (await Promise.resolve(shouldRetry ? shouldRetry(reason) : true).catch(() => false));
+  return retried ? null : { errorText: reason instanceof Error ? reason.message : 'The step timed out.' };
+}
+
+// Fires when any given signal does; a lone signal is returned as-is.
+export function anySignal(...signals: (AbortSignal | undefined)[]): AbortSignal | undefined {
+  const defined = signals.filter((s): s is AbortSignal => s !== undefined);
+  return defined.length <= 1 ? defined[0] : AbortSignal.any(defined);
+}
+
 export function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return typeof (value as AsyncIterable<unknown> | null | undefined)?.[Symbol.asyncIterator] === 'function';
 }

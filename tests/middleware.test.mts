@@ -7,15 +7,18 @@ import { GatewayRateLimitError } from '@ai-sdk/gateway';
 import { Client as PgClient } from 'pg';
 import {
   asSchema,
+  createUIMessageStream,
   embed,
   type InferToolOutput,
   embedMany,
   generateImage,
   generateText,
+  readUIMessageStream,
   stepCountIs,
   streamText,
   tool,
   ToolLoopAgent,
+  type UIMessage,
   type UIMessageChunk,
   uiMessageChunkSchema,
   wrapEmbeddingModel,
@@ -31,9 +34,11 @@ import {
   durableImageCalls,
   durableMCPTools,
   type DurableStreamRecord,
+  type DurableStreamSource,
   durableTools,
   type MCPClientLike,
   readDurableStream,
+  toolWriter,
   writeDurableStream,
 } from '../src/index.js';
 import { restoreAISDKErrorIdentity } from '../src/internal.js';
@@ -1493,6 +1498,53 @@ const dsHandoffWorkflow = DBOS.registerWorkflow(
   { name: 'dsHandoffWorkflow' },
 );
 
+// Resume fixtures: a long run of data records, and a turn whose last call never wrote its model-end.
+const dsTicksWorkflow = DBOS.registerWorkflow(
+  async (count: number) => {
+    await DBOS.runStep(
+      async () => {
+        for (let i = 0; i < count; i++) await writeDurableStream('ui', [{ type: 'data-tick', id: `tick-${i}`, data: { i } }]);
+      },
+      { name: 'write' },
+    );
+  },
+  { name: 'dsTicksWorkflow' },
+);
+const dsUnfinishedCallWorkflow = DBOS.registerWorkflow(
+  async () => {
+    await DBOS.runStep(
+      async () => {
+        const records: DurableStreamRecord[] = [
+          { kind: 'model', step: 0, attempt: 'a', parts: [{ type: 'text-start', id: 't1' }, { type: 'text-delta', id: 't1', delta: 'one' }, { type: 'text-end', id: 't1' }] },
+          { kind: 'model-end', step: 0, attempt: 'a', finishReason: { unified: 'length', raw: undefined } },
+          { kind: 'model', step: 1, attempt: 'b', parts: [{ type: 'text-start', id: 't1' }, { type: 'text-delta', id: 't1', delta: 'two' }] },
+        ];
+        for (const record of records) await DBOS.writeStream('ui', record);
+      },
+      { name: 'write' },
+    );
+  },
+  { name: 'dsUnfinishedCallWorkflow' },
+);
+// Counts the single-record reads a reader makes.
+function countingClient(): DurableStreamSource & { reads: number } {
+  const client = {
+    reads: 0,
+    readStream: <T,>(workflowID: string, key: string, options?: { offset?: number }) => DBOS.readStream<T>(workflowID, key, options),
+    readStreamOffset: <T,>(workflowID: string, key: string, offset: number, options?: { timeoutSeconds?: number }) => {
+      client.reads++;
+      return DBOS.readStreamOffset<T>(workflowID, key, offset, options);
+    },
+    retrieveWorkflow: (workflowID: string) => DBOS.retrieveWorkflow(workflowID),
+  };
+  return client;
+}
+async function drain(stream: ReadableStream<UIMessageChunk>): Promise<UIMessageChunk[]> {
+  const chunks: UIMessageChunk[] = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return chunks;
+}
+
 // Sub-agents as child workflows.
 const subMock = new MockLanguageModel();
 const subModel = wrapLanguageModel({ model: subMock, middleware: durableCalls({ durableStream: 'ui' }) });
@@ -1633,10 +1685,240 @@ function resetAgentMocks(): void {
   orchMock.generateResults.length = 0;
 }
 
+// Tool-written chunks: transient ones stream live, the rest are checkpointed and re-emitted before the tool's output.
+const twMock = new MockLanguageModel();
+const twModel = wrapLanguageModel({ model: twMock, middleware: durableCalls({ durableStream: 'ui' }) });
+let twRuns = 0;
+let twFailFirst = false;
+const twTools = {
+  search: tool({
+    inputSchema: z.object({ q: z.string() }),
+    execute: async ({ q }, { toolCallId }) => {
+      twRuns++;
+      const writer = toolWriter();
+      writer.write({ type: 'data-progress', data: { pct: 50 }, transient: true });
+      writer.write({ type: 'source-url', sourceId: `src-${toolCallId}`, url: 'https://example.com/a', title: 'A' });
+      writer.merge(
+        new ReadableStream<UIMessageChunk>({
+          start(controller) {
+            controller.enqueue({ type: 'file', url: 'https://example.com/chart.png', mediaType: 'image/png' });
+            controller.close();
+          },
+        }),
+      );
+      if (twFailFirst && twRuns === 1) throw new Error('flaky');
+      return `found ${q}`;
+    },
+  }),
+};
+const twWorkflow = DBOS.registerWorkflow(
+  async (prompt: string) => {
+    let message: UIMessage | undefined;
+    const live: UIMessageChunk[] = [];
+    const stream = createUIMessageStream({
+      execute: ({ writer }) => {
+        const tools = durableTools(twTools, { durableStream: 'ui', writer, tools: { search: { retriesAllowed: true, maxAttempts: 2, intervalSeconds: 0 } } });
+        writer.merge(streamText({ model: twModel, prompt, tools, stopWhen: stepCountIs(5), maxRetries: 0 }).toUIMessageStream());
+      },
+      onFinish: ({ responseMessage }) => {
+        message = responseMessage;
+      },
+    });
+    for await (const chunk of stream) live.push(chunk);
+    await DBOS.runStep(async () => 'noop', { name: 'noop' });
+    return { parts: message!.parts, live: live.map((c) => c.type) };
+  },
+  { name: 'twWorkflow' },
+);
+// A re-executed tool call writes a second record for the same step; a later step may reuse the provider's tool call id.
+let twRepeatGate = newGate();
+const toolRecord = (step: number, output: string, sourceId: string): DurableStreamRecord => ({
+  kind: 'tool',
+  step,
+  attempt: 1,
+  toolCallId: 'call-1',
+  output,
+  chunks: [{ type: 'source-url', sourceId, url: `https://example.com/${sourceId}` }],
+});
+// The re-execution writes different chunks, the same ones, or none because it fails.
+type Rerun = 'changed' | 'same' | 'failed';
+const rerunRecord: Record<Rerun, DurableStreamRecord> = {
+  changed: toolRecord(0, 'second', 's2'),
+  same: toolRecord(0, 'first', 's1'),
+  failed: { kind: 'tool', step: 0, attempt: 1, toolCallId: 'call-1', errorText: 'boom' },
+};
+const twRepeatWorkflow = DBOS.registerWorkflow(
+  async (rerun: Rerun) => {
+    await DBOS.runStep(
+      async () => {
+        await DBOS.writeStream('ui', toolRecord(0, 'first', 's1'));
+        await twRepeatGate.promise;
+        await DBOS.writeStream('ui', rerunRecord[rerun]);
+        await DBOS.writeStream('ui', toolRecord(3, 'other', 's3'));
+      },
+      { name: 'write' },
+    );
+    await closeDurableStream('ui', 'stop');
+  },
+  { name: 'twRepeatWorkflow' },
+);
+const toolSummary = (chunks: UIMessageChunk[]) =>
+  chunks.map((c) =>
+    c.type === 'source-url'
+      ? `source:${c.sourceId}`
+      : c.type === 'tool-output-available'
+        ? `output:${String(c.output)}`
+        : c.type === 'data-dbos-tool-superseded'
+          ? `superseded:${(c.data as { toolCallId: string }).toolCallId}`
+          : c.type,
+  );
+
+// The first attempt outlives its timeout and finishes after the retry; DBOS discards its result.
+let twTimeoutRuns = 0;
+let twTimeoutFinished = 0;
+const twTimeoutMock = new MockLanguageModel();
+const twTimeoutModel = wrapLanguageModel({ model: twTimeoutMock, middleware: durableCalls({ durableStream: 'ui' }) });
+const twTimeoutTools = durableTools(
+  {
+    slow: tool({
+      inputSchema: z.object({}),
+      execute: async () => {
+        const run = ++twTimeoutRuns;
+        if (run === 1) await new Promise((resolve) => setTimeout(resolve, 300));
+        toolWriter().write({ type: 'source-url', sourceId: `run-${run}`, url: 'https://example.com' });
+        if (run === 1) twTimeoutFinished++;
+        return `run ${run}`;
+      },
+    }),
+    // Retries allowed, but its predicate never retries a timeout; honors its abort signal.
+    picky: tool({
+      inputSchema: z.object({}),
+      execute: async (_input, { abortSignal }): Promise<string> => {
+        await new Promise<void>((resolve) => abortSignal?.addEventListener('abort', () => resolve(), { once: true }));
+        twTimeoutFinished++;
+        throw new Error('aborted');
+      },
+    }),
+    // No retries: its timeout is the call's outcome.
+    stuck: tool({
+      inputSchema: z.object({}),
+      execute: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        toolWriter().write({ type: 'source-url', sourceId: 'stuck', url: 'https://example.com' });
+        twTimeoutFinished++;
+        return 'late';
+      },
+    }),
+  },
+  {
+    durableStream: 'ui',
+    tools: {
+      slow: { timeoutMS: 100, retriesAllowed: true, maxAttempts: 2, intervalSeconds: 0 },
+      picky: { timeoutMS: 100, retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0, shouldRetry: (error) => !/timed out/.test(String(error)) },
+      stuck: { timeoutMS: 100 },
+    },
+  },
+);
+// Held open until the late attempt has finished, since a finished workflow's stream rejects writes.
+let twTimeoutGate = newGate();
+const twTimeoutWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const { text } = await generateText({ model: twTimeoutModel, prompt: 'go', tools: twTimeoutTools, stopWhen: stepCountIs(3), maxRetries: 0 });
+    await twTimeoutGate.promise;
+    return text;
+  },
+  { name: 'twTimeoutWorkflow' },
+);
+
+// Workflow cancellation reaching in-flight calls needs DBOS 5.1+ (stepStatus.cancelSignal); older versions skip these tests.
+let cancelSignalSupported = false;
+const cancelProbeWorkflow = DBOS.registerWorkflow(
+  async () => DBOS.runStep(async () => DBOS.stepStatus !== undefined && 'cancelSignal' in DBOS.stepStatus, { name: 'probe' }),
+  { name: 'cancelProbeWorkflow' },
+);
+async function until(condition: () => boolean | Promise<boolean>, timeoutMS = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMS;
+  while (!(await condition())) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+const cancelStreamMock = new MockLanguageModel();
+const cancelStreamModel = wrapLanguageModel({ model: cancelStreamMock, middleware: durableCalls({ durableStream: 'ui' }) });
+let cancelStreamGate = newGate();
+const cancelStreamWorkflow = DBOS.registerWorkflow(
+  async () => await streamText({ model: cancelStreamModel, prompt: 'hi', maxRetries: 0 }).text,
+  { name: 'cancelStreamWorkflow' },
+);
+
+// Parks the next doGenerate until its abort signal fires, then rejects like a real provider.
+class ParkingGenerateModel extends MockLanguageModel {
+  parkNext = false;
+  parked = 0;
+  rejected = 0;
+  override async doGenerate(options: Parameters<MockLanguageModel['doGenerate']>[0]) {
+    if (!this.parkNext) return super.doGenerate(options);
+    this.parkNext = false;
+    this.parked++;
+    return new Promise<never>((_, reject) => {
+      options.abortSignal?.addEventListener(
+        'abort',
+        () => {
+          this.rejected++;
+          reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+        },
+        { once: true },
+      );
+    });
+  }
+}
+const cancelGenerateMock = new ParkingGenerateModel();
+const cancelGenerateModel = wrapLanguageModel({ model: cancelGenerateMock, middleware: durableCalls() });
+const cancelGenerateWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: cancelGenerateModel, prompt: 'hi', maxRetries: 0 })).text,
+  { name: 'cancelGenerateWorkflow' },
+);
+
+// A tool that waits until its abort signal fires.
+const cancelToolState = { started: 0, aborted: 0 };
+const parkUntilAborted = async (signal: AbortSignal | undefined): Promise<string> => {
+  cancelToolState.started++;
+  await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+  cancelToolState.aborted++;
+  throw new Error('tool aborted');
+};
+const cancelToolMock = new MockLanguageModel();
+const cancelToolModel = wrapLanguageModel({ model: cancelToolMock, middleware: durableCalls({ durableStream: 'ui' }) });
+const cancelTools = durableTools(
+  {
+    park: tool({ inputSchema: z.object({}), execute: async (_input, { abortSignal }) => parkUntilAborted(abortSignal) }),
+  },
+  { durableStream: 'ui' },
+);
+const cancelToolWorkflow = DBOS.registerWorkflow(
+  async () => (await generateText({ model: cancelToolModel, prompt: 'hi', tools: cancelTools, stopWhen: stepCountIs(3), maxRetries: 0 })).text,
+  { name: 'cancelToolWorkflow' },
+);
+const cancelMcpClient: MCPClientLike = {
+  tools: async () => ({
+    park: tool({ inputSchema: z.object({}), execute: async (_input, { abortSignal }) => parkUntilAborted(abortSignal) }),
+  }),
+  close: async () => {},
+};
+const cancelMcpWorkflow = DBOS.registerWorkflow(
+  async () => {
+    const tools = await durableMCPTools(cancelMcpClient, { durableStream: 'ui' });
+    return (await generateText({ model: cancelToolModel, prompt: 'hi', tools, stopWhen: stepCountIs(3), maxRetries: 0 })).text;
+  },
+  { name: 'cancelMcpWorkflow' },
+);
+
 before(async () => {
   DBOS.setConfig({ name: 'dbos-vercel-ai-test', systemDatabaseUrl });
   await DBOS.launch();
   await DBOS.registerQueue('subagents', { concurrency: 1 });
+  cancelSignalSupported = await cancelProbeWorkflow();
 });
 
 after(async () => {
@@ -2862,7 +3144,7 @@ test('a streaming tool execute checkpoints its final value inside a workflow and
   assert.deepEqual(yielded, [1, 0]);
 });
 
-test('wrapped tools run directly outside a workflow, and tools without execute or opted out are untouched', async () => {
+test('wrapped tools run directly outside a workflow; tools without execute are untouched and opted-out ones only bind toolWriter', async () => {
   const before = weatherToolExecutions;
   assert.deepEqual(await wrappedTools.getWeather.execute!({ city: 'Rome' }, directExecOptions), {
     city: 'Rome',
@@ -2870,7 +3152,8 @@ test('wrapped tools run directly outside a workflow, and tools without execute o
   });
   assert.equal(weatherToolExecutions - before, 1);
   assert.equal(wrappedTools.clientOnly, plainTools.clientOnly);
-  assert.equal(wrappedTools.getTime, plainTools.getTime);
+  assert.equal(await wrappedTools.getTime.execute!({ city: 'Rome' }, directExecOptions), 'noon in Rome');
+  assert.equal(wrappedTools.getTime.description, plainTools.getTime.description);
   assert.notEqual(wrappedTools.getWeather, plainTools.getWeather);
 });
 
@@ -3340,8 +3623,91 @@ test('durable stream: a resume from an offset inside a stale attempt skips the r
   const resumed = await readChunks(workflowID, 'ui', 0 + 0);
   const fromStale = await readChunks(workflowID, 'ui', 1);
   assert.equal(streamedText(visible(fromStale)), 'fresh');
-  assert.deepEqual(visible(fromStale).map((c) => c.type), ['text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  // The reader can't tell whether the client saw the stale attempt, so it names it; it never ends parts the client may lack.
+  assert.deepEqual(visible(fromStale).map((c) => c.type), ['data-dbos-superseded', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
   assert.equal(streamedText(visible(resumed)), 'fresh');
+});
+
+test('durable stream: a client resuming after a crash is told the re-executed call supersedes what it saw', async () => {
+  dsStaleLiveGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(dsStaleLiveWorkflow, { workflowID })();
+  // The client sees the stale attempt's first text, then its connection drops.
+  const reader = readDurableStream({ workflowID, key: 'ui', messageId: 'msg-1' }).getReader();
+  const before: UIMessageChunk[] = [];
+  while (!before.some((c) => c.type === 'data-dbos-offset')) before.push((await reader.read()).value!);
+  await reader.cancel();
+  const offset = (before.find((c) => c.type === 'data-dbos-offset') as { data: { offset: number } }).data.offset;
+  dsStaleLiveGate.release();
+  await handle.getResult();
+
+  const resumed = await readChunks(workflowID, 'ui', offset);
+  assert.deepEqual(visible(resumed).map((c) => c.type), ['data-dbos-superseded', 'text-start', 'text-delta', 'text-end', 'finish-step', 'finish']);
+  assert.deepEqual((resumed.find((c) => c.type === 'data-dbos-superseded') as { data: unknown }).data, { attempt: 'stale', parts: ['stale:t1'] });
+
+  // An AI SDK client resuming with its partial message processes the resumed stream without error.
+  const toStream = (chunks: UIMessageChunk[]) =>
+    new ReadableStream<UIMessageChunk>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+  let message: UIMessage | undefined;
+  for await (message of readUIMessageStream({ stream: toStream(before), terminateOnError: true }));
+  for await (message of readUIMessageStream({ message, stream: toStream(resumed), terminateOnError: true }));
+  assert.deepEqual(
+    message!.parts.filter((p) => p.type === 'text').map((p) => (p as { text: string }).text),
+    ['STALE', 'fresh'],
+  );
+});
+
+test('durable stream: a resume between steps puts step boundaries where an uninterrupted read does', async () => {
+  dsMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'tool-call', toolCallId: 'call-1', toolName: 'getWeather', input: '{"city":"Oslo"}' },
+      { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+    ],
+    textStreamParts(['Rainy']),
+  );
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsWorkflow, { workflowID })('weather in Oslo?')).getResult();
+  const full = await readChunks(workflowID, 'ui');
+  // Resume right after the tool's output, before the second model step's first record.
+  const index = full.findIndex((c) => c.type === 'tool-output-available') + 1;
+  const offset = (full[index] as { data: { offset: number } }).data.offset;
+  assert.deepEqual(await readChunks(workflowID, 'ui', offset), full.slice(index + 1));
+});
+
+test('durable stream: a resume offset past the stored records restores nothing and reads nothing before it', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsTicksWorkflow, { workflowID })(2)).getResult();
+  const client = countingClient();
+  const chunks = await drain(readDurableStream({ workflowID, key: 'ui', offset: 2000, client }));
+  assert.deepEqual(visible(chunks), [{ type: 'finish' }]);
+  // One read finds the gap below the offset, one finds nothing at it.
+  assert.equal(client.reads, 2);
+});
+
+test('durable stream: a resume far from any model call reads back a bounded number of records', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsTicksWorkflow, { workflowID })(300)).getResult();
+  const client = countingClient();
+  const chunks = await drain(readDurableStream({ workflowID, key: 'ui', offset: 290, client }));
+  assert.equal(chunks.filter((c) => c.type === 'data-tick').length, 10);
+  // The scan limit (100) plus the ten remaining records and the empty read after them.
+  assert.equal(client.reads, 100 + 11);
+});
+
+test('durable stream: a resume inside a call that never ended keeps the finish reason of the call before it', async () => {
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(dsUnfinishedCallWorkflow, { workflowID })()).getResult();
+  const full = await readChunks(workflowID, 'ui');
+  assert.deepEqual(full.at(-1), { type: 'finish', finishReason: 'length' });
+  // Resume after the unfinished call's first record.
+  const index = full.findIndex((c) => c.type === 'data-dbos-offset' && (c.data as { offset: number }).offset === 3);
+  assert.deepEqual(await readChunks(workflowID, 'ui', 3), full.slice(index + 1));
 });
 
 test('durable stream: a second execution of a model step gets its own attempt id', async () => {
@@ -3509,9 +3875,11 @@ test('agentTool: timeoutMS cancels a child that runs too long and the parent see
     { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage: usage() },
   ]);
   const workflowID = randomUUID();
-  // The child's step is parked at the gate; the timeout takes effect once the step returns, so let it return after the deadline.
-  setTimeout(() => slowGate.release(), 800);
+  // The child's step is parked at the gate. With a cancel signal the timeout's cancel stops the step; without one the
+  // timeout takes effect once the step returns, so let it return after the deadline.
+  if (!cancelSignalSupported) setTimeout(() => slowGate.release(), 800);
   const result = await (await DBOS.startWorkflow(orchestratorWorkflow, { workflowID })('research slowly')).getResult();
+  slowGate.release();
   assert.equal(result.text, 'Timed out.');
   assert.equal(result.toolErrors.length, 1);
   assert.equal((await DBOS.getWorkflowStatus(`${workflowID}-call-1`))?.status, 'CANCELLED');
@@ -3758,3 +4126,300 @@ test('durable stream: a local tool error is masked for clients unless onError re
   for await (const chunk of readDurableStream({ workflowID, key: 'ui', onError: (e) => (e as Error).message })) revealed.push(chunk);
   assert.equal((revealed.find((c) => c.type === 'tool-output-error') as { errorText: string }).errorText, 'connection to db-internal.example refused');
 });
+
+function queueToolWriterTurn() {
+  twMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'tool-call', toolCallId: 'call-1', toolName: 'search', input: '{"q":"dbos"}' },
+      { type: 'finish', finishReason: { unified: 'tool-calls', raw: undefined }, usage: usage() },
+    ],
+    textStreamParts(['Done.']),
+  );
+}
+const partTypes = (parts: UIMessage['parts']) => parts.map((p) => p.type);
+
+test('toolWriter: non-transient chunks reach the workflow message and the durable stream, and replay without re-running the tool', async () => {
+  twRuns = 0;
+  twFailFirst = false;
+  queueToolWriterTurn();
+  const workflowID = randomUUID();
+  const result = await (await DBOS.startWorkflow(twWorkflow, { workflowID })('search')).getResult();
+  assert.deepEqual(partTypes(result.parts), ['step-start', 'tool-search', 'source-url', 'file', 'step-start', 'text']);
+  // The transient part streamed live but is not part of the message; the rest come before the tool's output.
+  assert.ok(result.live.includes('data-progress'));
+  assert.ok(result.live.indexOf('source-url') < result.live.indexOf('tool-output-available'));
+  assert.ok(result.live.indexOf('file') < result.live.indexOf('tool-output-available'));
+
+  const chunks = visible(await readChunks(workflowID, 'ui'));
+  const types = chunks.map((c) => c.type);
+  assert.deepEqual(
+    types.filter((t) => ['data-progress', 'source-url', 'file', 'tool-output-available'].includes(t)),
+    ['data-progress', 'source-url', 'file', 'tool-output-available'],
+  );
+
+  const steps = await DBOS.listWorkflowSteps(workflowID);
+  const forked = await DBOS.forkWorkflow<ReturnType<typeof twWorkflow>>(workflowID, steps!.find((s) => s.name === 'noop')!.functionID);
+  const replayed = await forked.getResult();
+  assert.equal(twRuns, 1);
+  assert.deepEqual(replayed.parts, result.parts);
+  assert.ok(!replayed.live.includes('data-progress'));
+});
+
+test('toolWriter: a retried attempt contributes its chunks once', async () => {
+  twRuns = 0;
+  twFailFirst = true;
+  queueToolWriterTurn();
+  const workflowID = randomUUID();
+  const result = await (await DBOS.startWorkflow(twWorkflow, { workflowID })('search')).getResult();
+  assert.equal(twRuns, 2);
+  assert.deepEqual(partTypes(result.parts), ['step-start', 'tool-search', 'source-url', 'file', 'step-start', 'text']);
+  const types = visible(await readChunks(workflowID, 'ui')).map((c) => c.type);
+  assert.equal(types.filter((t) => t === 'source-url').length, 1);
+  assert.equal(types.filter((t) => t === 'file').length, 1);
+});
+
+test('toolWriter: outside a workflow chunks go straight to the writer', async () => {
+  const written: UIMessageChunk[] = [];
+  const writer = { write: (c: UIMessageChunk) => written.push(c), merge: () => {}, onError: undefined };
+  const tools = durableTools(twTools, { writer });
+  twRuns = 0;
+  twFailFirst = false;
+  const output = await tools.search.execute!({ q: 'x' }, { toolCallId: 'c1', messages: [], context: undefined as never });
+  assert.equal(output, 'found x');
+  assert.deepEqual(written.map((c) => c.type), ['data-progress', 'source-url']);
+  assert.throws(() => toolWriter(), /toolWriter\(\) can only be called/);
+});
+
+test('toolWriter: a streaming tool can write from its body outside a workflow and when opted out', async () => {
+  const streaming = {
+    progress: tool({
+      inputSchema: z.object({}),
+      execute: async function* () {
+        toolWriter().write({ type: 'data-step', data: { n: 1 }, transient: true });
+        yield 'half';
+        await new Promise((resolve) => setImmediate(resolve));
+        toolWriter().write({ type: 'data-step', data: { n: 2 }, transient: true });
+        yield 'done';
+      },
+    }),
+  };
+  for (const options of [{}, { tools: { progress: false as const } }]) {
+    const written: UIMessageChunk[] = [];
+    const writer = { write: (c: UIMessageChunk) => written.push(c), merge: () => {}, onError: undefined };
+    const wrapped = durableTools(streaming, { writer, ...options });
+    const yielded: unknown[] = [];
+    for await (const value of wrapped.progress.execute!({}, { toolCallId: 'c1', messages: [], context: undefined as never }) as AsyncIterable<unknown>) {
+      yielded.push(value);
+    }
+    assert.deepEqual(yielded, ['half', 'done']);
+    assert.deepEqual(written.map((c) => (c as { data: { n: number } }).data.n), [1, 2]);
+  }
+});
+
+test('toolWriter: a stored history shows only the last record chunks for a re-executed call', async () => {
+  twRepeatGate = newGate();
+  twRepeatGate.release();
+  const workflowID = randomUUID();
+  await (await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })('changed')).getResult();
+  assert.deepEqual(toolSummary(visible(await readChunks(workflowID, 'ui'))), [
+    'start',
+    'output:first',
+    'source:s2',
+    'output:second',
+    'source:s3',
+    'output:other',
+    'finish',
+  ]);
+});
+
+async function readRepeatLive(rerun: Rerun): Promise<string[]> {
+  twRepeatGate = newGate();
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })(rerun);
+  await until(async () => (await readRecordsSoFar(workflowID)) >= 1);
+  const reader = readDurableStream({ workflowID, key: 'ui' }).getReader();
+  const seen: UIMessageChunk[] = [];
+  // Read through the first record while the second is still gated, so it arrives live.
+  for (;;) {
+    const { value } = await reader.read();
+    seen.push(value!);
+    if (value!.type === 'tool-output-available') break;
+  }
+  twRepeatGate.release();
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    seen.push(value);
+  }
+  await handle.getResult();
+  return toolSummary(visible(seen));
+}
+
+test('toolWriter: a live reader is told to discard the earlier chunks of a re-executed call', async () => {
+  assert.deepEqual(await readRepeatLive('changed'), [
+    'start',
+    'source:s1',
+    'output:first',
+    'superseded:call-1',
+    'source:s2',
+    'output:second',
+    'source:s3',
+    'output:other',
+    'finish',
+  ]);
+});
+
+test('toolWriter: a live reader does not repeat chunks a re-execution wrote again unchanged', async () => {
+  assert.deepEqual(await readRepeatLive('same'), ['start', 'source:s1', 'output:first', 'output:first', 'source:s3', 'output:other', 'finish']);
+});
+
+test('toolWriter: a re-execution that wrote no chunks hides the earlier ones, stored or live', async () => {
+  const workflowID = randomUUID();
+  twRepeatGate = newGate();
+  twRepeatGate.release();
+  await (await DBOS.startWorkflow(twRepeatWorkflow, { workflowID })('failed')).getResult();
+  assert.deepEqual(toolSummary(visible(await readChunks(workflowID, 'ui'))), [
+    'start',
+    'output:first',
+    'tool-output-error',
+    'source:s3',
+    'output:other',
+    'finish',
+  ]);
+  assert.deepEqual(await readRepeatLive('failed'), [
+    'start',
+    'source:s1',
+    'output:first',
+    'superseded:call-1',
+    'tool-output-error',
+    'source:s3',
+    'output:other',
+    'finish',
+  ]);
+});
+
+test('toolWriter: a timed-out attempt that finishes late writes no stream record', async () => {
+  twTimeoutRuns = 0;
+  twTimeoutFinished = 0;
+  twTimeoutGate = newGate();
+  twTimeoutMock.generateResults.push(toolCallResponse('slow', '{}'), textResponse('done'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(twTimeoutWorkflow, { workflowID })();
+  // The abandoned first attempt returns after the retry; give its step wrapper time to reach the stream write it skips.
+  await until(() => twTimeoutFinished === 1);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  twTimeoutGate.release();
+  assert.equal(await handle.getResult(), 'done');
+  const tools = (await readRecords(workflowID, 'ui')).filter((r) => r.kind === 'tool');
+  assert.equal(tools.length, 1);
+  assert.equal(tools[0]!.kind === 'tool' && tools[0]!.output, 'run 2');
+  assert.deepEqual(toolSummary(visible(await readChunks(workflowID, 'ui'))).filter((c) => c.startsWith('source:')), ['source:run-2']);
+});
+
+test('toolWriter: a final attempt that times out records the timeout, without its late chunks', async () => {
+  twTimeoutFinished = 0;
+  twTimeoutGate = newGate();
+  twTimeoutMock.generateResults.push(toolCallResponse('stuck', '{}'), textResponse('done'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(twTimeoutWorkflow, { workflowID })();
+  await until(() => twTimeoutFinished === 1);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  twTimeoutGate.release();
+  assert.equal(await handle.getResult(), 'done');
+  const tools = (await readRecords(workflowID, 'ui')).filter((r) => r.kind === 'tool');
+  assert.equal(tools.length, 1);
+  assert.match((tools[0] as { errorText?: string }).errorText ?? '', /timed out/);
+  assert.equal((tools[0] as { chunks?: unknown }).chunks, undefined);
+});
+
+test('toolWriter: a timeout that shouldRetry will not retry records the timeout', async () => {
+  twTimeoutFinished = 0;
+  twTimeoutGate = newGate();
+  twTimeoutMock.generateResults.push(toolCallResponse('picky', '{}'), textResponse('done'));
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(twTimeoutWorkflow, { workflowID })();
+  await until(() => twTimeoutFinished === 1);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  twTimeoutGate.release();
+  assert.equal(await handle.getResult(), 'done');
+  const tools = (await readRecords(workflowID, 'ui')).filter((r) => r.kind === 'tool');
+  assert.equal(tools.length, 1);
+  assert.match((tools[0] as { errorText?: string }).errorText ?? '', /timed out/);
+});
+
+test('workflow cancel: a streamed model call stops, nothing is checkpointed, and resume re-runs it', async (t) => {
+  if (!cancelSignalSupported) return t.skip('requires DBOS 5.1+');
+  cancelStreamGate = newGate();
+  const callsBefore = cancelStreamMock.streamCalls;
+  const cancellationsBefore = cancelStreamMock.streamCancellations;
+  cancelStreamMock.streamPartLists.push(
+    [
+      { type: 'stream-start', warnings: [] },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', delta: 'partial' },
+      () => cancelStreamGate.promise,
+      { type: 'text-end', id: 't1' },
+      { type: 'finish', finishReason: finishReason(), usage: usage() },
+    ],
+    textStreamParts(['fresh']),
+  );
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(cancelStreamWorkflow, { workflowID })();
+  await until(() => cancelStreamMock.streamCalls === callsBefore + 1);
+  await DBOS.cancelWorkflow(workflowID);
+  await until(() => cancelStreamMock.streamCancellations > cancellationsBefore);
+  assert.equal(cancelStreamMock.streamOptions.at(-1)!.abortSignal?.aborted, true);
+  await assert.rejects(handle.getResult());
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  // A cancelled call is not a consumer abort: nothing is recorded, so a resume calls the model again.
+  assert.ok(!(await DBOS.listWorkflowSteps(workflowID))!.some((s) => s.name === 'mock.mock-model.stream'));
+  await DBOS.resumeWorkflow(workflowID);
+  assert.equal(await DBOS.retrieveWorkflow<string>(workflowID).getResult(), 'fresh');
+  assert.equal(cancelStreamMock.streamCalls, callsBefore + 2);
+  // The durable stream shows only the re-run's output.
+  assert.equal(streamedText(visible(await readChunks(workflowID, 'ui'))), 'fresh');
+  cancelStreamGate.release();
+});
+
+test('workflow cancel: a generate call is aborted and resume re-runs it', async (t) => {
+  if (!cancelSignalSupported) return t.skip('requires DBOS 5.1+');
+  cancelGenerateMock.parkNext = true;
+  cancelGenerateMock.generateResults.push(textResponse('fresh'));
+  const parkedBefore = cancelGenerateMock.parked;
+  const rejectedBefore = cancelGenerateMock.rejected;
+  const workflowID = randomUUID();
+  const handle = await DBOS.startWorkflow(cancelGenerateWorkflow, { workflowID })();
+  await until(() => cancelGenerateMock.parked === parkedBefore + 1);
+  await DBOS.cancelWorkflow(workflowID);
+  await until(() => cancelGenerateMock.rejected === rejectedBefore + 1);
+  await assert.rejects(handle.getResult());
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.ok(!(await DBOS.listWorkflowSteps(workflowID))!.some((s) => s.name === 'mock.mock-model.generate'));
+  await DBOS.resumeWorkflow(workflowID);
+  assert.equal(await DBOS.retrieveWorkflow<string>(workflowID).getResult(), 'fresh');
+});
+
+for (const [kind, workflow] of [
+  ['durableTools', cancelToolWorkflow],
+  ['durableMCPTools', cancelMcpWorkflow],
+] as const) {
+  test(`workflow cancel: a ${kind} tool call is aborted and records no outcome`, async (t) => {
+    if (!cancelSignalSupported) return t.skip('requires DBOS 5.1+');
+    cancelToolMock.generateResults.push(toolCallResponse('park', '{}'));
+    const startedBefore = cancelToolState.started;
+    const abortedBefore = cancelToolState.aborted;
+    const workflowID = randomUUID();
+    const handle = await DBOS.startWorkflow(workflow, { workflowID })();
+    await until(() => cancelToolState.started === startedBefore + 1);
+    await DBOS.cancelWorkflow(workflowID);
+    await until(() => cancelToolState.aborted === abortedBefore + 1);
+    await assert.rejects(handle.getResult());
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const steps = (await DBOS.listWorkflowSteps(workflowID))!;
+    assert.ok(!steps.some((s) => s.name.includes('park')));
+    // No tool error reaches readers: the turn ends with an abort.
+    assert.ok(!(await readRecords(workflowID, 'ui')).some((r) => r.kind === 'tool'));
+    assert.deepEqual(visible(await readChunks(workflowID, 'ui')).at(-1), { type: 'abort' });
+  });
+}

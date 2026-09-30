@@ -1,6 +1,6 @@
-import { StepConfig } from '@dbos-inc/dbos-sdk';
+import { DBOS, StepConfig } from '@dbos-inc/dbos-sdk';
 import type { ToolSet } from 'ai' with { 'resolution-mode': 'import' };
-import { isAsyncIterable, runDurableStep, withErrorClassification } from './internal';
+import { anySignal, isAsyncIterable, runDurableStep, stepCancelSignal, timedOutOutcome, withErrorClassification } from './internal';
 import { writeToolRecord } from './durable-stream';
 
 // Structural type for an MCP client (e.g. from @ai-sdk/mcp) — deliberately loose: the AI SDK ecosystem
@@ -112,11 +112,20 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
         return run(
           `mcp.tool.${name}.${toolCallId ?? 'call'}`,
           async () => {
+            // Stop the call when the attempt times out or the workflow is cancelled, as well as on the caller's abort.
+            const cancelSignal = stepCancelSignal();
+            const record = async (outcome: { output: unknown } | { errorText: string }) => {
+              if (!durableStream || !toolCallId) return;
+              const timeout = await timedOutOutcome(callConfig.shouldRetry);
+              if (timeout === null) return;
+              await writeToolRecord(durableStream, toolCallId, timeout ?? outcome);
+            };
+            const abortSignal = anySignal(signal, DBOS.stepStatus?.timeoutSignal, cancelSignal);
             let output: unknown;
             try {
               const tool = (await client.tools(toolOptions))[name] as MCPToolLike | undefined;
               if (typeof tool?.execute !== 'function') throw new Error(`MCP tool "${name}" is not executable.`);
-              output = await tool.execute(input, execOptions);
+              output = await tool.execute(input, abortSignal === signal ? execOptions : { ...execOptions, abortSignal });
               // A streaming execute can't checkpoint mid-flight; drain it and record the final value (the last yield).
               if (isAsyncIterable(output)) {
                 let last: unknown;
@@ -124,12 +133,10 @@ export async function durableMCPTools(client: MCPClientLike, options: DurableMCP
                 output = last;
               }
             } catch (error) {
-              if (durableStream && toolCallId) {
-                await writeToolRecord(durableStream, toolCallId, { errorText: error instanceof Error ? error.message : String(error) });
-              }
+              if (!cancelSignal?.aborted) await record({ errorText: error instanceof Error ? error.message : String(error) });
               throw error;
             }
-            if (durableStream && toolCallId) await writeToolRecord(durableStream, toolCallId, { output });
+            await record({ output });
             return output;
           },
           callConfig,
