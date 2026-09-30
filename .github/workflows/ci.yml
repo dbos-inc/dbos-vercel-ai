@@ -49,6 +49,7 @@ jobs:
       - if: matrix.dbos-sdk != 'locked'
         run: npm install --no-save @dbos-inc/dbos-sdk@${{ matrix.dbos-sdk }}
       - run: npm run lint
+      - run: npm run test:publish
       - run: npm run build
       - run: npm test
         env:
